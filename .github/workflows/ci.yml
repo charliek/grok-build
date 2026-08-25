@@ -1,0 +1,115 @@
+name: CI
+
+# Runs on every push to gx/main and every PR targeting gx/main.
+#
+# "check" builds xai-grok-pager-bin and runs the targeted test set for the
+# gx-touched crates (see scripts/gx and CLAUDE.md for why the set is
+# targeted rather than `--workspace --all-targets`: the full xai-grok-shell
+# suite is huge and xai-grok-pager's tests/ dir has a pre-existing broken
+# target upstream that doesn't link).
+#
+# "secret-scan" runs gitleaks over the full history of the checkout.
+
+on:
+  push:
+    branches:
+      - gx/main
+  pull_request:
+    branches:
+      - gx/main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+          protoc --version
+
+      # rust-toolchain.toml pins channel 1.94.0 + components (rustfmt,
+      # clippy) + targets (incl. x86_64-unknown-linux-gnu). rustup reads
+      # this file automatically and installs everything it specifies the
+      # first time it is invoked in this directory, so a plain `rustup show`
+      # is enough -- no separate toolchain-install action needed.
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        run: rustup show
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7 # v2.9.2
+
+      - name: cargo check -p xai-grok-pager-bin
+        run: cargo check -p xai-grok-pager-bin --locked
+
+      - name: Test xai-grok-sampling-types
+        run: cargo test -p xai-grok-sampling-types --locked
+
+      - name: Test xai-grok-config
+        run: cargo test -p xai-grok-config --locked
+
+      # LIB tests only: this crate's tests/ dir has a pre-existing broken
+      # target (registered_features_are_documented include_str!s docs that
+      # upstream didn't ship in this tree), so --all-targets will not link.
+      - name: Test xai-grok-pager (lib only)
+        run: cargo test -p xai-grok-pager --lib --locked
+
+      - name: Test xai-grok-update
+        run: cargo test -p xai-grok-update --locked
+
+      - name: Test xai-grok-version
+        run: cargo test -p xai-grok-version --locked
+
+      # xai-grok-shell's full suite is huge; restrict to the gx-touched
+      # subset: a filtered --lib run, the sampling-client integration test,
+      # and the chat-history-downgrade bin.
+      - name: Test xai-grok-shell (lib subset)
+        run: |
+          cargo test -p xai-grok-shell --lib --locked -- \
+            leader:: \
+            agent::model_providers::tests:: \
+            session_compact
+
+      - name: Test xai-grok-shell (test_sampling_client)
+        run: cargo test -p xai-grok-shell --locked --test test_sampling_client
+
+      - name: Test xai-grok-shell (chat-history-downgrade bin)
+        run: cargo test -p xai-grok-shell --locked --bin chat-history-downgrade
+
+  secret-scan:
+    name: secret-scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Official gitleaks action. Findings fail the job by default (no
+      # config needed for that). PR comments are disabled so this job only
+      # needs `contents: read` -- no `pull-requests: write` grant. No
+      # GITLEAKS_LICENSE is required for scans of a personal-account repo
+      # (only GitHub Organizations need one); add the secret later if this
+      # repo ever moves under an org.
+      - name: Gitleaks scan
+        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+          GITLEAKS_ENABLE_COMMENTS: false
