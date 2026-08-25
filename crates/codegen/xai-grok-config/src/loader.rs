@@ -86,7 +86,25 @@ pub fn load_config_file(path: &Path) -> std::io::Result<toml::Value> {
 }
 
 pub fn load_from_disk() -> std::io::Result<toml::Value> {
-    load_user_config_layer(user_grok_home().as_deref(), USER_CONFIG_FILENAME)
+    // gx: the user tier is `config.toml` + the gx-only providers layer.
+    load_user_tier_for(user_grok_home().as_deref(), xai_grok_version::is_gx_build())
+}
+
+/// gx: the whole user tier for `home` — `config.toml` with
+/// `providers.toml` merged **over** it (see [`crate::providers_layer`]).
+///
+/// Merging inside the tier is what makes the providers layer invisible as a
+/// separate rank: it sits exactly at user authority, so requirements / MDM still
+/// clamp over it and it never interacts with the fenced `GROK_CONFIG` overlay.
+///
+/// `is_gx` is a parameter so both flavors stay unit-testable without process env;
+/// with `is_gx == false` this is byte-identical to the stock user-layer load.
+pub(crate) fn load_user_tier_for(home: Option<&Path>, is_gx: bool) -> std::io::Result<toml::Value> {
+    let mut user = load_user_config_layer(home, USER_CONFIG_FILENAME)?;
+    if let Some(providers) = crate::providers_layer::load_providers_layer_for(home, is_gx) {
+        deep_merge_toml(&mut user, &providers);
+    }
+    Ok(user)
 }
 
 /// User config filename (`$GROK_HOME/config.toml`), shared by the loaders here.
