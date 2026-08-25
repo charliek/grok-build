@@ -1,0 +1,131 @@
+name: Upstream Drift Check
+
+# Weekly, non-publishing check: fetches xai-org/grok-build's main branch,
+# attempts to rebase gx/main onto it locally (never pushed), and runs the
+# same targeted `cargo check` CI uses. On failure (conflicts, or a broken
+# build after a clean rebase) it opens or updates a single tracking issue,
+# so drift surfaces between real syncs via scripts/gx/sync-upstream.sh
+# instead of silently piling up. Nothing here ever pushes or opens a PR.
+
+on:
+  schedule:
+    - cron: "0 6 * * 1" # Monday 06:00 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: upstream-drift
+  cancel-in-progress: false
+
+jobs:
+  drift-check:
+    name: drift-check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout gx/main (full history)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: gx/main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Configure git identity (rebase only; nothing is ever pushed)
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/xai-org/grok-build.git
+          git fetch upstream main
+
+      - name: Attempt rebase (local only; never pushed)
+        id: rebase
+        run: |
+          set +e
+          git rebase upstream/main
+          status=$?
+          set -e
+          if [[ ${status} -ne 0 ]]; then
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+            git rebase --abort || true
+          else
+            echo "conflict=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install protoc
+        if: steps.rebase.outputs.conflict == 'false'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      # rust-toolchain.toml (post-rebase) pins the channel/components/targets;
+      # rustup installs whatever it specifies on first invocation.
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        if: steps.rebase.outputs.conflict == 'false'
+        run: rustup show
+
+      - name: Rust cache
+        if: steps.rebase.outputs.conflict == 'false'
+        uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7 # v2.9.2
+
+      - name: cargo check -p xai-grok-pager-bin (post-rebase)
+        id: cargo_check
+        if: steps.rebase.outputs.conflict == 'false'
+        run: |
+          set +e
+          cargo check -p xai-grok-pager-bin --locked
+          status=$?
+          set -e
+          if [[ ${status} -ne 0 ]]; then
+            echo "failed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "failed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Open/update/close the drift-tracking issue
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          conflict="${{ steps.rebase.outputs.conflict }}"
+          check_failed="${{ steps.cargo_check.outputs.failed || 'skipped' }}"
+
+          # Matched by title rather than a label, so this workflow has no
+          # dependency on a label existing in the repo ahead of time.
+          issue_title="Upstream drift: gx/main no longer rebases cleanly onto xai-org/grok-build main"
+
+          existing_issue="$(
+            gh issue list --repo "${REPO}" --state open --json number,title \
+              --jq ".[] | select(.title == \"${issue_title}\") | .number" \
+            | head -n1
+          )"
+
+          if [[ "${conflict}" == "true" || "${check_failed}" == "true" ]]; then
+            if [[ "${conflict}" == "true" ]]; then
+              reason="git rebase of gx/main onto upstream/main produced conflicts."
+            else
+              reason="the rebase applied cleanly, but 'cargo check -p xai-grok-pager-bin --locked' failed afterward."
+            fi
+
+            body=$'Automated weekly upstream-drift check failed.\n\n'"${reason}"$'\n\nRun: '"${RUN_URL}"$'\n\nSee docs/gx/UPSTREAM_SYNC.md for the manual rebase runbook. This issue is updated in place on each failing run, and is auto-closed the next time the check passes (typically once a real sync via scripts/gx/sync-upstream.sh resolves the drift).'
+
+            if [[ -n "${existing_issue}" ]]; then
+              gh issue comment "${existing_issue}" --repo "${REPO}" --body "${body}"
+            else
+              gh issue create --repo "${REPO}" --title "${issue_title}" --body "${body}"
+            fi
+          else
+            echo "No drift detected."
+            if [[ -n "${existing_issue}" ]]; then
+              gh issue comment "${existing_issue}" --repo "${REPO}" --body "Drift check passed on the latest run: ${RUN_URL}. Closing."
+              gh issue close "${existing_issue}" --repo "${REPO}"
+            fi
+          fi
