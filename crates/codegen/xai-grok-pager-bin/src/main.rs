@@ -61,6 +61,8 @@ fn process_identity(command: Option<&Command>, is_interactive: bool) -> Option<P
             | Command::Logout
             | Command::Mcp(_)
             | Command::Plugin(_)
+            // gx: `gx providers` is a plain unattended CLI command.
+            | Command::Providers(_)
             | Command::Memory(_)
             | Command::Models
             | Command::Sessions(_)
@@ -2210,6 +2212,12 @@ async fn async_main(mut args: PagerArgs) -> Result<()> {
                 init_tracing_simple("cli");
                 let _otel_guard = xai_grok_telemetry::otel_layer::otel_guard();
                 return xai_grok_pager::plugin_cmd::run(plugin_args).await;
+            }
+            // gx: providers layer CLI. Touches only $GROK_HOME/providers.toml,
+            // so it needs no agent config and never loads the model catalog.
+            Command::Providers(providers_args) => {
+                init_tracing_simple("cli");
+                return xai_grok_pager::providers_cmd::run(providers_args);
             }
             Command::Models => {
                 init_tracing_simple("cli");
