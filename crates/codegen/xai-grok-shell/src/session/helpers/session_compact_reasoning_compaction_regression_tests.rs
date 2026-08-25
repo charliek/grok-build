@@ -856,3 +856,106 @@ async fn thin_partial_retries_on_stall() {
 
     let _ = shutdown_tx.send(());
 }
+
+/// gx: the compaction tool mapping (`generate_session_compact`'s
+/// `ApiBackend::ChatCompletions` arm) builds its `ChatCompletionRequest`
+/// directly rather than going through `From<ConversationRequest>`, so it
+/// must apply `sanitize_json_schema_for_compat` itself. Regression for the
+/// gap where it called `ToolDefinition::function` unsanitized: a tool
+/// schema carrying the schemars `"default": null` artifact must reach the
+/// wire with that key stripped (Fireworks/Groq 400 on it), while real
+/// defaults and everything else about the schema survive untouched.
+#[tokio::test]
+async fn chat_completions_compaction_strips_null_defaults_from_tool_schema() {
+    use std::sync::{Arc, Mutex};
+
+    let captured: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let cap = captured.clone();
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(move |body: axum::Json<serde_json::Value>| {
+            let cap = cap.clone();
+            async move {
+                cap.lock().unwrap().push(body.0);
+                let stream = stream::iter(
+                    summary_stream()
+                        .into_iter()
+                        .map(Ok::<_, std::convert::Infallible>),
+                );
+                Sse::new(stream).keep_alive(KeepAlive::default())
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .unwrap();
+    });
+
+    let base_url = format!("http://{addr}/v1");
+    let config = test_config(&base_url);
+    let client = Client::new(config.clone()).unwrap();
+
+    let chat_history = vec![
+        ConversationItem::system("You are a helpful assistant."),
+        ConversationItem::user("Summarize the conversation so far."),
+    ];
+    let tools = vec![ToolSpec {
+        name: "run_script".to_string(),
+        description: Some("Run a script".to_string()),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "args": {
+                    "description": "JSON value bound to the script's `args` global.",
+                    "default": null
+                },
+                "name": { "type": "string", "default": "ok" }
+            },
+            "required": ["name"]
+        }),
+    }];
+
+    generate_session_compact(
+        chat_history,
+        0,
+        tools,
+        vec![],
+        client,
+        acp::SessionId::new("test-session"),
+        &config,
+        std::time::Duration::from_secs(30),
+        0,
+        crate::util::config::CompactionToolChoice::Auto,
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("compaction with a null-default tool schema must succeed"));
+
+    let bodies = captured.lock().unwrap();
+    assert_eq!(bodies.len(), 1, "mock must have served the request");
+    let params = &bodies[0]["tools"][0]["function"]["parameters"];
+
+    assert!(
+        params["properties"]["args"].get("default").is_none(),
+        "schemars' \"default\": null must not reach the wire: {params}"
+    );
+    assert_eq!(
+        params["properties"]["args"]["description"],
+        "JSON value bound to the script's `args` global.",
+        "non-default fields must survive: {params}"
+    );
+    assert_eq!(
+        params["properties"]["name"]["default"], "ok",
+        "real (non-null) defaults must survive: {params}"
+    );
+    assert_eq!(params["required"], json!(["name"]));
+
+    let _ = shutdown_tx.send(());
+}
