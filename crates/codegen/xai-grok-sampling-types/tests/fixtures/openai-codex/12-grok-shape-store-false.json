@@ -1,0 +1,36 @@
+{
+ "case": "12-grok-shape-store-false",
+ "url": "https://chatgpt.com/backend-api/codex/responses",
+ "status": 200,
+ "request_headers": {
+  "Authorization": "Bearer <REDACTED>",
+  "chatgpt-account-id": "<REDACTED-ACCOUNT-ID>",
+  "originator": "codex-tui",
+  "User-Agent": "codex-tui/0.147.0 (Mac OS 26.5.0; arm64) iTerm.app (codex-tui; 0.147.0)",
+  "Accept": "text/event-stream",
+  "Content-Type": "application/json",
+  "session-id": "b45778cc-f797-4002-9c23-d84de5f635fc"
+ },
+ "request_body": {
+  "model": "gpt-5.6-sol",
+  "input": [
+   {
+    "type": "message",
+    "role": "user",
+    "content": [
+     {
+      "type": "input_text",
+      "text": "Reply with exactly: pong"
+     }
+    ]
+   }
+  ],
+  "reasoning": {
+   "effort": "low",
+   "summary": "concise"
+  },
+  "prompt_cache_key": "fixture-prompt-cache-key",
+  "stream": true,
+  "store": false
+ }
+}

@@ -1,0 +1,68 @@
+{
+ "case": "13b-turn2-replay",
+ "url": "https://chatgpt.com/backend-api/codex/responses",
+ "status": 200,
+ "request_headers": {
+  "Authorization": "Bearer <REDACTED>",
+  "chatgpt-account-id": "<REDACTED-ACCOUNT-ID>",
+  "originator": "codex-tui",
+  "User-Agent": "codex-tui/0.147.0 (Mac OS 26.5.0; arm64) iTerm.app (codex-tui; 0.147.0)",
+  "Accept": "text/event-stream",
+  "Content-Type": "application/json",
+  "session-id": "2444d78a-c2fe-4c21-bdcc-d7ecc46876e5"
+ },
+ "request_body": {
+  "model": "gpt-5.6-sol",
+  "instructions": "You are a helpful assistant.",
+  "input": [
+   {
+    "type": "message",
+    "role": "user",
+    "content": [
+     {
+      "type": "input_text",
+      "text": "Remember the codeword 'zebra42'. Reply OK."
+     }
+    ]
+   },
+   {
+    "id": "msg_06bcee5c497f0b5b016a8d0ea1c04887d19ab817632dfcc265",
+    "type": "message",
+    "status": "completed",
+    "content": [
+     {
+      "type": "output_text",
+      "annotations": [],
+      "logprobs": [],
+      "text": "OK"
+     }
+    ],
+    "phase": "final_answer",
+    "role": "assistant"
+   },
+   {
+    "type": "message",
+    "role": "user",
+    "content": [
+     {
+      "type": "input_text",
+      "text": "What was the codeword? Reply with only it."
+     }
+    ]
+   }
+  ],
+  "tools": [],
+  "tool_choice": "auto",
+  "parallel_tool_calls": false,
+  "reasoning": {
+   "effort": "low",
+   "summary": "auto"
+  },
+  "store": false,
+  "stream": true,
+  "include": [
+   "reasoning.encrypted_content"
+  ],
+  "prompt_cache_key": "fixture-prompt-cache-key"
+ }
+}

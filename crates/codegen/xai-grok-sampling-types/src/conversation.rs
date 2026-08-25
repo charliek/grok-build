@@ -665,6 +665,16 @@ pub struct ConversationRequest {
     pub prompt_cache_key: Option<String>,
     /// What the sampler does when the response stops with `Length`.
     pub length_policy: LengthPolicy,
+    // gx: shape the Responses body for OpenAI's ChatGPT/Codex endpoint
+    // (`https://chatgpt.com/backend-api/codex/responses`), whose validator is
+    // strict where the public Responses API is lenient. Set from
+    // `[model.<id>].codex_compat` via `SamplerConfig`; see the
+    // `From<&ConversationRequest> for rs::CreateResponse` impl in
+    // `conversation/responses.rs` for exactly what it changes.
+    //
+    // `Default` is `false`, so every non-codex request — xAI included — is
+    // byte-for-byte what it was.
+    pub codex_compat: bool,
 }
 
 impl ConversationRequest {
