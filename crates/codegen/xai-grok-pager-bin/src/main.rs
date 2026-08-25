@@ -2477,6 +2477,12 @@ fn should_check_for_updates(no_auto_update_flag: bool) -> bool {
     if cfg!(debug_assertions) {
         return false;
     }
+    // gx: no background/leader update work at all for gx builds. `get_installer`
+    // already short-circuits every install path; this keeps gx from even
+    // spawning the checks (no network, no nag banner).
+    if xai_grok_version::is_gx_build() {
+        return false;
+    }
     if no_auto_update_flag {
         return false;
     }
@@ -2551,6 +2557,12 @@ async fn run_update_command(
 ) -> Result<()> {
     if json && !check {
         anyhow::bail!("--json requires --check");
+    }
+    // gx: fork builds never consume stock grok releases (see `get_installer`);
+    // say so instead of silently doing nothing.
+    if xai_grok_version::is_gx_build() {
+        println!("gx manages its own releases — see docs/gx/README.md");
+        return Ok(());
     }
     let mut update_config = base_update_config.clone();
     if check {

@@ -478,6 +478,23 @@ fn env_installer() -> Option<&'static str> {
 }
 
 pub async fn get_installer() -> Option<&'static str> {
+    // gx: the build flavor is compiled in; the pure variant below is what tests
+    // exercise for both flavors.
+    get_installer_for(xai_grok_version::is_gx_build()).await
+}
+
+/// gx: `is_gx` is a parameter so both build flavors are testable in one process
+/// (mirrors `leader::lock::leader_file_stem_for`).
+///
+/// A gx build is never managed by the stock grok updater. This is the single
+/// chokepoint every update path funnels through (`check_update_status`,
+/// `auto_update_target`, `ensure_latest_on_disk`, `check_update_background`,
+/// `run_update_if_available`, `run_update`), so `None` here means no gx build
+/// ever downloads, installs, or nags about a stock grok release.
+async fn get_installer_for(is_gx: bool) -> Option<&'static str> {
+    if is_gx {
+        return None;
+    }
     if let Some(i) = env_installer() {
         return Some(i);
     }

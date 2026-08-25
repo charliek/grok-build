@@ -69,9 +69,30 @@ fn resolve_lock_path(override_socket: Option<PathBuf>, root: &Path, ws_url: &str
     }
 }
 
-pub fn lock_path_for_ws_url_in(root: &Path, ws_url: &str) -> PathBuf {
+/// gx: file-name stem of the leader socket/lock pair. gx builds use a distinct
+/// stem so a gx client and a stock-grok client never adopt each other's leader
+/// even though both share `$GROK_HOME`. Also drives leader *discovery*
+/// (`leader::discover_leaders_in`), so each build only ever sees its own
+/// leaders. Pure in its input for testability; see [`leader_file_stem`].
+pub(crate) fn leader_file_stem_for(is_gx_build: bool) -> &'static str {
+    if is_gx_build { "gx-leader" } else { "leader" }
+}
+
+/// gx: the leader file stem for this build.
+pub(crate) fn leader_file_stem() -> &'static str {
+    leader_file_stem_for(xai_grok_version::is_gx_build())
+}
+
+/// The `<stem><ws-url-suffix><ext>` path under `root`. Pure (the stem is passed
+/// in) so both builds' layouts are unit-testable in one process.
+fn leader_path_in(root: &Path, ws_url: &str, stem: &str, ext: &str) -> PathBuf {
     let suffix = compute_ws_url_suffix(ws_url);
-    root.join(format!("leader{}.lock", suffix))
+    root.join(format!("{stem}{suffix}{ext}"))
+}
+
+pub fn lock_path_for_ws_url_in(root: &Path, ws_url: &str) -> PathBuf {
+    // gx: stem varies by build; suffix derivation is unchanged.
+    leader_path_in(root, ws_url, leader_file_stem(), ".lock")
 }
 
 pub fn lock_path_for_ws_url(ws_url: &str) -> PathBuf {
@@ -79,8 +100,8 @@ pub fn lock_path_for_ws_url(ws_url: &str) -> PathBuf {
 }
 
 pub fn socket_path_for_ws_url_in(root: &Path, ws_url: &str) -> PathBuf {
-    let suffix = compute_ws_url_suffix(ws_url);
-    root.join(format!("leader{}.sock", suffix))
+    // gx: stem varies by build; suffix derivation is unchanged.
+    leader_path_in(root, ws_url, leader_file_stem(), ".sock")
 }
 
 pub fn socket_path_for_ws_url(ws_url: &str) -> PathBuf {
@@ -88,14 +109,23 @@ pub fn socket_path_for_ws_url(ws_url: &str) -> PathBuf {
 }
 
 pub fn ws_url_suffix_from_paths(lock_path: &Path, socket_path: &Path) -> Option<String> {
+    // gx: parse against this build's stem (see `leader_file_stem`).
+    ws_url_suffix_from_paths_with_stem(lock_path, socket_path, leader_file_stem())
+}
+
+pub(crate) fn ws_url_suffix_from_paths_with_stem(
+    lock_path: &Path,
+    socket_path: &Path,
+    stem: &str,
+) -> Option<String> {
     let lock_name = lock_path.file_name()?.to_str()?;
     let socket_name = socket_path.file_name()?.to_str()?;
     let lock_suffix = lock_name
-        .strip_prefix("leader")?
+        .strip_prefix(stem)?
         .strip_suffix(".lock")?
         .to_string();
     let socket_suffix = socket_name
-        .strip_prefix("leader")?
+        .strip_prefix(stem)?
         .strip_suffix(".sock")?
         .to_string();
 
@@ -336,6 +366,80 @@ mod tests {
             root.join("leader.sock")
         );
         assert_eq!(resolve_lock_path(None, root, ""), root.join("leader.lock"));
+    }
+
+    /// gx: a gx build resolves a different leader socket/lock pair than stock
+    /// grok inside the same `$GROK_HOME`, so neither can adopt the other's
+    /// leader regardless of launch order.
+    #[test]
+    fn gx_build_resolves_distinct_leader_socket() {
+        let root = Path::new("/home/u/.grok");
+        assert_eq!(leader_file_stem_for(false), "leader");
+        assert_eq!(leader_file_stem_for(true), "gx-leader");
+
+        let stock_sock = leader_path_in(root, "", leader_file_stem_for(false), ".sock");
+        let gx_sock = leader_path_in(root, "", leader_file_stem_for(true), ".sock");
+        assert_eq!(stock_sock, root.join("leader.sock"));
+        assert_eq!(gx_sock, root.join("gx-leader.sock"));
+        assert_ne!(stock_sock, gx_sock);
+
+        let stock_lock = leader_path_in(root, "", leader_file_stem_for(false), ".lock");
+        let gx_lock = leader_path_in(root, "", leader_file_stem_for(true), ".lock");
+        assert_eq!(stock_lock, root.join("leader.lock"));
+        assert_eq!(gx_lock, root.join("gx-leader.lock"));
+        assert_ne!(stock_lock, gx_lock);
+
+        // The WS-URL suffix still differentiates instances within a build...
+        let ws_url = "wss://relay.staging.example/ws/code-agent";
+        let suffix = compute_ws_url_suffix(ws_url);
+        assert_eq!(
+            leader_path_in(root, ws_url, leader_file_stem_for(true), ".sock"),
+            root.join(format!("gx-leader{suffix}.sock"))
+        );
+        // ...and round-trips through the stem-aware parser.
+        assert_eq!(
+            ws_url_suffix_from_paths_with_stem(
+                &leader_path_in(root, ws_url, leader_file_stem_for(true), ".lock"),
+                &leader_path_in(root, ws_url, leader_file_stem_for(true), ".sock"),
+                leader_file_stem_for(true),
+            ),
+            Some(suffix)
+        );
+        // Cross-build parsing rejects: a gx path is not a stock leader file
+        // (this is what keeps discovery from crossing builds), and vice versa.
+        assert_eq!(
+            ws_url_suffix_from_paths_with_stem(&gx_lock, &gx_sock, leader_file_stem_for(false)),
+            None
+        );
+        assert_eq!(
+            ws_url_suffix_from_paths_with_stem(
+                &stock_lock,
+                &stock_sock,
+                leader_file_stem_for(true)
+            ),
+            None
+        );
+    }
+
+    /// gx: the live build's stem tracks the compiled-in version, and the paths
+    /// the process actually resolves are built from it.
+    #[test]
+    fn leader_file_stem_tracks_build_discriminator() {
+        let expected = if xai_grok_version::is_gx_build() {
+            "gx-leader"
+        } else {
+            "leader"
+        };
+        assert_eq!(leader_file_stem(), expected);
+        let root = Path::new("/home/u/.grok");
+        assert_eq!(
+            resolve_socket_path(None, root, ""),
+            root.join(format!("{expected}.sock"))
+        );
+        assert_eq!(
+            resolve_lock_path(None, root, ""),
+            root.join(format!("{expected}.lock"))
+        );
     }
 
     #[test]

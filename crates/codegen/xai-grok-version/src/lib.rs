@@ -41,6 +41,33 @@ pub fn installed_semver() -> Result<Version, semver::Error> {
     Version::parse(&installed())
 }
 
+/// gx: semver BUILD-METADATA marker that identifies a `gx` fork build
+/// (e.g. `1.0.8+gx.1`). It is build metadata, never a prerelease, so channel
+/// logic that special-cases `pre` never fires; the `semver` crate sorts it
+/// just *above* the equal-numbered stock release, so a stock release of the
+/// same number never looks like an upgrade.
+pub const GX_BUILD_MARKER: &str = "+gx.";
+
+/// gx: `true` when `version` carries the gx build-metadata marker. Pure, so the
+/// fork's behavior gates are unit-testable without touching process env.
+pub fn version_is_gx(version: &str) -> bool {
+    version.contains(GX_BUILD_MARKER)
+}
+
+/// gx: the single build-time discriminator for "this is a gx build". Everything
+/// the fork has to do differently from stock grok (leader socket name, updater
+/// suppression) keys off this one predicate.
+///
+/// Deliberately reads the *compiled* [`VERSION`] and NOT [`installed`]: these
+/// are identity gates, not version-comparison inputs. Honoring
+/// [`TEST_VERSION_ENV`] here would let a stray env var make a gx binary bind
+/// the stock leader socket and re-enable the stock auto-updater at runtime.
+/// Behavior that needs to vary per flavor in tests takes an `is_gx: bool`
+/// parameter instead (see `leader_file_stem_for`, `get_installer_for`).
+pub fn is_gx_build() -> bool {
+    version_is_gx(VERSION)
+}
+
 /// Formats the compiled version with a channel label for user-facing display, e.g. `"0.2.5 [stable]"`.
 /// `channel_label` is pre-formatted by `xai_grok_update::channel_label()`: `" [alpha]"`, `" [stable]"`, or `""` when no pointer is cached.
 pub fn display_version(channel_label: &str) -> String {
@@ -82,6 +109,52 @@ mod tests {
         // display_version uses compiled VERSION, so verify only that the label appends
         assert_eq!(display_version(""), VERSION);
         assert!(display_version(" [stable]").ends_with("[stable]"));
+    }
+
+    /// gx: the fork discriminator fires only on the `+gx.` build-metadata
+    /// marker, never on stock or alpha versions.
+    #[test]
+    fn version_is_gx_matches_only_gx_build_metadata() {
+        assert!(version_is_gx("1.0.8+gx.1"));
+        assert!(version_is_gx("1.0.8+gx.12"));
+        assert!(!version_is_gx("1.0.8"));
+        assert!(!version_is_gx("1.0.8-alpha.2"));
+        assert!(!version_is_gx("1.0.8+deadbeef"));
+        // The marker is build metadata, not a prerelease, and sorts just above
+        // the equal-numbered stock release (semver 1.x orders build metadata).
+        let gx: Version = "1.0.8+gx.1".parse().unwrap();
+        let stock: Version = "1.0.8".parse().unwrap();
+        assert!(gx.pre.is_empty(), "gx marker must not be a prerelease");
+        assert!(gx > stock, "gx build must not look older than stock 1.0.8");
+    }
+
+    /// gx: the build discriminator is compiled in, so a runtime
+    /// `GROK_TEST_VERSION` can never flip a gx build into stock behavior (wrong
+    /// leader socket, stock auto-update re-enabled) or vice versa. `installed()`
+    /// still honors the override — only the identity gate is pinned.
+    #[test]
+    fn is_gx_build_ignores_test_version_override() {
+        let compiled = version_is_gx(VERSION);
+        assert_eq!(is_gx_build(), compiled);
+
+        let prev = std::env::var_os(TEST_VERSION_ENV);
+        for probe in ["1.0.8+gx.1", "1.0.8"] {
+            // SAFETY: this crate's tests do not otherwise read process env.
+            unsafe { std::env::set_var(TEST_VERSION_ENV, probe) };
+            assert_eq!(installed(), probe, "installed() still honors the override");
+            assert_eq!(
+                is_gx_build(),
+                compiled,
+                "is_gx_build() must track compiled VERSION, not {TEST_VERSION_ENV}={probe}"
+            );
+        }
+        // SAFETY: see above.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(TEST_VERSION_ENV, v),
+                None => std::env::remove_var(TEST_VERSION_ENV),
+            }
+        }
     }
 
     #[test]
