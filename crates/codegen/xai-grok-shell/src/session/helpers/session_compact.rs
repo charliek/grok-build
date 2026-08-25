@@ -4,7 +4,7 @@
 use crate::sampling::{
     ApiBackend, ChatCompletionRequest, ChatRequestMessage, Client as OaiCompatClient,
     ConversationRequest, ConversationToolChoice, HostedTool, SamplingError, ToolChoice,
-    ToolDefinition, ToolSpec, conversation_to_chat_messages,
+    ToolDefinition, ToolSpec, conversation_to_chat_messages, sanitize_json_schema_for_compat,
 };
 use agent_client_protocol as acp;
 use async_openai::types::responses::ResponseStreamEvent;
@@ -528,7 +528,17 @@ pub(crate) async fn generate_session_compact(
                     .with_tools(
                         tools
                             .into_iter()
-                            .map(|t| ToolDefinition::function(t.name, t.description, t.parameters))
+                            .map(|t| {
+                                // gx: same OpenAI-compat sanitizer the wire
+                                // path applies in `From<ConversationRequest>`
+                                // — strips schemars' `"default": null` so
+                                // Fireworks/Groq don't 400 on it.
+                                ToolDefinition::function(
+                                    t.name,
+                                    t.description,
+                                    sanitize_json_schema_for_compat(t.parameters),
+                                )
+                            })
                             .collect(),
                     )
                     .with_tool_choice(wire_tool_choice);
