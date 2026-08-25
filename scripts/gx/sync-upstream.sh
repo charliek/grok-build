@@ -149,7 +149,13 @@ step "11/13 Gate: targeted tests (CI parity, all --locked)"
 cargo check -p xai-grok-pager-bin --locked
 cargo test -p xai-grok-sampling-types --locked
 cargo test -p xai-grok-config --locked
-cargo test -p xai-grok-pager --lib --locked
+# Skip the two host-environment-sensitive upstream diagnostics tests
+# (same skips as .github/workflows/ci.yml -- keep the two lists in sync):
+# doctor_cmd probes the real host; diagnostics::fix spawns an interactive
+# bash and depends on the local shell rc.
+cargo test -p xai-grok-pager --lib --locked -- \
+  --skip doctor_cmd::tests::fake_standalone_facts_compose_through_shared_view \
+  --skip diagnostics::fix::tests::shell_aliases_expand_to_exact_argv_and_bypass_is_explicit
 cargo test -p xai-grok-update --locked
 cargo test -p xai-grok-version --locked
 cargo test -p xai-grok-shell --lib --locked -- leader:: agent::model_providers::tests:: session_compact
