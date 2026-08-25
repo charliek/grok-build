@@ -8,7 +8,10 @@ mod chat_completions;
 mod messages;
 mod responses;
 
-pub use chat_completions::{conversation_item_to_chat_message, conversation_to_chat_messages};
+pub use chat_completions::{
+    conversation_item_to_chat_message, conversation_to_chat_messages,
+    sanitize_json_schema_for_compat,
+};
 pub use messages::build_messages_request;
 pub use responses::{
     extra_tool_entries, patch_reasoning_text_types, response_to_conversation_items,

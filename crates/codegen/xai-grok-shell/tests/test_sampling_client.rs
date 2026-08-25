@@ -1440,3 +1440,86 @@ async fn test_chat_completions_backend_hits_chat_endpoint_not_responses() {
         "Should NOT have called /v1/responses"
     );
 }
+
+/// OpenAI-compat wire hardening, end to end through the real client:
+/// the body that actually leaves the process must not carry
+/// `messages[n].model_id` (Fireworks / Groq 400 on it) nor any
+/// `"default": null` inside a tool's JSON Schema (schemars artifact that
+/// strict servers reject). Everything else about the request is unchanged.
+#[tokio::test]
+async fn chat_completions_request_body_is_openai_compat_clean() {
+    fn collect_key_paths(value: &Value, key: &str, path: &str, out: &mut Vec<String>) {
+        match value {
+            Value::Object(map) => {
+                for (k, v) in map {
+                    let child = format!("{path}/{k}");
+                    if k == key {
+                        out.push(child.clone());
+                    }
+                    collect_key_paths(v, key, &child, out);
+                }
+            }
+            Value::Array(items) => {
+                for (i, v) in items.iter().enumerate() {
+                    collect_key_paths(v, key, &format!("{path}/{i}"), out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let server = MockInferenceServer::start().await.unwrap();
+    server.set_response("ok");
+    let client = create_test_client(&server.url(), ApiBackend::ChatCompletions);
+
+    let request = ConversationRequest::from_items(vec![
+        ConversationItem::system("You are helpful."),
+        ConversationItem::user("q1"),
+        ConversationItem::assistant("a1").with_model_id("grok-4"),
+        ConversationItem::user("q2"),
+    ])
+    .with_tools(vec![ToolSpec {
+        name: "run_script".to_string(),
+        description: Some("Run a script".to_string()),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "args": {"description": "optional args", "default": null},
+                "name": {"type": "string", "default": "ok"}
+            },
+            "required": ["name"]
+        }),
+    }]);
+
+    let _ = client.conversation_collect(request).await.unwrap();
+
+    let body = server.request_bodies().pop().expect("request captured");
+
+    let mut model_ids = Vec::new();
+    collect_key_paths(&body, "model_id", "", &mut model_ids);
+    assert!(
+        model_ids.is_empty(),
+        "no messages[].model_id may reach the wire, found {model_ids:?} in {body:#}"
+    );
+
+    let mut defaults = Vec::new();
+    collect_key_paths(&body, "default", "", &mut defaults);
+    let null_defaults: Vec<&String> = defaults
+        .iter()
+        .filter(|p| body.pointer(p).is_some_and(Value::is_null))
+        .collect();
+    assert!(
+        null_defaults.is_empty(),
+        "no \"default\": null may reach the wire, found {null_defaults:?} in {body:#}"
+    );
+
+    // Nothing else was dropped.
+    let messages = body.get("messages").unwrap().as_array().unwrap();
+    assert_eq!(messages.len(), 4, "{body:#}");
+    assert_eq!(messages[2]["role"], "assistant");
+    assert_eq!(messages[2]["content"], "a1");
+    let params = &body["tools"][0]["function"]["parameters"];
+    assert_eq!(params["properties"]["name"]["default"], "ok");
+    assert_eq!(params["properties"]["args"]["description"], "optional args");
+    assert_eq!(params["required"], json!(["name"]));
+}
