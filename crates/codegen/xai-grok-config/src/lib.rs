@@ -4,8 +4,11 @@
 //! Merge order (lowest to highest priority):
 //! 1. `/etc/grok/managed_config.toml`
 //! 2. `$GROK_HOME/managed_config.toml`
-//! 3. `$GROK_HOME/config.toml`
-//! 4. `$GROK_HOME/requirements.toml` (cloud cache; Ed25519-signed at rest once a key is embedded, see [`signed_policy`])
+//! 3. `$GROK_HOME/config.toml`, with the gx-only providers layer
+//!    (`$GROK_HOME/providers.toml`) merged over it inside this same tier — see
+//!    [`providers_layer`]
+//! 4. `$GROK_HOME/requirements.toml` (cloud cache; Ed25519-signed at rest once a
+//!    key is embedded — see [`signed_policy`] — below the OS-protected layers)
 //! 5. `/etc/grok/requirements.toml`
 //! 6. macOS MDM managed preferences (`ai.x.grok`, admin-forced), macOS only
 //!
@@ -39,6 +42,8 @@ mod mcp_server_config;
 pub mod mcp_servers;
 mod memory_v2;
 mod paths;
+// gx: the `$GROK_HOME/providers.toml` user-tier layer.
+pub mod providers_layer;
 mod remote_announcement;
 mod remote_fetch;
 mod remote_settings;
@@ -116,6 +121,8 @@ pub use paths::{
     ensure_sessions_cwd_dir_in, grok_application, grok_application_in, grok_home, sessions_cwd_dir,
     sessions_cwd_dir_in, set_dir_owner_only, system_config_dir, user_grok_home,
 };
+// gx: the providers layer's public surface (the `gx providers` CLI writes this file).
+pub use providers_layer::{PROVIDERS_FILENAME, PROVIDERS_LAYER_TABLES, providers_layer_path};
 pub use remote_announcement::{AnnouncementCta, RemoteAnnouncement};
 pub use remote_fetch::{remote_fetch_enabled_from_layers, resolve_remote_fetch_enabled};
 pub use remote_settings::{
