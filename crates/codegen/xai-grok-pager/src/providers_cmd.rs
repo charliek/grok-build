@@ -16,8 +16,11 @@
 //!   a TTY, or from piped stdin.
 //! - `status` — per-provider configuration, redacted key material, key source,
 //!   model counts, plus the `~/.codex/auth.json` view for `openai-codex`.
-//! - `login openai` / `token openai` — parsed but not implemented in this
-//!   build (Phase 2); they exit 2 so the clap surface stays stable.
+//! - `login openai` — delegate to `codex login` (gx runs no OAuth flow of its
+//!   own; codex owns the credential store).
+//! - `token openai` — **the auth helper the `openai-codex` preset invokes**:
+//!   print `{"access_token", "expires_in"}` and nothing else on stdout. See
+//!   [`crate::openai_codex_auth`].
 //!
 //! Invariants:
 //! - `config.toml` is **never** written by this module. Not one code path.
@@ -87,36 +90,24 @@ pub enum ProvidersCommand {
     },
     /// Show configured providers, key sources (redacted), and model counts
     Status,
-    /// Sign in to a provider (not yet available in this build)
-    Login(Phase2Args),
-    /// Print a provider access token (not yet available in this build)
-    Token(Phase2Args),
+    /// Sign in to a provider (OpenAI: delegates to `codex login`)
+    Login(AuthTargetArgs),
+    /// Print a provider access token as the auth-helper JSON grok expects
+    Token(AuthTargetArgs),
 }
 
 #[derive(Debug, clap::Args, Clone)]
-pub struct Phase2Args {
+pub struct AuthTargetArgs {
     #[command(subcommand)]
-    pub provider: Phase2Provider,
+    pub provider: AuthTarget,
 }
 
-/// Providers the Phase-2 auth commands will support. Parsed today so the CLI
-/// surface does not change when the implementation lands.
+/// Providers with an interactive login / minted (non-static) credential.
 #[derive(Debug, Subcommand, Clone, Copy, PartialEq, Eq)]
-pub enum Phase2Provider {
+pub enum AuthTarget {
     /// OpenAI (ChatGPT/Codex plan credentials)
     Openai,
 }
-
-impl Phase2Provider {
-    fn id(self) -> &'static str {
-        match self {
-            Phase2Provider::Openai => "openai",
-        }
-    }
-}
-
-/// Exit code for a subcommand that parses but is not implemented yet.
-pub const PHASE2_EXIT_CODE: i32 = 2;
 
 pub fn run(args: ProvidersArgs) -> Result<()> {
     let home = xai_grok_config::grok_home();
@@ -125,26 +116,25 @@ pub fn run(args: ProvidersArgs) -> Result<()> {
         ProvidersCommand::SetKey { provider } => run_set_key(&home, &provider),
         ProvidersCommand::UnsetKey { provider } => run_unset_key(&home, &provider),
         ProvidersCommand::Status => run_status(&home),
-        ProvidersCommand::Login(args) => phase2_unavailable("login", args.provider),
-        ProvidersCommand::Token(args) => phase2_unavailable("token", args.provider),
+        ProvidersCommand::Login(args) => match args.provider {
+            AuthTarget::Openai => run_login_openai(),
+        },
+        ProvidersCommand::Token(args) => match args.provider {
+            AuthTarget::Openai => crate::openai_codex_auth::run_token(),
+        },
     }
 }
 
-/// The message a Phase-2 placeholder prints before exiting [`PHASE2_EXIT_CODE`].
-fn phase2_unavailable_message(command: &str, provider: Phase2Provider) -> String {
-    format!(
-        "gx providers {command} {}: not yet available in this build",
-        provider.id()
-    )
-}
-
-fn phase2_unavailable(command: &str, provider: Phase2Provider) -> ! {
-    eprintln!("{}", phase2_unavailable_message(command, provider));
-    eprintln!(
-        "  This lands with the gx OpenAI phase. Until then, sign in with the \
-         codex CLI (`codex login`) and check `gx providers status`."
-    );
-    std::process::exit(PHASE2_EXIT_CODE)
+/// `gx providers login openai`: run `codex login` and pass its exit status
+/// through, so a script can branch on it exactly as if it had run codex itself.
+fn run_login_openai() -> Result<()> {
+    let status = crate::openai_codex_auth::run_login()?;
+    if status.success() {
+        eprintln!("gx: signed in. `gx providers status` shows the account and expiry.");
+        return Ok(());
+    }
+    // `codex login` already printed its own diagnosis; do not paper over it.
+    std::process::exit(status.code().unwrap_or(1))
 }
 
 /// Sessions read `providers.toml` once at startup; there is no hot-reload
@@ -170,7 +160,7 @@ fn warn_if_not_gx() {
 // `gx providers set-key`, which is the only writer of key material here.
 // ---------------------------------------------------------------------------
 
-/// A scalar a preset can ship. Deliberately small — everything a
+/// A value a preset can ship. Deliberately small — everything a
 /// `[model_providers.*]` / `[model.*]` entry needs.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum PresetValue {
@@ -178,6 +168,24 @@ pub(crate) enum PresetValue {
     Int(i64),
     Bool(bool),
     StrList(&'static [&'static str]),
+    /// A value only this machine can supply — the gx binary's own path, the
+    /// account id in `~/.codex/auth.json`. Resolved once per `install` run
+    /// through [`PresetContext`].
+    Dynamic(DynamicValue),
+}
+
+/// The install-time-resolved preset values. Each one is a whole field value
+/// (an inline table), not a scalar, because both are tables in the shapes gx
+/// ships.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DynamicValue {
+    /// `auth = { command = "<this gx binary>", args = [...] }` — the
+    /// auth-helper seam the `openai-codex` provider mints its bearer through.
+    GxTokenHelper,
+    /// `extra_headers = { "chatgpt-account-id" = "<id>", originator = "gx" }`.
+    /// The account id is omitted (with a warning) when `~/.codex/auth.json`
+    /// carries none.
+    CodexHeaders,
 }
 
 /// One key in a preset entry, plus every value gx has ever shipped for it.
@@ -200,6 +208,213 @@ impl PresetField {
     fn current(&self) -> &PresetValue {
         &self.defaults[0]
     }
+
+    fn dynamic(&self) -> Option<DynamicValue> {
+        match self.current() {
+            PresetValue::Dynamic(kind) => Some(*kind),
+            _ => None,
+        }
+    }
+}
+
+/// Machine facts `install` resolves once and every [`PresetValue::Dynamic`]
+/// reads from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PresetContext {
+    /// How to invoke gx from a config file. The **current executable's**
+    /// absolute path when it can be resolved, so the preset keeps working when
+    /// `gx` is not on `PATH`; bare `gx` otherwise.
+    pub gx_command: String,
+    /// `tokens.account_id` from `~/.codex/auth.json` at install time.
+    pub codex_account_id: Option<String>,
+    /// Things `install` should tell the user about how the above resolved.
+    pub notes: Vec<String>,
+}
+
+impl PresetContext {
+    /// Resolve from this machine: the running binary and the codex store.
+    pub(crate) fn detect() -> Self {
+        let mut notes = Vec::new();
+        let gx_command = match std::env::current_exe() {
+            Ok(path) => path.to_string_lossy().into_owned(),
+            Err(e) => {
+                notes.push(format!(
+                    "could not resolve this binary's own path ({e}); the openai-codex \
+                     auth helper was written as plain `gx`, which must be on PATH."
+                ));
+                "gx".to_owned()
+            }
+        };
+        let codex_account_id = crate::openai_codex_auth::codex_auth_json_path()
+            .and_then(|p| crate::openai_codex_auth::read_auth_document(&p).ok())
+            .and_then(|doc| doc.account_id());
+        Self::new(gx_command, codex_account_id, notes)
+    }
+
+    /// The values as given, plus whatever they imply. Shared by [`detect`] and
+    /// the test constructor so a note is never something only production says.
+    ///
+    /// [`detect`]: Self::detect
+    fn new(gx_command: String, codex_account_id: Option<String>, mut notes: Vec<String>) -> Self {
+        if codex_account_id.is_none() {
+            notes.push(
+                "no ChatGPT account id in ~/.codex/auth.json, so the openai-codex \
+                 `chatgpt-account-id` header was omitted. Run `codex login` (or \
+                 `gx providers login openai`), then re-run `gx providers install`."
+                    .to_owned(),
+            );
+        }
+        Self {
+            gx_command,
+            codex_account_id,
+            notes,
+        }
+    }
+
+    /// A context that reads nothing from this machine.
+    #[cfg(test)]
+    pub(crate) fn fixed(gx_command: &str, codex_account_id: Option<&str>) -> Self {
+        Self::new(
+            gx_command.to_owned(),
+            codex_account_id.map(str::to_owned),
+            Vec::new(),
+        )
+    }
+}
+
+/// The args gx's own auth helper is always invoked with. Also the signature
+/// `install` recognizes when deciding whether an existing `auth` entry is a
+/// gx-shipped one whose binary path may be refreshed.
+pub(crate) const TOKEN_HELPER_ARGS: &[&str] = &["providers", "token", "openai"];
+
+/// Budget grok gives the helper: enough for every case that ends in a token —
+/// one refresh round trip, its single `invalid_grant` retry, and a wait behind
+/// another gx process that is itself doing one.
+///
+/// It deliberately does **not** cover
+/// [`crate::openai_codex_auth::LOCK_TIMEOUT`] *plus* two full round trips: that
+/// combination only arises when the lock holder is itself timing out, and
+/// grok's own timeout is the better outcome than a helper that hangs for
+/// minutes. The lock wait's own error is what explains it.
+pub(crate) const TOKEN_HELPER_TIMEOUT_SECS: i64 = 120;
+
+/// The header naming the ChatGPT account, and the originator gx identifies as.
+pub(crate) const CHATGPT_ACCOUNT_HEADER: &str = "chatgpt-account-id";
+pub(crate) const GX_ORIGINATOR: &str = "gx";
+
+/// Resolve a preset value to the concrete TOML this machine should write.
+///
+/// Comparison, rendering, and the `config.toml` shadow check all run on
+/// [`toml::Value`], so a preset value becomes plain data exactly once, here.
+fn resolve_value(v: &PresetValue, ctx: &PresetContext) -> toml::Value {
+    match v {
+        PresetValue::Str(s) => toml::Value::String((*s).to_owned()),
+        PresetValue::Int(n) => toml::Value::Integer(*n),
+        PresetValue::Bool(b) => toml::Value::Boolean(*b),
+        PresetValue::StrList(items) => toml::Value::Array(
+            items
+                .iter()
+                .map(|i| toml::Value::String((*i).to_owned()))
+                .collect(),
+        ),
+        PresetValue::Dynamic(DynamicValue::GxTokenHelper) => {
+            let mut map = toml::map::Map::new();
+            map.insert(
+                "command".to_owned(),
+                toml::Value::String(ctx.gx_command.clone()),
+            );
+            map.insert(
+                "args".to_owned(),
+                toml::Value::Array(
+                    TOKEN_HELPER_ARGS
+                        .iter()
+                        .map(|a| toml::Value::String((*a).to_owned()))
+                        .collect(),
+                ),
+            );
+            // Explicit, because the 30s default is too tight for the worst
+            // case the helper can legitimately hit: waiting out another gx
+            // process's refresh and then doing its own round trip.
+            map.insert(
+                "timeout_secs".to_owned(),
+                toml::Value::Integer(TOKEN_HELPER_TIMEOUT_SECS),
+            );
+            toml::Value::Table(map)
+        }
+        PresetValue::Dynamic(DynamicValue::CodexHeaders) => {
+            let mut map = toml::map::Map::new();
+            if let Some(id) = &ctx.codex_account_id {
+                map.insert(
+                    CHATGPT_ACCOUNT_HEADER.to_owned(),
+                    toml::Value::String(id.clone()),
+                );
+            }
+            map.insert(
+                "originator".to_owned(),
+                toml::Value::String(GX_ORIGINATOR.to_owned()),
+            );
+            toml::Value::Table(map)
+        }
+    }
+}
+
+/// Whether an existing value is a **gx-shipped shape** of a dynamic field,
+/// even though it does not equal what this machine would write now.
+///
+/// Without this, moving the gx binary (or switching ChatGPT accounts) would
+/// leave the old path/account in place forever: `install` would see a value it
+/// never shipped and treat it as a hand edit. The signature checks below are
+/// narrow enough that a genuinely hand-written helper — different args, an
+/// extra header — is still left alone.
+fn is_shipped_dynamic_shape(kind: DynamicValue, existing: &toml::Value) -> bool {
+    let Some(table) = existing.as_table() else {
+        return false;
+    };
+    match kind {
+        DynamicValue::GxTokenHelper => {
+            let args: Vec<&str> = table
+                .get("args")
+                .and_then(toml::Value::as_array)
+                .map(|a| a.iter().filter_map(toml::Value::as_str).collect())
+                .unwrap_or_default();
+            // All three, because each alone is too weak. The args say what is
+            // being invoked; the command says it is *gx* invoking it — a
+            // wrapper script that happens to call `gx providers token openai`
+            // is the user's, and rewriting its `command` to gx's own path would
+            // silently delete their wrapper from the chain. And no extra field:
+            // an `env`, a `cwd`, a longer `timeout_secs` under a key gx never
+            // ships is a hand edit, and replacing the whole inline table would
+            // drop it.
+            let command_is_gx = table
+                .get("command")
+                .and_then(toml::Value::as_str)
+                .is_some_and(is_gx_command);
+            let only_shipped_keys = table
+                .keys()
+                .all(|k| k == "command" || k == "args" || k == "timeout_secs");
+            args == TOKEN_HELPER_ARGS && command_is_gx && only_shipped_keys
+        }
+        DynamicValue::CodexHeaders => {
+            let originator_is_gx =
+                table.get("originator").and_then(toml::Value::as_str) == Some(GX_ORIGINATOR);
+            let only_shipped_keys = table
+                .keys()
+                .all(|k| k == CHATGPT_ACCOUNT_HEADER || k == "originator");
+            originator_is_gx && only_shipped_keys
+        }
+    }
+}
+
+/// Whether `command` is one gx itself could have written: bare `gx` (the
+/// fallback when `current_exe` fails) or an absolute path whose file name is
+/// `gx` (a gx binary, wherever it was installed). A relative path, or an
+/// absolute one pointing at anything else, belongs to the user.
+fn is_gx_command(command: &str) -> bool {
+    if command == "gx" {
+        return true;
+    }
+    let path = Path::new(command);
+    path.is_absolute() && path.file_name().is_some_and(|n| n == "gx")
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -217,6 +432,10 @@ pub(crate) struct ProviderPreset {
     pub label: &'static str,
     /// Whether `gx providers install` writes this preset in this build.
     pub install: bool,
+    /// `gx providers set-key` refuses this provider. Set on OAuth providers,
+    /// where a static `api_key` outranks — and therefore silently disables —
+    /// the auth helper that is the whole point of the entry.
+    pub rejects_static_key: bool,
     /// Printed by `install` after the entry is written.
     pub note: Option<&'static str>,
     pub fields: &'static [PresetField],
@@ -401,17 +620,107 @@ const FIREWORKS_DEEPSEEK_FLASH_FIELDS: &[PresetField] = &[
     FIREWORKS_REASONING_EFFORTS,
 ];
 
-// -- OpenAI (Phase 2 skeletons; NOT installed by this build) -----------------
+// -- OpenAI (ChatGPT / Codex plan) -------------------------------------------
 //
-// Shapes are placeholders until the ChatGPT request-contract spike fixes them.
-// `openai-codex` deliberately carries NO `env_key`: a static key/env key beats
-// the auth-provider token in credential resolution, which would shadow the
-// codex credentials this preset exists to use.
+// Shapes verified live against `https://chatgpt.com/backend-api/codex/responses`
+// (spike 0A.1, 2026-08-25):
+//
+// - `api_backend = "responses"`, SSE. The endpoint's body validator is strict:
+//   `store: false` is required, unknown top-level fields 400, and
+//   `temperature` / `top_p` / `max_output_tokens` 400 as "Unsupported
+//   parameter". `codex_compat = true` on each model is what makes grok's
+//   Responses mapping emit that shape (see the sampling-types `responses.rs`).
+// - NO `env_key`, and `set-key` refuses this provider: a static key or env key
+//   beats the auth-provider token in credential resolution, which would shadow
+//   the codex credentials this preset exists to use.
+// - `auth` is the inline auth-helper seam: gx's own binary, minting from
+//   `~/.codex/auth.json` (see `crate::openai_codex_auth`). Resolved to the
+//   running executable's absolute path at install time so the entry keeps
+//   working when `gx` is not on PATH.
+// - `chatgpt-account-id` and `originator` are optional today (the spike passed
+//   without each) but are sent anyway as drift insurance; both codex and
+//   CLIProxyAPI send them.
 
 const OPENAI_CODEX_PROVIDER_FIELDS: &[PresetField] = &[
     PresetField::new("base_url", &[s("https://chatgpt.com/backend-api/codex")]),
     PresetField::new("api_backend", &[s("responses")]),
+    PresetField::new("auth", &[PresetValue::Dynamic(DynamicValue::GxTokenHelper)]),
+    PresetField::new(
+        "extra_headers",
+        &[PresetValue::Dynamic(DynamicValue::CodexHeaders)],
+    ),
 ];
+
+/// Shared by every ChatGPT-plan model.
+///
+/// `context_window`: 272000, codex-rs's own value for the gpt-5.6 family
+/// (`codex-rs/models-manager/models.json`). Efforts: the endpoint accepts
+/// none/low/medium/high/xhigh/max and rejects `minimal`; the menu below is
+/// codex's own `supported_reasoning_levels` for these models.
+const OPENAI_CODEX_MODEL_PROVIDER: PresetField =
+    PresetField::new("model_provider", &[s("openai-codex")]);
+const OPENAI_CODEX_CONTEXT_WINDOW: PresetField = PresetField::new("context_window", &[i(272_000)]);
+const OPENAI_CODEX_COMPAT: PresetField = PresetField::new("codex_compat", &[b(true)]);
+const OPENAI_CODEX_SUPPORTS_EFFORT: PresetField =
+    PresetField::new("supports_reasoning_effort", &[b(true)]);
+const OPENAI_CODEX_EFFORT: PresetField = PresetField::new("reasoning_effort", &[s("medium")]);
+const OPENAI_CODEX_EFFORTS: PresetField = PresetField::new(
+    "reasoning_efforts",
+    &[l(&["low", "medium", "high", "xhigh"])],
+);
+
+const OPENAI_SOL_FIELDS: &[PresetField] = &[
+    PresetField::new("model", &[s("gpt-5.6-sol")]),
+    PresetField::new("name", &[s("GPT-5.6 Sol (ChatGPT)")]),
+    PresetField::new(
+        "description",
+        &[s(
+            "OpenAI's frontier agentic coding model, via your ChatGPT plan.",
+        )],
+    ),
+    OPENAI_CODEX_MODEL_PROVIDER,
+    OPENAI_CODEX_CONTEXT_WINDOW,
+    OPENAI_CODEX_COMPAT,
+    OPENAI_CODEX_SUPPORTS_EFFORT,
+    OPENAI_CODEX_EFFORT,
+    OPENAI_CODEX_EFFORTS,
+];
+
+const OPENAI_TERRA_FIELDS: &[PresetField] = &[
+    PresetField::new("model", &[s("gpt-5.6-terra")]),
+    PresetField::new("name", &[s("GPT-5.6 Terra (ChatGPT)")]),
+    PresetField::new("description", &[s("GPT-5.6 Terra via your ChatGPT plan.")]),
+    OPENAI_CODEX_MODEL_PROVIDER,
+    OPENAI_CODEX_CONTEXT_WINDOW,
+    OPENAI_CODEX_COMPAT,
+    OPENAI_CODEX_SUPPORTS_EFFORT,
+    OPENAI_CODEX_EFFORT,
+    OPENAI_CODEX_EFFORTS,
+];
+
+const OPENAI_LUNA_FIELDS: &[PresetField] = &[
+    PresetField::new("model", &[s("gpt-5.6-luna")]),
+    PresetField::new("name", &[s("GPT-5.6 Luna (ChatGPT)")]),
+    PresetField::new(
+        "description",
+        &[s("GPT-5.6 Luna, the faster ChatGPT-plan model.")],
+    ),
+    OPENAI_CODEX_MODEL_PROVIDER,
+    OPENAI_CODEX_CONTEXT_WINDOW,
+    OPENAI_CODEX_COMPAT,
+    OPENAI_CODEX_SUPPORTS_EFFORT,
+    OPENAI_CODEX_EFFORT,
+    OPENAI_CODEX_EFFORTS,
+];
+
+// -- OpenAI (plain API key) --------------------------------------------------
+//
+// A separate provider on purpose, never a dual-mode entry: this one talks to
+// the public Responses API with an `sk-...` key and has nothing to do with a
+// ChatGPT plan. It ships with **no models**: which OpenAI models a key can
+// reach is account-specific, so a shipped catalog would be noise that goes
+// stale. Users add their own `[model.<id>]` entries with
+// `model_provider = "openai-api"`.
 
 const OPENAI_API_PROVIDER_FIELDS: &[PresetField] = &[
     PresetField::new("base_url", &[s("https://api.openai.com/v1")]),
@@ -419,12 +728,19 @@ const OPENAI_API_PROVIDER_FIELDS: &[PresetField] = &[
     PresetField::new("env_key", &[s("OPENAI_API_KEY")]),
 ];
 
+const OPENAI_API_NOTE: &str = "no models ship with this provider — the catalog is account-specific. Add your \
+     own, e.g. [model.\"gpt-5.4\"] with model_provider = \"openai-api\".";
+
+const OPENAI_CODEX_NOTE: &str = "signs in with your ChatGPT plan through `codex login`; run \
+     `gx providers login openai` if `gx providers status` shows no credentials.";
+
 /// The shipped catalog. Order is the order `install` writes and `status` prints.
 pub(crate) const PRESETS: &[ProviderPreset] = &[
     ProviderPreset {
         id: "zai-coding-plan",
         label: "GLM (Z.AI coding plan)",
         install: true,
+        rejects_static_key: false,
         note: Some(ALSO_WORKS_ON_STOCK),
         fields: ZAI_PROVIDER_FIELDS,
         models: &[ModelPreset {
@@ -436,6 +752,7 @@ pub(crate) const PRESETS: &[ProviderPreset] = &[
         id: "openrouter",
         label: "OpenRouter",
         install: true,
+        rejects_static_key: false,
         note: Some(ALSO_WORKS_ON_STOCK),
         fields: OPENROUTER_PROVIDER_FIELDS,
         models: &[ModelPreset {
@@ -447,6 +764,7 @@ pub(crate) const PRESETS: &[ProviderPreset] = &[
         id: "fireworks",
         label: "Fireworks",
         install: true,
+        rejects_static_key: false,
         note: None,
         fields: FIREWORKS_PROVIDER_FIELDS,
         models: &[
@@ -475,16 +793,31 @@ pub(crate) const PRESETS: &[ProviderPreset] = &[
     ProviderPreset {
         id: "openai-codex",
         label: "OpenAI (ChatGPT/Codex plan)",
-        install: false,
-        note: None,
+        install: true,
+        rejects_static_key: true,
+        note: Some(OPENAI_CODEX_NOTE),
         fields: OPENAI_CODEX_PROVIDER_FIELDS,
-        models: &[],
+        models: &[
+            ModelPreset {
+                id: "gpt-5.6-sol",
+                fields: OPENAI_SOL_FIELDS,
+            },
+            ModelPreset {
+                id: "gpt-5.6-terra",
+                fields: OPENAI_TERRA_FIELDS,
+            },
+            ModelPreset {
+                id: "gpt-5.6-luna",
+                fields: OPENAI_LUNA_FIELDS,
+            },
+        ],
     },
     ProviderPreset {
         id: "openai-api",
         label: "OpenAI (API key)",
-        install: false,
-        note: None,
+        install: true,
+        rejects_static_key: false,
+        note: Some(OPENAI_API_NOTE),
         fields: OPENAI_API_PROVIDER_FIELDS,
         models: &[],
     },
@@ -498,47 +831,38 @@ fn preset_for(id: &str) -> Option<&'static ProviderPreset> {
 // TOML value plumbing
 // ---------------------------------------------------------------------------
 
-fn to_edit_value(v: &PresetValue) -> toml_edit::Value {
+/// Render a resolved preset value as the `toml_edit` value `install` writes.
+/// Tables become **inline** tables: they are one field of an entry
+/// (`auth = { ... }`), not a section of their own.
+fn to_edit_value(v: &toml::Value) -> toml_edit::Value {
     match v {
-        PresetValue::Str(s) => toml_edit::Value::from(*s),
-        PresetValue::Int(n) => toml_edit::Value::from(*n),
-        PresetValue::Bool(b) => toml_edit::Value::from(*b),
-        PresetValue::StrList(items) => {
+        toml::Value::String(s) => toml_edit::Value::from(s.as_str()),
+        toml::Value::Integer(n) => toml_edit::Value::from(*n),
+        toml::Value::Float(f) => toml_edit::Value::from(*f),
+        toml::Value::Boolean(b) => toml_edit::Value::from(*b),
+        toml::Value::Datetime(d) => toml_edit::Value::from(d.to_string()),
+        toml::Value::Array(items) => {
             let mut array = toml_edit::Array::new();
-            for item in *items {
-                array.push(*item);
+            for item in items {
+                array.push(to_edit_value(item));
             }
             toml_edit::Value::Array(array)
+        }
+        toml::Value::Table(map) => {
+            let mut table = toml_edit::InlineTable::new();
+            for (k, v) in map {
+                table.insert(k, to_edit_value(v));
+            }
+            toml_edit::Value::InlineTable(table)
         }
     }
 }
 
-fn edit_item_matches(item: &toml_edit::Item, v: &PresetValue) -> bool {
-    match v {
-        PresetValue::Str(s) => item.as_str() == Some(*s),
-        PresetValue::Int(n) => item.as_integer() == Some(*n),
-        PresetValue::Bool(b) => item.as_bool() == Some(*b),
-        PresetValue::StrList(items) => item.as_array().is_some_and(|a| {
-            a.len() == items.len()
-                && a.iter()
-                    .zip(items.iter())
-                    .all(|(got, want)| got.as_str() == Some(*want))
-        }),
-    }
-}
-
-fn toml_value_matches(value: &toml::Value, v: &PresetValue) -> bool {
-    match v {
-        PresetValue::Str(s) => value.as_str() == Some(*s),
-        PresetValue::Int(n) => value.as_integer() == Some(*n),
-        PresetValue::Bool(b) => value.as_bool() == Some(*b),
-        PresetValue::StrList(items) => value.as_array().is_some_and(|a| {
-            a.len() == items.len()
-                && a.iter()
-                    .zip(items.iter())
-                    .all(|(got, want)| got.as_str() == Some(*want))
-        }),
-    }
+/// Both comparisons go through [`edit_item_to_value`] rather than matching on
+/// the `toml_edit` shape: one definition of equality for scalars, arrays, and
+/// tables alike, and no way for an inline table and a section to disagree.
+fn edit_item_matches(item: &toml_edit::Item, want: &toml::Value) -> bool {
+    edit_item_to_value(item).as_ref() == Some(want)
 }
 
 /// Convert a `toml_edit` item to a plain [`toml::Value`], so an entry gx just
@@ -649,6 +973,11 @@ pub(crate) struct InstallReport {
     pub added_fields: Vec<String>,
     /// Fields upgraded from an older shipped default.
     pub upgraded_fields: Vec<String>,
+    /// Machine-derived fields (the gx binary path, the ChatGPT account header)
+    /// rewritten because this machine now resolves them differently.
+    pub refreshed_fields: Vec<String>,
+    /// How the machine-derived values resolved, when that is worth saying.
+    pub context_notes: Vec<String>,
     /// User-modified fields left as they are.
     pub kept_fields: Vec<String>,
     /// User-modified fields overwritten because of `--force`.
@@ -698,6 +1027,7 @@ fn config_state(
     parent: &str,
     child: &str,
     fields: &[PresetField],
+    ctx: &PresetContext,
 ) -> ConfigState {
     let Some(entry) = config
         .and_then(|c| c.get(parent))
@@ -711,7 +1041,7 @@ fn config_state(
     let identical = fields.iter().all(|f| {
         table
             .get(f.key)
-            .is_some_and(|v| toml_value_matches(v, f.current()))
+            .is_some_and(|v| *v == resolve_value(f.current(), ctx))
     });
     if identical {
         ConfigState::Identical
@@ -763,28 +1093,42 @@ fn apply_fields(
     path: &str,
     entry_created: bool,
     force: bool,
+    ctx: &PresetContext,
     report: &mut InstallReport,
 ) {
     for field in fields {
-        let current = field.current();
+        let current = resolve_value(field.current(), ctx);
         match table.get(field.key) {
             None => {
-                set_value_preserving_decor(table, field.key, to_edit_value(current));
+                set_value_preserving_decor(table, field.key, to_edit_value(&current));
                 if !entry_created {
                     report.added_fields.push(format!("{path}.{}", field.key));
                 }
             }
-            Some(item) if edit_item_matches(item, current) => {}
+            Some(item) if edit_item_matches(item, &current) => {}
             Some(item)
                 if field.defaults[1..]
                     .iter()
-                    .any(|older| edit_item_matches(item, older)) =>
+                    .any(|older| edit_item_matches(item, &resolve_value(older, ctx))) =>
             {
-                set_value_preserving_decor(table, field.key, to_edit_value(current));
+                set_value_preserving_decor(table, field.key, to_edit_value(&current));
                 report.upgraded_fields.push(format!("{path}.{}", field.key));
             }
+            // A dynamic field still carrying a gx-shipped *shape* is stale, not
+            // hand-edited: the binary moved, or the ChatGPT account changed.
+            // Refresh it, and say so, rather than requiring `--force`.
+            Some(item)
+                if field.dynamic().is_some_and(|kind| {
+                    edit_item_to_value(item).is_some_and(|v| is_shipped_dynamic_shape(kind, &v))
+                }) =>
+            {
+                set_value_preserving_decor(table, field.key, to_edit_value(&current));
+                report
+                    .refreshed_fields
+                    .push(format!("{path}.{}", field.key));
+            }
             Some(_) if force => {
-                set_value_preserving_decor(table, field.key, to_edit_value(current));
+                set_value_preserving_decor(table, field.key, to_edit_value(&current));
                 report.forced_fields.push(format!("{path}.{}", field.key));
             }
             Some(_) => {
@@ -842,6 +1186,7 @@ fn apply_entry(
     child: &str,
     fields: &[PresetField],
     force: bool,
+    ctx: &PresetContext,
     report: &mut InstallReport,
 ) -> Result<()> {
     let path = quoted_path(parent, child);
@@ -866,7 +1211,7 @@ fn apply_entry(
         }
     }
 
-    let state = config_state(config, parent, child, fields);
+    let state = config_state(config, parent, child, fields, ctx);
     let present = doc
         .get(parent)
         .and_then(|t| t.get(child))
@@ -880,7 +1225,7 @@ fn apply_entry(
     }
 
     let (table, created) = entry_table(doc, parent, child)?;
-    apply_fields(table, fields, &path, created, force, report);
+    apply_fields(table, fields, &path, created, force, ctx, report);
     if created {
         report.added_entries.push(path);
     }
@@ -894,6 +1239,7 @@ pub(crate) fn apply_presets(
     config: Option<&toml::Value>,
     presets: &[ProviderPreset],
     force: bool,
+    ctx: &PresetContext,
 ) -> Result<InstallReport> {
     let mut report = InstallReport::default();
     for preset in presets.iter().filter(|p| p.install) {
@@ -904,6 +1250,7 @@ pub(crate) fn apply_presets(
             preset.id,
             preset.fields,
             force,
+            ctx,
             &mut report,
         )?;
         for model in preset.models {
@@ -914,9 +1261,19 @@ pub(crate) fn apply_presets(
                 model.id,
                 model.fields,
                 force,
+                ctx,
                 &mut report,
             )?;
         }
+    }
+    // Only mention how the machine-derived values resolved when a preset that
+    // actually uses one was installed.
+    if presets
+        .iter()
+        .filter(|p| p.install)
+        .any(|p| p.fields.iter().any(|f| f.dynamic().is_some()))
+    {
+        report.context_notes = ctx.notes.clone();
     }
     // Shadow detection runs over the *finished* document so it can compare the
     // full tables, catching conflicts in fields no preset ships.
@@ -938,6 +1295,7 @@ pub(crate) fn install_at(
     home: &Path,
     presets: &[ProviderPreset],
     force: bool,
+    ctx: &PresetContext,
 ) -> Result<InstallReport> {
     let path = providers_path(home);
     // Everything below is a read-modify-write; hold the cross-process lock for
@@ -946,7 +1304,7 @@ pub(crate) fn install_at(
     let previous = read_existing(&path)?;
     let mut doc = parse_document(&previous, &path)?;
     let config = read_config_for_install(home)?;
-    let mut report = apply_presets(&mut doc, config.as_ref(), presets, force)?;
+    let mut report = apply_presets(&mut doc, config.as_ref(), presets, force, ctx)?;
 
     let mut rendered = doc.to_string();
     if previous.trim().is_empty() {
@@ -964,12 +1322,13 @@ pub(crate) fn install_at(
 fn run_install(home: &Path, force: bool) -> Result<()> {
     warn_if_not_gx();
     let path = providers_path(home);
-    let report = install_at(home, PRESETS, force)?;
+    let report = install_at(home, PRESETS, force, &PresetContext::detect())?;
 
     println!("{}", path.display());
     if report.added_entries.is_empty()
         && report.added_fields.is_empty()
         && report.upgraded_fields.is_empty()
+        && report.refreshed_fields.is_empty()
         && report.forced_fields.is_empty()
     {
         println!("  up to date — nothing to add or upgrade");
@@ -982,6 +1341,9 @@ fn run_install(home: &Path, force: bool) -> Result<()> {
     }
     for field in &report.upgraded_fields {
         println!("  upgraded  {field} (was an older shipped default)");
+    }
+    for field in &report.refreshed_fields {
+        println!("  refreshed {field} (re-resolved for this machine)");
     }
     for field in &report.forced_fields {
         println!("  forced    {field} (--force replaced your value)");
@@ -1001,6 +1363,9 @@ fn run_install(home: &Path, force: bool) -> Result<()> {
             shadow.path,
             shadow.fields.join(", ")
         );
+    }
+    for note in &report.context_notes {
+        eprintln!("warning: {note}");
     }
     warn_if_reclamped(&path, report.reclamped_from);
     if let Some(len) = report.exceeds_runtime_cap {
@@ -1035,6 +1400,17 @@ pub(crate) fn set_key_at(home: &Path, provider: &str, key: &str) -> Result<()> {
     if key.is_empty() {
         bail!("empty key: nothing written");
     }
+    // Checked before anything is opened, and regardless of whether the entry is
+    // already in providers.toml: on an OAuth provider a static key is not a
+    // "second credential", it is one that *wins* over the auth helper.
+    if preset_for(provider).is_some_and(|p| p.rejects_static_key) {
+        bail!(
+            "`{provider}` does not take an API key: it signs in with your ChatGPT \
+             account through `codex login`, and a stored api_key would shadow that. \
+             Run `gx providers login openai`, or use the `openai-api` provider with \
+             $OPENAI_API_KEY for a plain API key."
+        );
+    }
     let path = providers_path(home);
     let _lock = lock_providers(home)?;
     let previous = read_existing(&path)?;
@@ -1047,10 +1423,10 @@ pub(crate) fn set_key_at(home: &Path, provider: &str, key: &str) -> Result<()> {
     let preset = preset_for(provider);
     if !known_here {
         match preset {
-            // A Phase-2 skeleton: writing a lone api_key under an entry this
-            // build never installs would leave a half-configured provider.
+            // A preset this build never installs: writing a lone api_key under
+            // it would leave a half-configured provider.
             Some(preset) if !preset.install => bail!(
-                "`{provider}` is not available in this build yet; nothing written. \
+                "`{provider}` is not installed by this build; nothing written. \
                  Run `gx providers status` to see what is configured."
             ),
             // A preset the user has not installed yet: install just that one so
@@ -1061,6 +1437,7 @@ pub(crate) fn set_key_at(home: &Path, provider: &str, key: &str) -> Result<()> {
                     read_config_for_install(home)?.as_ref(),
                     std::slice::from_ref(preset),
                     false,
+                    &PresetContext::detect(),
                 )?;
             }
             None => bail!(
@@ -1384,13 +1761,95 @@ pub(crate) fn status_report(
         .collect();
 
     let providers_present = path.exists();
+    let codex = codex_auth_path.map(|p| {
+        let mut status = read_codex_auth(p);
+        let installed = installed_openai_codex_entry(providers_doc.as_ref(), config_doc.as_ref());
+        annotate_codex_account(home, &mut status, installed.as_ref());
+        annotate_token_helper(&mut status, installed.as_ref());
+        status
+    });
     StatusReport {
         providers_path: path,
         providers_present,
         providers_error,
         config_error,
         providers,
-        codex: codex_auth_path.map(read_codex_auth),
+        codex,
+    }
+}
+
+/// The `openai-codex` entry as the **runtime** will see it: providers.toml
+/// deep-merged over config.toml, exactly as `load_user_tier_for` resolves it.
+fn installed_openai_codex_entry(
+    providers_doc: Option<&toml::Value>,
+    config_doc: Option<&toml::Value>,
+) -> Option<toml::Value> {
+    merged_entry(
+        table_of(config_doc, "model_providers").and_then(|t| t.get("openai-codex")),
+        table_of(providers_doc, "model_providers").and_then(|t| t.get("openai-codex")),
+    )
+}
+
+/// Flag an installed `auth.command` that is an absolute path to nothing.
+///
+/// The preset writes gx's own absolute path so the helper keeps working when
+/// `gx` is not on `PATH` — which means moving, reinstalling or `cargo clean`ing
+/// the binary turns the entry into a dangling reference. grok's failure there
+/// is a helper that will not spawn, several layers away from this file; saying
+/// so here is the difference between "re-run install" and a debugging session.
+/// Only absolute paths are checked: a bare `gx` (or any other relative command)
+/// is resolved against `PATH` at spawn time, which is not this function's to
+/// second-guess.
+fn annotate_token_helper(status: &mut CodexAuthStatus, installed: Option<&toml::Value>) {
+    let Some(command) = installed
+        .and_then(|entry| entry.get("auth"))
+        .and_then(|auth| auth.get("command"))
+        .and_then(toml::Value::as_str)
+    else {
+        return;
+    };
+    let path = Path::new(command);
+    if path.is_absolute() && !path.exists() {
+        status.helper_path_missing = Some(command.to_owned());
+    }
+}
+
+/// Compare the account in `auth.json` against (a) the one gx last saw and (b)
+/// the one baked into the installed `chatgpt-account-id` header, then refresh
+/// gx's cache.
+///
+/// A ChatGPT account switch is invisible otherwise: the tokens keep working,
+/// but requests carry the previous account's header until `install` is re-run.
+fn annotate_codex_account(
+    home: &Path,
+    status: &mut CodexAuthStatus,
+    installed: Option<&toml::Value>,
+) {
+    let Some(current) = status.account_id.clone() else {
+        return;
+    };
+    let state_path =
+        crate::openai_codex_auth::CodexPaths::for_auth_json(status.path.clone(), home).state;
+    let cached = crate::openai_codex_auth::read_state(&state_path).account_id;
+    let check = crate::openai_codex_auth::account_check(Some(current.clone()), cached);
+    if check.changed {
+        status.account_changed_from = check.cached.as_deref().map(|id| redact_tail(id, 6));
+    }
+    // Cache the account we just saw, so the *next* switch is the one reported.
+    crate::openai_codex_auth::record_account(&state_path, Some(&current));
+
+    // The header that will actually be sent.
+    let header = installed.and_then(|entry| {
+        entry
+            .get("extra_headers")
+            .and_then(|h| h.get(crate::providers_cmd::CHATGPT_ACCOUNT_HEADER))
+            .and_then(toml::Value::as_str)
+            .map(str::to_owned)
+    });
+    if let Some(header) = header
+        && header != current
+    {
+        status.installed_header_mismatch = Some(redact_tail(&header, 6));
     }
 }
 
@@ -1575,20 +2034,36 @@ pub(crate) struct CodexAuthStatus {
     pub error: Option<String>,
     /// `exp` from the access token's JWT payload (signature NOT verified).
     pub access_token_exp: Option<i64>,
+    /// Account id in full. Compared against gx's cache and against the
+    /// installed header; **never rendered** — `account_id_redacted` is.
+    pub account_id: Option<String>,
     /// Account id, redacted to its last 6 characters.
     pub account_id_redacted: Option<String>,
     /// `chatgpt_plan_type`, when the token carries one.
     pub plan: Option<String>,
     pub has_api_key: bool,
     pub has_refresh_token: bool,
+    /// `last_refresh`, as a unix timestamp. Held (rather than a verdict) so the
+    /// refresh rule stays the credential module's single definition and
+    /// rendering stays a pure function of `(status, now)`.
+    pub last_refresh_unix: Option<i64>,
+    /// Whether the file carries a `tokens` object at all.
+    pub has_tokens: bool,
+    /// The account gx saw last time, redacted. `Some` only when it differs
+    /// from the current one.
+    pub account_changed_from: Option<String>,
+    /// The `chatgpt-account-id` written into providers.toml at install time,
+    /// redacted. `Some` only when it no longer matches `auth.json`.
+    pub installed_header_mismatch: Option<String>,
+    /// The installed `auth.command`, when it is an absolute path that no longer
+    /// exists — a moved or removed gx binary. Not a secret: it is a path the
+    /// user wrote (indirectly) and has to fix.
+    pub helper_path_missing: Option<String>,
 }
 
 /// `$CODEX_HOME/auth.json`, else `~/.codex/auth.json`.
 fn codex_auth_path() -> Option<PathBuf> {
-    if let Some(home) = std::env::var_os("CODEX_HOME").filter(|v| !v.is_empty()) {
-        return Some(PathBuf::from(home).join("auth.json"));
-    }
-    dirs::home_dir().map(|h| h.join(".codex").join("auth.json"))
+    crate::openai_codex_auth::codex_auth_json_path()
 }
 
 /// Decode a JWT payload **without verifying the signature**. gx only reads
@@ -1604,61 +2079,42 @@ pub(crate) fn decode_jwt_claims_unverified(token: &str) -> Option<serde_json::Va
 
 /// Read codex's `auth.json` read-only: never written, never refreshed, and
 /// unknown fields are simply not touched.
+///
+/// The parsing and the staleness rule are [`crate::openai_codex_auth`]'s, not a
+/// second copy: what `status` reports about expiry is exactly what
+/// `gx providers token openai` will act on.
 pub(crate) fn read_codex_auth(path: &Path) -> CodexAuthStatus {
     let mut status = CodexAuthStatus {
         path: path.to_path_buf(),
         ..Default::default()
     };
-    let raw = match std::fs::read_to_string(path) {
-        Ok(raw) => raw,
+    // `read_auth_document` reports a missing file as an error; `status` renders
+    // absence differently from unreadability, so it is distinguished here.
+    match std::fs::metadata(path) {
+        Ok(_) => status.present = true,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return status,
         Err(e) => {
             status.error = Some(e.to_string());
             return status;
         }
-    };
-    status.present = true;
-    let json: serde_json::Value = match serde_json::from_str(&raw) {
-        Ok(v) => v,
+    }
+    let doc = match crate::openai_codex_auth::read_auth_document(path) {
+        Ok(doc) => doc,
         Err(e) => {
-            status.error = Some(e.to_string());
+            // The module's messages carry the path and a position, never file
+            // content — this file is nothing but credentials.
+            status.error = Some(format!("{e:#}"));
             return status;
         }
     };
-    status.has_api_key = json
-        .get("OPENAI_API_KEY")
-        .and_then(|v| v.as_str())
-        .is_some_and(|s| !s.trim().is_empty());
-    let tokens = json.get("tokens");
-    status.has_refresh_token = tokens
-        .and_then(|t| t.get("refresh_token"))
-        .and_then(|v| v.as_str())
-        .is_some_and(|s| !s.trim().is_empty());
-
-    let mut account_id = tokens
-        .and_then(|t| t.get("account_id"))
-        .and_then(|v| v.as_str())
-        .map(str::to_owned);
-
-    if let Some(access) = tokens
-        .and_then(|t| t.get("access_token"))
-        .and_then(|v| v.as_str())
-        && let Some(claims) = decode_jwt_claims_unverified(access)
-    {
-        status.access_token_exp = claims.get("exp").and_then(serde_json::Value::as_i64);
-        let auth = claims.get("https://api.openai.com/auth");
-        if account_id.is_none() {
-            account_id = auth
-                .and_then(|a| a.get("chatgpt_account_id"))
-                .and_then(|v| v.as_str())
-                .map(str::to_owned);
-        }
-        status.plan = auth
-            .and_then(|a| a.get("chatgpt_plan_type"))
-            .and_then(|v| v.as_str())
-            .map(str::to_owned);
-    }
-    status.account_id_redacted = account_id.as_deref().map(|id| redact_tail(id, 6));
+    status.has_api_key = doc.has_api_key();
+    status.has_refresh_token = doc.has_refresh_token();
+    status.access_token_exp = doc.access_token_exp();
+    status.plan = doc.plan();
+    status.account_id = doc.account_id();
+    status.account_id_redacted = status.account_id.as_deref().map(|id| redact_tail(id, 6));
+    status.last_refresh_unix = doc.last_refresh_unix();
+    status.has_tokens = doc.has_tokens();
     status
 }
 
@@ -1695,16 +2151,53 @@ fn render_codex_status(codex: &CodexAuthStatus, now_unix: i64) -> String {
             out.push_str("  access token no parsable JWT exp claim\n");
         }
     }
+    if codex.has_tokens {
+        use crate::openai_codex_auth::Freshness;
+        let verdict = crate::openai_codex_auth::freshness_from(
+            codex.access_token_exp,
+            codex.last_refresh_unix,
+            now_unix,
+        );
+        let line = match verdict {
+            Freshness::FreshByJwt { .. } => "fresh (JWT exp)",
+            Freshness::FreshByLastRefresh { .. } => "fresh (last_refresh, no parsable JWT)",
+            Freshness::StaleByJwt => "REFRESH DUE — `gx providers token openai` will refresh it",
+            Freshness::StaleByLastRefresh => {
+                "REFRESH DUE — last_refresh is over 7 days old, no parsable JWT"
+            }
+            Freshness::StaleUnknown => {
+                "UNKNOWN — no JWT exp and no last_refresh; gx will try to refresh"
+            }
+        };
+        out.push_str(&format!("  refresh      {line}\n"));
+    }
     if let Some(account) = &codex.account_id_redacted {
         out.push_str(&format!("  account      {account}\n"));
     }
     if let Some(plan) = &codex.plan {
         out.push_str(&format!("  plan         {plan}\n"));
     }
+    if let Some(previous) = &codex.account_changed_from {
+        out.push_str(&format!(
+            "  ACCOUNT CHANGED  was {previous}; gx's cached account has been updated\n"
+        ));
+    }
+    if let Some(installed) = &codex.installed_header_mismatch {
+        out.push_str(&format!(
+            "  STALE HEADER     providers.toml sends chatgpt-account-id {installed}, which no \
+             longer matches auth.json — re-run `gx providers install`\n"
+        ));
+    }
+    if let Some(command) = &codex.helper_path_missing {
+        out.push_str(&format!(
+            "  HELPER MISSING   {command}: helper path missing (binary moved?) — rerun \
+             `gx providers install`\n"
+        ));
+    }
     if codex.has_api_key {
         out.push_str("  OPENAI_API_KEY present in auth.json (api-key mode)\n");
     }
-    if !codex.has_refresh_token {
+    if codex.has_tokens && !codex.has_refresh_token {
         out.push_str("  note         no refresh_token; `codex login` again when it expires\n");
     }
     out.push('\n');
@@ -1752,7 +2245,7 @@ pub(crate) const MAX_CONFIG_BYTES: u64 = 10 * 1024 * 1024;
 ///
 /// `Ok(false)` = absent, treat as empty. `Ok(true)` = safe to read. `Err` =
 /// refuse. The message carries only the path and sizes, never file content.
-fn gate_file(path: &Path, max_bytes: u64, what: &str) -> Result<bool> {
+pub(crate) fn gate_file(path: &Path, max_bytes: u64, what: &str) -> Result<bool> {
     match std::fs::metadata(path) {
         Ok(meta) => {
             if !meta.is_file() {
