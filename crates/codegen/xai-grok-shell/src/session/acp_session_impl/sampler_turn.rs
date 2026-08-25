@@ -658,6 +658,7 @@ impl SessionActor {
                 reasoning_effort: None,
                 reasoning_summary: None,
                 stream_tool_calls: None,
+                codex_compat: None,
             });
         let creds = self.chat_state_handle.get_credentials().await;
         let model_facts = self.model_auth_facts(cfg.model.as_str());
@@ -747,6 +748,9 @@ impl SessionActor {
             max_retries: cfg.max_retries.or(Some(self.max_retries)),
             rate_limit_retry_threshold: cfg.rate_limit_retry_threshold,
             stream_tool_calls: cfg.stream_tool_calls.unwrap_or(false),
+            // gx: survives model switches -- this config is rebuilt from the
+            // chat-state actor's copy on every turn.
+            codex_compat: cfg.codex_compat.unwrap_or(false),
             idle_timeout_secs: None,
             client_identifier: self.client_identifier.clone(),
             deployment_id: crate::managed_config::resolve_deployment_id(
