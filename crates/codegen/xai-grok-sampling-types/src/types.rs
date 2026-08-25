@@ -1070,6 +1070,12 @@ pub struct SamplingConfig {
     /// API request body so the upstream emits per-chunk argument deltas.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_tool_calls: Option<bool>,
+    /// gx: when true, shape the Responses body for OpenAI's ChatGPT/Codex
+    /// endpoint. Carried here (and not only on `SamplerConfig`) because the
+    /// per-turn sampler config is rebuilt from this struct after every model
+    /// switch; dropping it here would silently disable the shaping mid-session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_compat: Option<bool>,
 }
 
 // ============ Responses API wrapper ============

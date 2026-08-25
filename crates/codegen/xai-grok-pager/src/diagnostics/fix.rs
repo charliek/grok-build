@@ -1459,7 +1459,7 @@ fn resolve_validator_program(shell: &Path) -> Option<PathBuf> {
     find_on_path(kind.name())
 }
 
-fn find_on_path(name: &str) -> Option<PathBuf> {
+pub(crate) fn find_on_path(name: &str) -> Option<PathBuf> {
     find_on_path_in(name, std::env::split_paths(&std::env::var_os("PATH")?))
 }
 
