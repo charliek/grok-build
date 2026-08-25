@@ -1890,3 +1890,102 @@ fn json_kind(value: &serde_json::Value) -> &'static str {
         serde_json::Value::Object(_) => "object",
     }
 }
+
+// ---------------------------------------------------------------------------
+// gx: codex_compat rewrites system-role input items to role:"developer".
+//
+// Verified live: `backend-api/codex/responses` 400s ("System messages are
+// not allowed") on any input item with role:"system", but accepts
+// role:"developer". grok always sends its system prompt as a system-role
+// input item, so without this rewrite every real gx request to
+// openai-codex models fails.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn codex_compat_rewrites_system_role_input_items_to_developer() {
+    let body = body_of(&codex_request());
+
+    let input = body["input"].as_array().expect("input items");
+    let roles: Vec<Option<&str>> = input
+        .iter()
+        .map(|item| item.get("role").and_then(serde_json::Value::as_str))
+        .collect();
+
+    assert!(
+        roles.contains(&Some("developer")),
+        "the system item must be rewritten to role:\"developer\" — {body}"
+    );
+    assert!(
+        !roles.contains(&Some("system")),
+        "no input item may carry role:\"system\" — the codex endpoint 400s on it — {body}"
+    );
+    assert!(
+        !body.to_string().contains("\"system\""),
+        "\"system\" must not appear anywhere in the serialized input — {body}"
+    );
+}
+
+#[test]
+fn codex_compat_rewrites_every_system_item_preserving_order() {
+    let mut req = ConversationRequest::from_items(vec![
+        ConversationItem::system("first system prompt"),
+        ConversationItem::user("hello"),
+        ConversationItem::system("second system prompt"),
+    ])
+    .with_model("gpt-5.6-sol");
+    req.codex_compat = true;
+
+    let body = body_of(&req);
+    let input = body["input"].as_array().expect("input items");
+
+    let roles: Vec<&str> = input
+        .iter()
+        .map(|item| item["role"].as_str().expect("role"))
+        .collect();
+    assert_eq!(
+        roles,
+        vec!["developer", "user", "developer"],
+        "order must be preserved and both system items rewritten — {body}"
+    );
+
+    // EasyInputMessage content serializes as a plain string for text-only
+    // items; accept both the string and content-part-array shapes.
+    let texts: Vec<&str> = input
+        .iter()
+        .map(|item| {
+            item["content"]
+                .as_str()
+                .or_else(|| item["content"][0]["text"].as_str())
+                .expect("text content")
+        })
+        .collect();
+    assert_eq!(
+        texts,
+        vec!["first system prompt", "hello", "second system prompt"],
+        "content must survive the role rewrite unchanged — {body}"
+    );
+}
+
+#[test]
+fn without_codex_compat_system_role_input_items_stay_system() {
+    // The xAI regression: off the codex path, system-role input items must
+    // keep serializing exactly as they always have.
+    let mut req = codex_request();
+    req.codex_compat = false;
+
+    let body = body_of(&req);
+    let input = body["input"].as_array().expect("input items");
+    let roles: Vec<&str> = input
+        .iter()
+        .map(|item| item["role"].as_str().expect("role"))
+        .collect();
+
+    assert!(
+        roles.contains(&"system"),
+        "system-role input items must not be rewritten off the codex path — {body}"
+    );
+    assert!(
+        !roles.contains(&"developer"),
+        "no item should become \"developer\" off the codex path — {body}"
+    );
+}
