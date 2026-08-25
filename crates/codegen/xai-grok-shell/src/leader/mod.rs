@@ -360,7 +360,8 @@ fn descriptor_from_paths(
                 lock_path
                     .as_deref()
                     .and_then(|path| path.file_name()?.to_str())
-                    .and_then(|name| name.strip_prefix("leader"))
+                    // gx: this build's stem (see `lock::leader_file_stem`).
+                    .and_then(|name| name.strip_prefix(lock::leader_file_stem()))
                     .and_then(|name| name.strip_suffix(".lock"))
                     .map(str::to_string)
             })
@@ -368,7 +369,8 @@ fn descriptor_from_paths(
                 socket_path
                     .as_deref()
                     .and_then(|path| path.file_name()?.to_str())
-                    .and_then(|name| name.strip_prefix("leader"))
+                    // gx: this build's stem (see `lock::leader_file_stem`).
+                    .and_then(|name| name.strip_prefix(lock::leader_file_stem()))
                     .and_then(|name| name.strip_suffix(".sock"))
                     .map(str::to_string)
             })
@@ -397,15 +399,17 @@ async fn discover_leaders_in(root: &Path) -> Vec<LeaderDescriptor> {
             continue;
         };
         let file_name = file_name.to_string();
+        // gx: discovery only sees this build's leaders (gx vs stock stem).
         if let Some(suffix) = file_name
-            .strip_prefix("leader")
+            .strip_prefix(lock::leader_file_stem())
             .and_then(|name| name.strip_suffix(".lock"))
         {
             candidates.entry(suffix.to_string()).or_default().0 = Some(path);
             continue;
         }
+        // gx: discovery only sees this build's leaders (gx vs stock stem).
         if let Some(suffix) = file_name
-            .strip_prefix("leader")
+            .strip_prefix(lock::leader_file_stem())
             .and_then(|name| name.strip_suffix(".sock"))
         {
             candidates.entry(suffix.to_string()).or_default().1 = Some(path);
@@ -1658,8 +1662,22 @@ fn resolve_binary_impl(
     grok_home: &Path,
     current_exe: Option<std::path::PathBuf>,
 ) -> Result<std::path::PathBuf, ConnectionError> {
+    // gx: the managed-install redirect below points at stock `grok`.
+    resolve_binary_impl_for(grok_home, current_exe, xai_grok_version::is_gx_build())
+}
+/// gx: `is_gx_build` is a parameter so both builds' resolution is testable in
+/// one process. A gx build never redirects to the managed `~/.grok/bin/grok`:
+/// that is the *stock* binary, and a leader spawned from it would bind the
+/// stock socket stem (see `lock::leader_file_stem`), leaving the gx client
+/// waiting on a socket nobody binds.
+fn resolve_binary_impl_for(
+    grok_home: &Path,
+    current_exe: Option<std::path::PathBuf>,
+    is_gx_build: bool,
+) -> Result<std::path::PathBuf, ConnectionError> {
     let managed_bin = grok_home.join("bin").join(managed_grok_bin_name());
-    if let Some(ref exe) = current_exe
+    if !is_gx_build
+        && let Some(ref exe) = current_exe
         && path_is_under(exe, grok_home)
         && managed_bin.exists()
     {
@@ -1668,7 +1686,7 @@ fn resolve_binary_impl(
     if let Some(exe) = current_exe {
         return Ok(exe);
     }
-    if managed_bin.exists() {
+    if !is_gx_build && managed_bin.exists() {
         return Ok(managed_bin);
     }
     Err(ConnectionError::SpawnFailed(
@@ -2624,6 +2642,36 @@ mod tests {
         std::fs::write(&managed, "managed").unwrap();
         let result = resolve_binary_impl(temp.path(), None).unwrap();
         assert_eq!(result, managed);
+    }
+    /// gx: a gx build spawns *itself* as the leader, never the managed stock
+    /// `grok` binary — even when it lives under `$GROK_HOME` (which is what
+    /// triggers the managed redirect for stock builds).
+    #[test]
+    fn resolve_binary_never_redirects_gx_build_to_managed_grok() {
+        let temp = TempDir::new().unwrap();
+        let bin_dir = temp.path().join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let managed = bin_dir.join(managed_grok_bin_name());
+        std::fs::write(&managed, "managed-stock-grok").unwrap();
+        let gx_exe = bin_dir.join("gx");
+        std::fs::write(&gx_exe, "gx").unwrap();
+
+        // Stock build in the same layout takes the managed redirect...
+        assert_eq!(
+            resolve_binary_impl_for(temp.path(), Some(gx_exe.clone()), false).unwrap(),
+            managed
+        );
+        // ...a gx build keeps its own exe.
+        assert_eq!(
+            resolve_binary_impl_for(temp.path(), Some(gx_exe.clone()), true).unwrap(),
+            gx_exe
+        );
+        // And with no current_exe a gx build errors rather than spawning stock.
+        assert_eq!(
+            resolve_binary_impl_for(temp.path(), None, false).unwrap(),
+            managed
+        );
+        assert!(resolve_binary_impl_for(temp.path(), None, true).is_err());
     }
     #[test]
     fn pid_check_identifies_dead_leader() {

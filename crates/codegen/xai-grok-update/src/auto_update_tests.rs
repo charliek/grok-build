@@ -2558,3 +2558,69 @@ async fn test_windows_replace_exe_sweeps_accumulated_asides() {
         "other executables' leftovers must be untouched"
     );
 }
+
+// ---------------------------------------------------------------------------
+// gx: fork builds are never managed by the stock grok updater.
+// ---------------------------------------------------------------------------
+
+/// gx: `get_installer` is the single chokepoint every update path funnels
+/// through; for a gx build it returns `None` even when the environment screams
+/// "npm-managed", so nothing downloads, installs, or nags. The flavor is a
+/// compiled-in constant, so both branches are covered through the pure
+/// `get_installer_for` rather than a `GROK_TEST_VERSION` override.
+#[tokio::test]
+#[serial_test::serial]
+async fn gx_build_has_no_installer() {
+    let _g = InstallerEnvGuard::isolate();
+    unsafe { std::env::set_var("GROK_INSTALLER", "npm") };
+
+    assert_eq!(
+        get_installer_for(true).await,
+        None,
+        "gx builds must resolve no installer, so every update path bails early"
+    );
+    // Stock builds are unaffected: the same env still resolves npm.
+    assert_eq!(get_installer_for(false).await, Some("npm"));
+
+    // And the live wrapper agrees with this build's compiled flavor.
+    let expected = if xai_grok_version::is_gx_build() {
+        None
+    } else {
+        Some("npm")
+    };
+    assert_eq!(get_installer().await, expected);
+}
+
+/// gx: the version-comparison layer is safe with build metadata — `1.0.8+gx.1`
+/// sorts just *above* stock `1.0.8`, so an equal-numbered stock release is
+/// never "newer", and the stable-channel prerelease special-case never fires
+/// (`current.pre` is empty for a build-metadata version).
+#[test]
+fn gx_version_never_needs_update_against_equal_stock_release() {
+    assert_eq!(
+        needs_update("1.0.8+gx.1", "1.0.8", "stable", false),
+        Some(false),
+        "an equal-numbered stock release must not look like an upgrade"
+    );
+    assert_eq!(
+        needs_update("1.0.8+gx.1", "1.0.7", "stable", false),
+        Some(false)
+    );
+    // A genuinely newer stock release still compares as newer — the gx gate is
+    // `get_installer`, not the comparison, so this stays honest.
+    assert_eq!(
+        needs_update("1.0.8+gx.1", "1.0.9", "stable", false),
+        Some(true)
+    );
+    // Note the reason `get_installer` (not `needs_update`) is the gate: with an
+    // authoritative installer, `allow_downgrade` compares by inequality, and
+    // build metadata makes `1.0.8+gx.1 != 1.0.8`.
+    assert_eq!(
+        needs_update("1.0.8+gx.1", "1.0.8", "stable", true),
+        Some(true)
+    );
+    // Sanity: `+gx.1` is build metadata, not a prerelease.
+    let gx = semver::Version::parse("1.0.8+gx.1").unwrap();
+    assert!(gx.pre.is_empty(), "gx marker must not be a prerelease");
+    assert_eq!(gx.build.as_str(), "gx.1");
+}
