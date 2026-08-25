@@ -32,7 +32,18 @@ const INCOMPLETE_REASON_MAX_PROMPT_TOKENS: &str = "max_prompt_tokens";
 /// A server-side time limit cut generation short (xAI extension).
 const INCOMPLETE_REASON_MAX_TIME_LIMIT: &str = "max_time_limit";
 
-/// Returns whether a Responses API event reflects real model progress rather than a liveness-only heartbeat or status transition.
+/// Hard cap on the number of items retained in `streamed_output_items` (the
+/// empty-terminal-frame fallback; see its doc comment). A real turn's output
+/// array is small — a handful of messages/tool calls — so this is generous
+/// headroom, not a working limit. It exists purely to bound memory for a
+/// runaway or adversarial stream: once hit, further items are dropped and
+/// the fallback simply becomes partial for that turn, which is strictly
+/// better than growing without bound. The normal `response.output` path
+/// (the common case) is unaffected either way.
+const MAX_STREAMED_OUTPUT_ITEMS: usize = 512;
+
+/// Returns whether a Responses API event reflects real model progress
+/// rather than a liveness-only heartbeat / status transition.
 pub(crate) fn responses_event_has_meaningful_content(event: &rs::ResponseStreamEvent) -> bool {
     use rs::ResponseStreamEvent;
 
@@ -253,6 +264,28 @@ pub(crate) fn stream_responses_tracked<'a>(
         // Later `ResponseFunctionCallArgumentsDelta` events look up `output_index` here to find the matching `tool_index`
         let mut output_to_tool_index: BTreeMap<u32, u32> = BTreeMap::new();
         let mut next_tool_index: u32 = 0;
+
+        // Completed output items observed on the wire, keyed by
+        // `output_index` so they replay in server order.
+        //
+        // The Responses API contract says the terminal `response.completed` /
+        // `response.incomplete` frame repeats the full `output` array, and
+        // that is what we normally read. Some backends (notably the ChatGPT
+        // `backend-api/codex` deployment) send the terminal frame with
+        // `"output": []` and expect the client to have assembled the turn
+        // from the per-item `response.output_item.done` frames instead.
+        // Without this, every visible message and tool call is dropped and
+        // the turn looks empty even though usage was billed.
+        //
+        // Only variants that `response_to_conversation_items` actually turns
+        // into a `ConversationItem` are worth keeping around for this
+        // fallback (see the insert site below for the exact list and why).
+        // Everything else — including `McpCall`, whose payloads can be
+        // large — is dropped at insert time rather than retained until the
+        // terminal frame, and insertion stops past
+        // `MAX_STREAMED_OUTPUT_ITEMS` regardless of variant, so a runaway
+        // stream can't grow this without bound.
+        let mut streamed_output_items: BTreeMap<u32, rs::OutputItem> = BTreeMap::new();
 
         let mut stream = raw_stream;
         loop {
@@ -555,6 +588,36 @@ pub(crate) fn stream_responses_tracked<'a>(
                         }
                         _ => {}
                     }
+                    // Authoritative per-item copy of what the deltas
+                    // approximated. Kept as a fallback for backends whose
+                    // terminal frame omits `output`; see
+                    // `streamed_output_items`. Only store variants that
+                    // `response_to_conversation_items` actually converts
+                    // into a `ConversationItem` — Message (assistant text),
+                    // FunctionCall (tool calls), Reasoning, and the three
+                    // backend-tool-call kinds it renders as
+                    // `BackendToolCall` items (WebSearchCall, CustomToolCall,
+                    // CodeInterpreterCall). Every other variant (McpCall
+                    // included — it only ever bumps a counter there, never
+                    // producing an item, despite sometimes carrying a large
+                    // payload) is dropped here rather than retained until
+                    // the terminal frame. Bounded by
+                    // `MAX_STREAMED_OUTPUT_ITEMS` so a runaway stream can't
+                    // grow this without limit.
+                    if streamed_output_items.len() < MAX_STREAMED_OUTPUT_ITEMS {
+                        match &done_event.item {
+                            rs::OutputItem::Message(_)
+                            | rs::OutputItem::FunctionCall(_)
+                            | rs::OutputItem::Reasoning(_)
+                            | rs::OutputItem::WebSearchCall(_)
+                            | rs::OutputItem::CustomToolCall(_)
+                            | rs::OutputItem::CodeInterpreterCall(_) => {
+                                streamed_output_items
+                                    .insert(done_event.output_index, done_event.item);
+                            }
+                            _ => {}
+                        }
+                    }
                 }
 
                 // CustomToolCallInputDelta is x_search in-progress streaming.
@@ -637,8 +700,18 @@ pub(crate) fn stream_responses_tracked<'a>(
             .as_ref()
             .map(|d| d.reason.clone());
 
-        // Convert to ConversationItem(s); patch in accumulated reasoning text as a fallback when the final response lacks `content` or `summary`
-        // The streaming deltas may have arrived out of band
+        // Terminal frame carried no output array: rebuild the turn from the
+        // `response.output_item.done` frames we saw. Only ever a fallback —
+        // when the terminal frame does carry `output` it stays authoritative.
+        if response.output.is_empty() && !streamed_output_items.is_empty() {
+            response.output = std::mem::take(&mut streamed_output_items)
+                .into_values()
+                .collect();
+        }
+
+        // Convert to ConversationItem(s); patch in accumulated reasoning
+        // text as a fallback when the final response lacks `content` /
+        // `summary` (the streaming deltas may have arrived out of band).
         // Splice policy lives in `inject_streaming_reasoning_fallback`.
         let mut items = xai_grok_sampling_types::response_to_conversation_items(response);
         xai_grok_sampling_types::inject_streaming_reasoning_fallback(&mut items, reasoning_acc);
@@ -1120,6 +1193,214 @@ mod tests {
             }
             other => panic!("expected Completed, got {other:?}"),
         }
+    }
+
+    /// Parse a raw SSE `data:` payload exactly as it arrives on the wire.
+    fn wire_event(json: &str) -> rs::ResponseStreamEvent {
+        serde_json::from_str(json).expect("wire event should deserialize")
+    }
+
+    /// Terminal frame from the ChatGPT `backend-api/codex` deployment: the
+    /// `output` array is empty even for a successful turn, so the completed
+    /// items only ever appear on `response.output_item.done`.
+    fn codex_completed_frame(output_tokens: u32) -> String {
+        format!(
+            r#"{{"type":"response.completed","sequence_number":9,"response":{{
+                "id":"resp_1","object":"response","created_at":1787629216,
+                "completed_at":1787629217,"status":"completed","background":false,
+                "error":null,"incomplete_details":null,"instructions":null,
+                "max_output_tokens":null,"model":"gpt-5.6-sol","output":[],
+                "parallel_tool_calls":false,"previous_response_id":null,
+                "temperature":1.0,"tool_choice":"auto","tools":[],"top_p":1.0,
+                "usage":{{"input_tokens":10,"input_tokens_details":{{"cached_tokens":0}},
+                "output_tokens":{output_tokens},
+                "output_tokens_details":{{"reasoning_tokens":0}},"total_tokens":{total}}}
+            }}}}"#,
+            total = 10 + output_tokens,
+        )
+    }
+
+    fn completed_response(events: &[SamplingEvent]) -> &ConversationResponse {
+        match events.last().unwrap() {
+            SamplingEvent::Completed { response, .. } => response,
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    fn assistant_items(
+        response: &ConversationResponse,
+    ) -> Vec<&xai_grok_sampling_types::AssistantItem> {
+        response
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                ConversationItem::Assistant(a) => Some(a),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Replays the real `gpt-5.6-sol` "Reply with exactly pong" turn recorded
+    /// off `https://chatgpt.com/backend-api/codex`. The terminal frame's
+    /// `output` is `[]`, so the visible text has to come from the
+    /// `response.output_item.done` frame.
+    #[tokio::test]
+    async fn completed_frame_without_output_recovers_message_from_item_done() {
+        let raw = stream::iter(vec![
+            Ok(wire_event(
+                r#"{"type":"response.output_item.added","sequence_number":2,"output_index":0,
+                    "item":{"id":"msg_1","type":"message","status":"in_progress","content":[],
+                    "phase":"final_answer","role":"assistant"}}"#,
+            )),
+            Ok(wire_event(
+                r#"{"type":"response.content_part.added","sequence_number":3,"item_id":"msg_1",
+                    "output_index":0,"content_index":0,
+                    "part":{"type":"output_text","annotations":[],"logprobs":[],"text":""}}"#,
+            )),
+            Ok(wire_event(
+                r#"{"type":"response.output_text.delta","sequence_number":4,"item_id":"msg_1",
+                    "output_index":0,"content_index":0,"delta":"pong","logprobs":[]}"#,
+            )),
+            Ok(wire_event(
+                r#"{"type":"response.output_text.done","sequence_number":5,"item_id":"msg_1",
+                    "output_index":0,"content_index":0,"text":"pong","logprobs":[]}"#,
+            )),
+            Ok(wire_event(
+                r#"{"type":"response.content_part.done","sequence_number":6,"item_id":"msg_1",
+                    "output_index":0,"content_index":0,
+                    "part":{"type":"output_text","annotations":[],"logprobs":[],"text":"pong"}}"#,
+            )),
+            Ok(wire_event(
+                r#"{"type":"response.output_item.done","sequence_number":7,"output_index":0,
+                    "item":{"id":"msg_1","type":"message","status":"completed",
+                    "content":[{"type":"output_text","annotations":[],"logprobs":[],
+                    "text":"pong"}],"phase":"final_answer","role":"assistant"}}"#,
+            )),
+            Ok(wire_event(&codex_completed_frame(5))),
+        ])
+        .boxed();
+
+        let events = collect(stream_responses(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+        ))
+        .await;
+
+        let response = completed_response(&events);
+        let assistants = assistant_items(response);
+        assert_eq!(assistants.len(), 1, "expected one assistant item");
+        assert_eq!(&*assistants[0].content, "pong");
+        assert!(assistants[0].tool_calls.is_empty());
+        assert_eq!(response.stop_reason, Some(StopReason::Stop));
+        assert_eq!(response.usage.as_ref().unwrap().completion_tokens, 5);
+    }
+
+    /// Same deployment, tool-call turn: the function call is only ever
+    /// described by `response.output_item.done`.
+    #[tokio::test]
+    async fn completed_frame_without_output_recovers_function_call_from_item_done() {
+        let raw = stream::iter(vec![
+            Ok(wire_event(
+                r#"{"type":"response.output_item.added","sequence_number":2,"output_index":0,
+                    "item":{"id":"fc_1","type":"function_call","status":"in_progress",
+                    "arguments":"","call_id":"call_abc","name":"get_marker"}}"#,
+            )),
+            Ok(wire_event(
+                r#"{"type":"response.function_call_arguments.delta","sequence_number":3,
+                    "item_id":"fc_1","output_index":0,"delta":"{}"}"#,
+            )),
+            Ok(wire_event(
+                r#"{"type":"response.function_call_arguments.done","sequence_number":4,
+                    "item_id":"fc_1","output_index":0,"arguments":"{}"}"#,
+            )),
+            Ok(wire_event(
+                r#"{"type":"response.output_item.done","sequence_number":5,"output_index":0,
+                    "item":{"id":"fc_1","type":"function_call","status":"completed",
+                    "arguments":"{}","call_id":"call_abc","name":"get_marker"}}"#,
+            )),
+            Ok(wire_event(&codex_completed_frame(7))),
+        ])
+        .boxed();
+
+        let events = collect(stream_responses(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+        ))
+        .await;
+
+        let response = completed_response(&events);
+        let calls: Vec<_> = assistant_items(response)
+            .iter()
+            .flat_map(|a| a.tool_calls.iter())
+            .collect();
+        assert_eq!(calls.len(), 1, "expected one tool call");
+        assert_eq!(&*calls[0].id, "call_abc");
+        assert_eq!(&*calls[0].name, "get_marker");
+        assert_eq!(&*calls[0].arguments, "{}");
+        assert_eq!(response.stop_reason, Some(StopReason::ToolCalls));
+    }
+
+    /// Terminal frame from the first-party xAI gateway: `output` carries the
+    /// full completed array, as the Responses API contract promises. Modeled
+    /// on the real xAI wire shape recorded in
+    /// `xai_grok_test_support::sse::responses_api_events` (same `message` /
+    /// `output_text` fixture used to script live xAI completions elsewhere
+    /// in the test suite), not a struct literal, so deserialization
+    /// differences between the wire and our types can't evade the guard.
+    fn xai_completed_frame_with_message(text: &str, output_tokens: u32) -> String {
+        format!(
+            r#"{{"type":"response.completed","sequence_number":8,"response":{{
+                "id":"resp_1","object":"response","created_at":1234567890,
+                "model":"grok-build","status":"completed",
+                "output":[{{"type":"message","id":"msg_1","role":"assistant",
+                "status":"completed","content":[{{"type":"output_text",
+                "text":"{text}","annotations":[]}}]}}],
+                "usage":{{"input_tokens":10,"input_tokens_details":{{"cached_tokens":0}},
+                "output_tokens":{output_tokens},
+                "output_tokens_details":{{"reasoning_tokens":0}},"total_tokens":{total}}}
+            }}}}"#,
+            total = 10 + output_tokens,
+        )
+    }
+
+    /// A terminal frame that *does* carry `output` stays authoritative — the
+    /// per-item fallback must not duplicate or override it. This is the
+    /// first-party xAI gateway shape.
+    #[tokio::test]
+    async fn completed_frame_with_output_wins_over_item_done_fallback() {
+        let raw = stream::iter(vec![
+            Ok(wire_event(
+                r#"{"type":"response.output_item.done","sequence_number":7,"output_index":0,
+                    "item":{"id":"msg_1","type":"message","status":"completed",
+                    "content":[{"type":"output_text","annotations":[],"logprobs":[],
+                    "text":"stale"}],"role":"assistant"}}"#,
+            )),
+            Ok(wire_event(&xai_completed_frame_with_message(
+                "authoritative",
+                5,
+            ))),
+        ])
+        .boxed();
+
+        let events = collect(stream_responses(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+        ))
+        .await;
+
+        let response = completed_response(&events);
+        let assistants = assistant_items(response);
+        assert_eq!(assistants.len(), 1);
+        assert_eq!(&*assistants[0].content, "authoritative");
     }
 
     #[test]
