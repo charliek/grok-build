@@ -184,9 +184,25 @@ fn install_mirrors_the_live_glm_openrouter_and_fireworks_shapes() {
         );
         assert!(entry["context_window"].as_integer().is_some(), "{id} ctx");
         assert_eq!(entry["stream_tool_calls"].as_bool(), Some(false), "{id}");
-        // Reasoning-effort fields wait on a live probe.
-        assert!(entry.get("reasoning_effort").is_none(), "{id}");
-        assert!(entry.get("supports_reasoning_effort").is_none(), "{id}");
+        // Live-probed (2026-08-25): Fireworks validates `reasoning_effort`;
+        // `adaptive` is accepted by Fireworks but excluded here because
+        // grok's `ReasoningEffort` enum cannot express it.
+        assert_eq!(
+            entry["supports_reasoning_effort"].as_bool(),
+            Some(true),
+            "{id}"
+        );
+        assert_eq!(entry["reasoning_effort"].as_str(), Some("high"), "{id}");
+        assert_eq!(
+            entry["reasoning_efforts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(toml::Value::as_str)
+                .collect::<Vec<_>>(),
+            vec!["low", "medium", "high", "xhigh", "max"],
+            "{id}"
+        );
     }
     assert_eq!(
         parsed["model"]["fireworks/deepseek-v4-flash"]["model"].as_str(),
@@ -379,6 +395,144 @@ model = "hand-picked-wire-id"
             .added_fields
             .contains(&"model_providers.synth.env_key".to_owned())
     );
+}
+
+/// Upgrade path for the 2026-08-25 Fireworks reasoning-effort probe: a
+/// `providers.toml` written by a build that shipped Fireworks entries
+/// *without* `reasoning_effort` / `supports_reasoning_effort` /
+/// `reasoning_efforts` must gain exactly those three fields per model on the
+/// next `install`, and nothing else in the file should move.
+#[test]
+fn install_adds_reasoning_effort_fields_to_pre_probe_fireworks_entries() {
+    let dir = home();
+    let path = providers_path(dir.path());
+    fs::write(
+        &path,
+        r#"[model_providers.fireworks]
+base_url = "https://api.fireworks.ai/inference/v1"
+api_backend = "chat_completions"
+env_key = "FIREWORKS_API_KEY"
+
+[model."fireworks/kimi-k3"]
+model = "accounts/fireworks/models/kimi-k3"
+name = "Kimi K3 (Fireworks)"
+description = "Moonshot Kimi K3 for coding and agentic work, served by Fireworks."
+model_provider = "fireworks"
+context_window = 1048576
+stream_tool_calls = false
+
+[model."fireworks/qwen3p8-max"]
+model = "accounts/fireworks/models/qwen3p8-max"
+name = "Qwen3.8 Max (Fireworks)"
+description = "Qwen3.8 Max for large-context coding work, served by Fireworks."
+model_provider = "fireworks"
+context_window = 262144
+stream_tool_calls = false
+
+[model."fireworks/deepseek-v4-pro"]
+model = "accounts/fireworks/models/deepseek-v4-pro"
+name = "DeepSeek V4 Pro (Fireworks)"
+description = "DeepSeek V4 Pro for deep coding and reasoning work, served by Fireworks."
+model_provider = "fireworks"
+context_window = 1048576
+stream_tool_calls = false
+
+[model."fireworks/kimi-k2p7-code"]
+model = "accounts/fireworks/models/kimi-k2p7-code"
+name = "Kimi K2.7 Code (Fireworks)"
+description = "Moonshot Kimi K2.7 coding model, served by Fireworks."
+model_provider = "fireworks"
+context_window = 262144
+stream_tool_calls = false
+
+[model."fireworks/deepseek-v4-flash"]
+model = "accounts/fireworks/models/deepseek-v4-flash-0731"
+name = "DeepSeek V4 Flash (Fireworks)"
+description = "Fast DeepSeek V4 Flash for high-throughput coding work, served by Fireworks."
+model_provider = "fireworks"
+context_window = 1048576
+stream_tool_calls = false
+"#,
+    )
+    .unwrap();
+    let before = fs::read_to_string(&path).unwrap();
+
+    let report = install_at(dir.path(), PRESETS, false).expect("install");
+    let parsed = parse_providers(dir.path());
+
+    // No new Fireworks tables — every Fireworks entry already existed. (The
+    // fixture omits the other presets on purpose, so `install` does add
+    // *those* as fresh entries; that is out of scope for this test.)
+    assert!(
+        report
+            .added_entries
+            .iter()
+            .all(|e| !e.contains("fireworks")),
+        "no fireworks entry should be added: {:?}",
+        report.added_entries
+    );
+    assert!(report.upgraded_fields.is_empty());
+    assert!(report.forced_fields.is_empty());
+    assert!(
+        report.kept_fields.is_empty(),
+        "every pre-existing field already equals the shipped default: {:?}",
+        report.kept_fields
+    );
+
+    let fireworks_ids = [
+        "fireworks/kimi-k3",
+        "fireworks/qwen3p8-max",
+        "fireworks/deepseek-v4-pro",
+        "fireworks/kimi-k2p7-code",
+        "fireworks/deepseek-v4-flash",
+    ];
+    for id in fireworks_ids {
+        for field in [
+            "supports_reasoning_effort",
+            "reasoning_effort",
+            "reasoning_efforts",
+        ] {
+            assert!(
+                report
+                    .added_fields
+                    .contains(&format!("model.\"{id}\".{field}")),
+                "expected model.\"{id}\".{field} in added_fields: {:?}",
+                report.added_fields
+            );
+        }
+        let entry = &parsed["model"][id];
+        assert_eq!(
+            entry["supports_reasoning_effort"].as_bool(),
+            Some(true),
+            "{id}"
+        );
+        assert_eq!(entry["reasoning_effort"].as_str(), Some("high"), "{id}");
+        assert_eq!(
+            entry["reasoning_efforts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(toml::Value::as_str)
+                .collect::<Vec<_>>(),
+            vec!["low", "medium", "high", "xhigh", "max"],
+            "{id}"
+        );
+    }
+    assert_eq!(
+        report.added_fields.len(),
+        fireworks_ids.len() * 3,
+        "only the three effort fields per model should be added: {:?}",
+        report.added_fields
+    );
+
+    // Nothing pre-existing moved: every original line is still present
+    // verbatim, and the new fields are strictly additive.
+    for line in before.lines() {
+        assert!(
+            providers_body(dir.path()).contains(line),
+            "original line dropped: {line}"
+        );
+    }
 }
 
 #[test]
@@ -1727,6 +1881,44 @@ fn every_preset_is_shaped_for_the_providers_layer_allowlist() {
                 model.id,
                 preset.id
             );
+
+            // A model that opts into reasoning effort must ship both the
+            // current default and the accepted list, and the default must be
+            // a member of that list. `ReasoningEffort` (xai-grok-sampling-types)
+            // has no `adaptive` variant, so no preset may ever list it.
+            let supports_effort = model
+                .fields
+                .iter()
+                .find(|f| f.key == "supports_reasoning_effort")
+                .is_some_and(|f| *f.current() == PresetValue::Bool(true));
+            if supports_effort {
+                let effort = model
+                    .fields
+                    .iter()
+                    .find(|f| f.key == "reasoning_effort")
+                    .unwrap_or_else(|| panic!("{} must ship reasoning_effort", model.id));
+                let efforts = model
+                    .fields
+                    .iter()
+                    .find(|f| f.key == "reasoning_efforts")
+                    .unwrap_or_else(|| panic!("{} must ship reasoning_efforts", model.id));
+                let PresetValue::Str(default) = effort.current() else {
+                    panic!("{} reasoning_effort must be a string", model.id);
+                };
+                let PresetValue::StrList(list) = efforts.current() else {
+                    panic!("{} reasoning_efforts must be a string list", model.id);
+                };
+                assert!(
+                    list.contains(default),
+                    "{} default {default} must be one of {list:?}",
+                    model.id
+                );
+                assert!(
+                    !list.contains(&"adaptive"),
+                    "{} must not list adaptive: grok's ReasoningEffort enum cannot express it",
+                    model.id
+                );
+            }
         }
     }
 
