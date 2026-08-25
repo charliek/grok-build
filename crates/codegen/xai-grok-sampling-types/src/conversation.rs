@@ -631,6 +631,16 @@ pub struct ConversationRequest {
     pub json_schema: Option<serde_json::Value>,
     /// Sticky routing key for prompt-cache reuse; overrides `x_grok_conv_id` for routing.
     pub prompt_cache_key: Option<String>,
+    // gx: shape the Responses body for OpenAI's ChatGPT/Codex endpoint
+    // (`https://chatgpt.com/backend-api/codex/responses`), whose validator is
+    // strict where the public Responses API is lenient. Set from
+    // `[model.<id>].codex_compat` via `SamplerConfig`; see the
+    // `From<&ConversationRequest> for rs::CreateResponse` impl in
+    // `conversation/responses.rs` for exactly what it changes.
+    //
+    // `Default` is `false`, so every non-codex request — xAI included — is
+    // byte-for-byte what it was.
+    pub codex_compat: bool,
 }
 
 impl ConversationRequest {

@@ -109,6 +109,10 @@ impl ChatStateActor {
             prompt_cache_key: None,
             reasoning_effort: self.state.sampling_config.reasoning_effort,
             json_schema: None,
+            // gx: the sampler also stamps this in
+            // `apply_conversation_defaults`, which every request path passes
+            // through -- including the ones this builder does not construct.
+            codex_compat: self.state.sampling_config.codex_compat.unwrap_or(false),
         }
     }
 }

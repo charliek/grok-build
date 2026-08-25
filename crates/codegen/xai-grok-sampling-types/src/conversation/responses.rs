@@ -125,13 +125,31 @@ impl From<&ConversationRequest> for rs::CreateResponse {
                 verbosity: None,
             });
 
+        // gx: OpenAI's ChatGPT/Codex endpoint validates this body far more
+        // strictly than the public Responses API (spike 0A.1, verified live):
+        //
+        // - `store` must be present and `false` — omitting it is a 400
+        //   ("Store must be set to false"), and grok's mapping otherwise emits
+        //   `None`.
+        // - `temperature`, `top_p`, and `max_output_tokens` are each a 400
+        //   ("Unsupported parameter"), whatever their value — so they are
+        //   dropped here rather than merely left unset, which is why the
+        //   suppression lives in the mapping and not at the call sites.
+        // - `include: ["reasoning.encrypted_content"]` is what makes multi-turn
+        //   reasoning replay work with `store: false`.
+        //
+        // `instructions` stays `None`: grok sends its system prompt as an input
+        // item, and the endpoint accepts a body without `instructions`.
+        let codex = req.codex_compat;
+        let include = codex.then(|| vec![rs::IncludeEnum::ReasoningEncryptedContent]);
+
         rs::CreateResponse {
             background: None,
             conversation: None,
-            include: None,
+            include,
             input,
             instructions: None,
-            max_output_tokens: req.max_output_tokens,
+            max_output_tokens: if codex { None } else { req.max_output_tokens },
             max_tool_calls: None,
             metadata: None,
             model: req.model.clone(),
@@ -149,15 +167,15 @@ impl From<&ConversationRequest> for rs::CreateResponse {
             }),
             safety_identifier: None,
             service_tier: None,
-            store: None,
+            store: codex.then_some(false),
             stream: None,
             stream_options: None,
-            temperature: req.temperature,
+            temperature: if codex { None } else { req.temperature },
             text,
             tool_choice,
             tools: if tools.is_empty() { None } else { Some(tools) },
             top_logprobs: None,
-            top_p: req.top_p,
+            top_p: if codex { None } else { req.top_p },
             truncation: None,
         }
     }

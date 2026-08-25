@@ -970,6 +970,12 @@ pub(crate) fn parse_remote_model_value(
             .get("streamToolCalls")
             .or_else(|| obj.get("stream_tool_calls"))
             .and_then(|v| v.as_bool()),
+        // gx: a remote catalog can opt a model into the ChatGPT/Codex body
+        // shape, same as a local `[model.<id>]` entry.
+        codex_compat: obj
+            .get("codexCompat")
+            .or_else(|| obj.get("codex_compat"))
+            .and_then(|v| v.as_bool()),
         laziness_detector: get_object(obj, "lazinessDetector")
             .or_else(|| get_object(obj, "laziness_detector"))
             .or_else(|| meta.and_then(|m| get_object(m, "lazinessDetector")))

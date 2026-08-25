@@ -395,6 +395,8 @@ struct ClientDefaults {
     api_backend: ApiBackend,
     auth_scheme: AuthScheme,
     stream_tool_calls: bool,
+    // gx: see `SamplerConfig::codex_compat`.
+    codex_compat: bool,
     extra_response_includes: Vec<String>,
     doom_loop_recovery: Option<xai_grok_sampling_types::DoomLoopRecoveryPolicy>,
 }
@@ -704,6 +706,7 @@ impl SamplingClient {
             api_backend: config.api_backend,
             auth_scheme: config.auth_scheme,
             stream_tool_calls: config.stream_tool_calls,
+            codex_compat: config.codex_compat,
             extra_response_includes: config.extra_response_includes,
             doom_loop_recovery: config.doom_loop_recovery,
         };
@@ -1195,19 +1198,24 @@ impl SamplingClient {
             request.inner.model = Some(self.defaults.model.clone());
         }
 
-        // Apply temperature default if not specified
-        if request.inner.temperature.is_none() {
-            request.inner.temperature = self.defaults.temperature;
-        }
+        // gx: OpenAI's ChatGPT/Codex endpoint 400s on temperature, top_p, and
+        // max_output_tokens whatever their value, so a configured default must
+        // not be filled in here after the mapping deliberately dropped them.
+        if !self.defaults.codex_compat {
+            // Apply temperature default if not specified
+            if request.inner.temperature.is_none() {
+                request.inner.temperature = self.defaults.temperature;
+            }
 
-        // Apply top_p default if not specified
-        if request.inner.top_p.is_none() {
-            request.inner.top_p = self.defaults.top_p;
-        }
+            // Apply top_p default if not specified
+            if request.inner.top_p.is_none() {
+                request.inner.top_p = self.defaults.top_p;
+            }
 
-        // Apply max_output_tokens default if not specified
-        if request.inner.max_output_tokens.is_none() {
-            request.inner.max_output_tokens = self.defaults.max_completion_tokens;
+            // Apply max_output_tokens default if not specified
+            if request.inner.max_output_tokens.is_none() {
+                request.inner.max_output_tokens = self.defaults.max_completion_tokens;
+            }
         }
 
         // Set store to false if not specified (default is true, but that breaks ZDR compliance)
@@ -1892,6 +1900,11 @@ impl SamplingClient {
             request.max_output_tokens = self.defaults.max_completion_tokens;
         }
 
+        // gx: the single choke point every conversation path passes through,
+        // so the flag reaches side calls, compaction, and recap requests too --
+        // not just the ones built by the chat-state actor.
+        request.codex_compat = self.defaults.codex_compat;
+
         Ok(())
     }
 
@@ -2233,6 +2246,7 @@ mod tests {
             force_http1: false,
             max_retries: None,
             stream_tool_calls: false,
+            codex_compat: false,
             idle_timeout_secs: None,
             reasoning_effort: None,
             origin_client: None,
@@ -3188,6 +3202,69 @@ mod tests {
         };
         let usage = e.response.usage.expect("usage present");
         assert_eq!(usage.total_tokens, 6_714);
+    }
+
+    // gx: the two seams that carry `codex_compat` from the model config to the
+    // wire. The body shaping itself is asserted in `xai-grok-sampling-types`;
+    // what matters here is that the flag arrives and that the defaults pass
+    // does not undo it.
+
+    #[test]
+    fn codex_compat_reaches_every_conversation_request() {
+        let client = SamplingClient::new(SamplerConfig {
+            codex_compat: true,
+            api_backend: ApiBackend::Responses,
+            ..minimal_config()
+        })
+        .expect("client should build");
+
+        let mut request = xai_grok_sampling_types::ConversationRequest::default();
+        client
+            .apply_conversation_defaults(&mut request)
+            .expect("defaults");
+        assert!(
+            request.codex_compat,
+            "a request built anywhere -- side call, compaction, recap -- must \
+             still be shaped for the endpoint it is going to"
+        );
+    }
+
+    #[test]
+    fn codex_compat_stops_the_defaults_pass_reintroducing_rejected_parameters() {
+        // The mapping drops these; without this guard the sampler's own
+        // defaults would put them straight back and the endpoint would 400.
+        let configured = SamplerConfig {
+            temperature: Some(0.7),
+            top_p: Some(0.9),
+            max_completion_tokens: Some(4096),
+            api_backend: ApiBackend::Responses,
+            ..minimal_config()
+        };
+
+        let codex = SamplingClient::new(SamplerConfig {
+            codex_compat: true,
+            ..configured.clone()
+        })
+        .expect("client should build");
+        let mut wrapper = CreateResponseWrapper::new(rs::CreateResponse::default());
+        codex
+            .apply_response_defaults(&mut wrapper)
+            .expect("defaults");
+        assert_eq!(wrapper.inner.temperature, None);
+        assert_eq!(wrapper.inner.top_p, None);
+        assert_eq!(wrapper.inner.max_output_tokens, None);
+        // Still ZDR-shaped, exactly as before.
+        assert_eq!(wrapper.inner.store, Some(false));
+
+        // Every other Responses provider keeps the old behavior.
+        let plain = SamplingClient::new(configured).expect("client should build");
+        let mut wrapper = CreateResponseWrapper::new(rs::CreateResponse::default());
+        plain
+            .apply_response_defaults(&mut wrapper)
+            .expect("defaults");
+        assert_eq!(wrapper.inner.temperature, Some(0.7));
+        assert_eq!(wrapper.inner.top_p, Some(0.9));
+        assert_eq!(wrapper.inner.max_output_tokens, Some(4096));
     }
 
     #[test]

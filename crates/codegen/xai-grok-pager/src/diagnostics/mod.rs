@@ -27,8 +27,9 @@ pub use fix::{
     ssh_wrap_automatic_remediation, verify_persistent_fix,
 };
 pub(crate) use fix::{
-    automatic_fix_choices, automatic_remediation_for, format_applicable_automatic_fixes,
-    format_fix_preview, format_fix_success, human_fix_command, select_fix_plan,
+    automatic_fix_choices, automatic_remediation_for, find_on_path,
+    format_applicable_automatic_fixes, format_fix_preview, format_fix_success, human_fix_command,
+    select_fix_plan,
 };
 pub(crate) use model::probe_requires_live_tui;
 pub(crate) use model::{
