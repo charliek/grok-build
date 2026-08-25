@@ -1007,4 +1007,209 @@ mod tests {
             "a model that sets its own query params inherits none of the provider's"
         );
     }
+
+    /// Spike 0A.2 — the review-flagged uncertainty, settled on the wire.
+    ///
+    /// A `[model_providers.<id>]` with an inline `auth` helper mints a bearer
+    /// that is actually attached as `Authorization: Bearer <token>` on a request
+    /// to a **non-xAI** endpoint. The mock 401s anything but the helper's token,
+    /// so a green stream is itself proof the right bearer went out; the request
+    /// log is asserted directly as well.
+    ///
+    /// The trusted-URL gate (`is_xai_api_bearer_url`, applied in
+    /// `resolve_model_list`) restricts only the xAI *session* bearer and the
+    /// fail-closed sentinel for provider-backed models that have no auth at all.
+    /// An explicit auth provider is never gated on the URL — asserted below by
+    /// pinning the endpoint as untrusted before driving the request.
+    #[tokio::test]
+    async fn inline_provider_auth_bearer_reaches_a_non_xai_endpoint() {
+        use futures::StreamExt as _;
+        use xai_grok_test_support::{MockInferenceServer, MockModelEntry};
+
+        use crate::agent::config::sampling_config_for_model;
+        use crate::sampling::{Client, ConversationItem, ConversationRequest};
+
+        const TOKEN: &str = "spike0a2-minted-bearer";
+        const SESSION_JWT: &str = "session-jwt-must-not-leak";
+
+        let server = MockInferenceServer::start_with_required_auth(
+            vec![MockModelEntry::new("mock-gateway-model")],
+            TOKEN,
+        )
+        .await
+        .expect("start mock inference server");
+        server.set_response("OK");
+        let base = server.url();
+
+        // The mock's `http://127.0.0.1:PORT/v1` is *not* a trusted xAI bearer
+        // URL, so model resolution takes the same arm it would for a real
+        // third-party gateway (`session_bearer_unsafe == true`).
+        assert!(
+            !crate::util::is_xai_api_bearer_url(&base),
+            "the mock endpoint must be untrusted for the session bearer: {base}"
+        );
+
+        let raw_config: toml::Value = toml::from_str(&format!(
+            r#"
+            [model_providers.spike0a2]
+            base_url = "{base}"
+            context_window = 200000
+
+            [model_providers.spike0a2.auth]
+            command = "printf '{{\"access_token\":\"{TOKEN}\",\"expires_in\":3600}}'"
+
+            [model.spike0a2-model]
+            model = "mock-gateway-model"
+            model_provider = "spike0a2"
+            "#
+        ))
+        .expect("test config is valid TOML");
+
+        let cfg = Config::new_from_toml_cfg(&raw_config).expect("config should parse");
+        let resolved = resolve_model_list(&cfg, None);
+        let model = resolved.get("spike0a2-model").expect("model should exist");
+        let provider = model
+            .auth_provider
+            .as_ref()
+            .expect("the model inherits the provider's inline auth");
+        assert_eq!(provider.name, "model_provider:spike0a2");
+        assert!(
+            !provider.is_fail_closed(),
+            "an inline auth helper must not be replaced by the fail-closed sentinel \
+             just because the endpoint is third-party"
+        );
+
+        // The pre-turn mint arm (`SessionActor::refresh_provider_token_pre_turn`).
+        let minted = provider
+            .ensure_fresh_token(None)
+            .await
+            .rotated()
+            .expect("the helper mints a token");
+        assert_eq!(minted, TOKEN);
+
+        let creds = resolve_credentials(model, Some(SESSION_JWT));
+        assert_eq!(
+            creds.api_key.as_deref(),
+            Some(TOKEN),
+            "the minted provider token wins over the session token"
+        );
+        assert_eq!(creds.base_url, base, "requests go to the provider endpoint");
+
+        let sampler = sampling_config_for_model(model, creds, None, None, None, None);
+        let client = Client::new(sampler).expect("sampling client builds");
+        let request = ConversationRequest::from_items(vec![ConversationItem::user("Hello")]);
+        let (mut stream, _metadata) = client
+            .conversation_stream(request)
+            .await
+            .expect("the mock accepts only the minted bearer, so this proves it went out");
+        while stream.next().await.is_some() {}
+
+        let requests = server.requests();
+        let chat = requests
+            .iter()
+            .find(|e| e.method == "POST" && e.path.contains("chat/completions"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "no POST /v1/chat/completions logged; requests:\n{}",
+                    server.request_log_summary()
+                )
+            });
+        assert_eq!(
+            chat.authorization.as_deref(),
+            Some(format!("Bearer {TOKEN}").as_str()),
+            "the inline provider's minted token must ride the Authorization header \
+             on a third-party endpoint; requests:\n{}",
+            server.request_log_summary()
+        );
+        assert!(
+            !requests.iter().any(|e| e
+                .authorization
+                .as_deref()
+                .is_some_and(|a| a.contains(SESSION_JWT))),
+            "the session bearer must never reach a third-party endpoint; requests:\n{}",
+            server.request_log_summary()
+        );
+    }
+
+    /// The negative half of the same gate: a `model_provider`-backed model on an
+    /// untrusted endpoint with **no** auth helper and no `api_key`/`env_key`
+    /// gets the fail-closed sentinel, resolves no credential, and goes out with
+    /// no `Authorization` header at all — rather than borrowing the session bearer.
+    #[tokio::test]
+    async fn provider_without_auth_sends_no_bearer_to_a_non_xai_endpoint() {
+        use futures::StreamExt as _;
+        use xai_grok_test_support::{MockInferenceServer, MockModelEntry};
+
+        use crate::agent::config::sampling_config_for_model;
+        use crate::sampling::{Client, ConversationItem, ConversationRequest};
+
+        const SESSION_JWT: &str = "session-jwt-must-not-leak";
+
+        let server =
+            MockInferenceServer::start_with_models(vec![MockModelEntry::new("mock-gateway-model")])
+                .await
+                .expect("start mock inference server");
+        server.set_response("OK");
+        let base = server.url();
+
+        let raw_config: toml::Value = toml::from_str(&format!(
+            r#"
+            [model_providers.spike0a2noauth]
+            base_url = "{base}"
+            context_window = 200000
+
+            [model.spike0a2-noauth-model]
+            model = "mock-gateway-model"
+            model_provider = "spike0a2noauth"
+            "#
+        ))
+        .expect("test config is valid TOML");
+
+        let cfg = Config::new_from_toml_cfg(&raw_config).expect("config should parse");
+        let resolved = resolve_model_list(&cfg, None);
+        let model = resolved
+            .get("spike0a2-noauth-model")
+            .expect("model should exist");
+        let provider = model
+            .effective_auth_provider()
+            .expect("a credential-less provider on an untrusted URL fails closed via a ref");
+        assert!(
+            provider.is_fail_closed(),
+            "expected the fail-closed sentinel, got {}",
+            provider.name
+        );
+        assert_eq!(provider.name, "model_provider:spike0a2noauth (fail-closed)");
+
+        let creds = resolve_credentials(model, Some(SESSION_JWT));
+        assert_eq!(
+            creds.api_key, None,
+            "the fail-closed sentinel resolves no credential and blocks the session token"
+        );
+
+        let sampler = sampling_config_for_model(model, creds, None, None, None, None);
+        let client = Client::new(sampler).expect("sampling client builds");
+        let request = ConversationRequest::from_items(vec![ConversationItem::user("Hello")]);
+        let (mut stream, _metadata) = client
+            .conversation_stream(request)
+            .await
+            .expect("the mock does not require auth, so the unauthenticated request streams");
+        while stream.next().await.is_some() {}
+
+        let requests = server.requests();
+        let chat = requests
+            .iter()
+            .find(|e| e.method == "POST" && e.path.contains("chat/completions"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "no POST /v1/chat/completions logged; requests:\n{}",
+                    server.request_log_summary()
+                )
+            });
+        assert_eq!(
+            chat.authorization,
+            None,
+            "a fail-closed provider must send no Authorization header at all; requests:\n{}",
+            server.request_log_summary()
+        );
+    }
 }
