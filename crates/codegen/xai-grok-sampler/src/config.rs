@@ -61,6 +61,14 @@ pub struct SamplerConfig {
     pub force_http1: bool,
     pub max_retries: Option<u32>,
     pub stream_tool_calls: bool,
+    // gx: shape the Responses body for OpenAI's ChatGPT/Codex endpoint. Set
+    // from `[model.<id>].codex_compat`; carried onto every
+    // `ConversationRequest` this client sends (see
+    // `SamplingClient::apply_conversation_defaults`) so the mapping in
+    // `xai-grok-sampling-types` can emit the strict shape that endpoint
+    // requires. `false` everywhere else, which is the pre-gx behavior.
+    #[serde(default)]
+    pub codex_compat: bool,
     pub idle_timeout_secs: Option<u64>,
 
     // Reasoning effort
@@ -129,6 +137,7 @@ impl Default for SamplerConfig {
             force_http1: false,
             max_retries: None,
             stream_tool_calls: false,
+            codex_compat: false,
             idle_timeout_secs: None,
             reasoning_effort: None,
             origin_client: None,

@@ -1,0 +1,55 @@
+{
+ "case": "14a-tool-turn1",
+ "url": "https://chatgpt.com/backend-api/codex/responses",
+ "status": 200,
+ "request_headers": {
+  "Authorization": "Bearer <REDACTED>",
+  "chatgpt-account-id": "<REDACTED-ACCOUNT-ID>",
+  "originator": "codex-tui",
+  "User-Agent": "codex-tui/0.147.0 (Mac OS 26.5.0; arm64) iTerm.app (codex-tui; 0.147.0)",
+  "Accept": "text/event-stream",
+  "Content-Type": "application/json",
+  "session-id": "aba72a7c-308f-4820-8d68-96edeb11ae4d"
+ },
+ "request_body": {
+  "model": "gpt-5.6-sol",
+  "instructions": "You are a helpful assistant.",
+  "input": [
+   {
+    "type": "message",
+    "role": "user",
+    "content": [
+     {
+      "type": "input_text",
+      "text": "Call the get_marker tool and reply with only its result."
+     }
+    ]
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "name": "get_marker",
+    "description": "Returns the marker string",
+    "parameters": {
+     "type": "object",
+     "properties": {},
+     "additionalProperties": false
+    },
+    "strict": false
+   }
+  ],
+  "tool_choice": "auto",
+  "parallel_tool_calls": false,
+  "reasoning": {
+   "effort": "low",
+   "summary": "auto"
+  },
+  "store": false,
+  "stream": true,
+  "include": [
+   "reasoning.encrypted_content"
+  ],
+  "prompt_cache_key": "fixture-prompt-cache-key"
+ }
+}

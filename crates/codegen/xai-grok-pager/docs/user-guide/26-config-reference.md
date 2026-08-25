@@ -357,6 +357,7 @@ User-level configuration lives in `$GROK_HOME/config.toml` (default `~/.grok/con
 | `model.<id>.auth_provider` | `string` | `yes` | `user` | Name of a `[auth_provider.<name>]` helper that mints this model's bearer token. |
 | `model.<id>.auto_compact_threshold_percent` | `integer` | `yes` | `user` | Per-model auto-compact threshold (0-100). |
 | `model.<id>.base_url` | `string` | `yes` | `user` | Provider endpoint base URL. |
+| `model.<id>.codex_compat` | `boolean` | `yes` | `user` | gx: emit the strict Responses body OpenAI's ChatGPT/Codex endpoint requires (explicit `store: false`, no `temperature` / `top_p` / `max_output_tokens`, `include: ["reasoning.encrypted_content"]`). Set by the `openai-codex` preset; leave unset elsewhere. |
 | `model.<id>.compaction_at_tokens` | `number / table` | `yes` | `user` | Token threshold that triggers compaction for this model. |
 | `model.<id>.compactions_remaining` | `string / table` | `yes` | `user` | How compaction leftover context is sent. Alias `send_compactions_remaining`. |
 | `model.<id>.context_window` | `number` | `yes` | `user` | Context window tokens; drives auto-compact timing. |
