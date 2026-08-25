@@ -288,11 +288,13 @@ const OX_ALPHA_FIELDS: &[PresetField] = &[
 // Every Fireworks model carries `stream_tool_calls = false` and an explicit
 // `context_window` (grok has no catalog entry for third-party ids).
 //
-// NOTE: no `reasoning_effort` / `supports_reasoning_effort` / `reasoning_efforts`
-// here on purpose. Whether these models accept grok's reasoning-effort wire
-// fields is a live-probe question; adding a guessed default now would make the
-// probe's answer a "user-modified value" for anyone who installed early. Add
-// the fields (as new `defaults[0]` entries) once the probe lands.
+// `reasoning_effort` / `supports_reasoning_effort` / `reasoning_efforts`: a
+// live probe against Fireworks' `chat_completions` API (2026-08-25) confirmed
+// it validates `reasoning_effort` and 400s with the accepted list on an
+// invalid value: low, medium, high, xhigh, max, none, adaptive. `reasoning_efforts`
+// below omits `adaptive` on purpose — grok's `ReasoningEffort` enum
+// (`xai-grok-sampling-types`) has no variant for it, so it is not a value gx
+// can ever send.
 
 const FIREWORKS_PROVIDER_FIELDS: &[PresetField] = &[
     PresetField::new("base_url", &[s("https://api.fireworks.ai/inference/v1")]),
@@ -300,11 +302,18 @@ const FIREWORKS_PROVIDER_FIELDS: &[PresetField] = &[
     PresetField::new("env_key", &[s("FIREWORKS_API_KEY")]),
 ];
 
-// Every Fireworks model preset shares these two fields; factored out so the
+// Every Fireworks model preset shares these fields; factored out so the
 // per-model arrays below only spell out what actually varies.
 const FIREWORKS_MODEL_PROVIDER: PresetField = PresetField::new("model_provider", &[s("fireworks")]);
 const FIREWORKS_NO_STREAM_TOOL_CALLS: PresetField =
     PresetField::new("stream_tool_calls", &[b(false)]);
+const FIREWORKS_SUPPORTS_REASONING_EFFORT: PresetField =
+    PresetField::new("supports_reasoning_effort", &[b(true)]);
+const FIREWORKS_REASONING_EFFORT: PresetField = PresetField::new("reasoning_effort", &[s("high")]);
+const FIREWORKS_REASONING_EFFORTS: PresetField = PresetField::new(
+    "reasoning_efforts",
+    &[l(&["low", "medium", "high", "xhigh", "max"])],
+);
 
 const FIREWORKS_KIMI_K3_FIELDS: &[PresetField] = &[
     PresetField::new("model", &[s("accounts/fireworks/models/kimi-k3")]),
@@ -318,6 +327,9 @@ const FIREWORKS_KIMI_K3_FIELDS: &[PresetField] = &[
     FIREWORKS_MODEL_PROVIDER,
     PresetField::new("context_window", &[i(1_048_576)]),
     FIREWORKS_NO_STREAM_TOOL_CALLS,
+    FIREWORKS_SUPPORTS_REASONING_EFFORT,
+    FIREWORKS_REASONING_EFFORT,
+    FIREWORKS_REASONING_EFFORTS,
 ];
 
 const FIREWORKS_QWEN_FIELDS: &[PresetField] = &[
@@ -332,6 +344,9 @@ const FIREWORKS_QWEN_FIELDS: &[PresetField] = &[
     FIREWORKS_MODEL_PROVIDER,
     PresetField::new("context_window", &[i(262_144)]),
     FIREWORKS_NO_STREAM_TOOL_CALLS,
+    FIREWORKS_SUPPORTS_REASONING_EFFORT,
+    FIREWORKS_REASONING_EFFORT,
+    FIREWORKS_REASONING_EFFORTS,
 ];
 
 const FIREWORKS_DEEPSEEK_PRO_FIELDS: &[PresetField] = &[
@@ -346,6 +361,9 @@ const FIREWORKS_DEEPSEEK_PRO_FIELDS: &[PresetField] = &[
     FIREWORKS_MODEL_PROVIDER,
     PresetField::new("context_window", &[i(1_048_576)]),
     FIREWORKS_NO_STREAM_TOOL_CALLS,
+    FIREWORKS_SUPPORTS_REASONING_EFFORT,
+    FIREWORKS_REASONING_EFFORT,
+    FIREWORKS_REASONING_EFFORTS,
 ];
 
 const FIREWORKS_KIMI_CODE_FIELDS: &[PresetField] = &[
@@ -358,6 +376,9 @@ const FIREWORKS_KIMI_CODE_FIELDS: &[PresetField] = &[
     FIREWORKS_MODEL_PROVIDER,
     PresetField::new("context_window", &[i(262_144)]),
     FIREWORKS_NO_STREAM_TOOL_CALLS,
+    FIREWORKS_SUPPORTS_REASONING_EFFORT,
+    FIREWORKS_REASONING_EFFORT,
+    FIREWORKS_REASONING_EFFORTS,
 ];
 
 const FIREWORKS_DEEPSEEK_FLASH_FIELDS: &[PresetField] = &[
@@ -375,6 +396,9 @@ const FIREWORKS_DEEPSEEK_FLASH_FIELDS: &[PresetField] = &[
     FIREWORKS_MODEL_PROVIDER,
     PresetField::new("context_window", &[i(1_048_576)]),
     FIREWORKS_NO_STREAM_TOOL_CALLS,
+    FIREWORKS_SUPPORTS_REASONING_EFFORT,
+    FIREWORKS_REASONING_EFFORT,
+    FIREWORKS_REASONING_EFFORTS,
 ];
 
 // -- OpenAI (Phase 2 skeletons; NOT installed by this build) -----------------
