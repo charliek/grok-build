@@ -178,11 +178,29 @@ impl From<&ConversationRequest> for rs::CreateResponse {
 
 /// Reasoning items stay top-level siblings rather than folding into the assistant, so the input replays the model's original order.
 pub(super) fn build_responses_input(req: &ConversationRequest) -> rs::InputParam {
-    let items: Vec<rs::InputItem> = req
+    let mut items: Vec<rs::InputItem> = req
         .items
         .iter()
         .flat_map(conversation_item_to_input_items)
         .collect();
+
+    // gx: the ChatGPT/Codex endpoint 400s ("System messages are not allowed")
+    // on any input item carrying role:"system" (spike, verified live). Every
+    // real gx request sends its system prompt as a system-role input item, so
+    // under codex_compat those items are rewritten to role:"developer" —
+    // empirically accepted (200) and semantically equivalent (both roles
+    // outrank "user" in the Responses API's instruction hierarchy). Left
+    // alone off the codex path to avoid an xAI regression.
+    if req.codex_compat {
+        for item in &mut items {
+            if let rs::InputItem::EasyMessage(msg) = item
+                && msg.role == rs::Role::System
+            {
+                msg.role = rs::Role::Developer;
+            }
+        }
+    }
+
     rs::InputParam::Items(items)
 }
 
