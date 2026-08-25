@@ -795,6 +795,9 @@ async fn read_parent_sampling_config(
                 max_retries: cfg.max_retries.or(ctx.sampling_config.max_retries),
                 rate_limit_retry_threshold: cfg.rate_limit_retry_threshold,
                 stream_tool_calls: cfg.stream_tool_calls.unwrap_or(false),
+                // gx: a subagent inherits the parent model's provider, so it
+                // must inherit its body shaping too.
+                codex_compat: cfg.codex_compat.unwrap_or(false),
                 idle_timeout_secs: None,
                 client_identifier: ctx.sampling_config.client_identifier.clone(),
                 deployment_id: ctx.sampling_config.deployment_id.clone(),

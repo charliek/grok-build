@@ -1616,3 +1616,267 @@ fn serialized_body_contains_no_placeholder_strings() {
         "both reasoning siblings must be present"
     );
 }
+
+// ---------------------------------------------------------------------------
+// gx: `codex_compat` — the body shape OpenAI's ChatGPT/Codex endpoint accepts
+//
+// The assertions below are anchored to bodies the **live** endpoint answered
+// 200, captured during the gx Phase-0A spike; see
+// `tests/fixtures/openai-codex/README.md`. The endpoint's validator is strict
+// in three ways the public Responses API is not: `store` must be an explicit
+// `false`, `temperature` / `top_p` / `max_output_tokens` are each rejected
+// outright, and unknown top-level fields 400.
+// ---------------------------------------------------------------------------
+
+/// The known-good request bodies, by case name.
+fn codex_fixtures() -> Vec<(&'static str, serde_json::Value)> {
+    const RAW: &[(&str, &str)] = &[
+        (
+            "12-grok-shape-store-false",
+            include_str!("../../tests/fixtures/openai-codex/12-grok-shape-store-false.json"),
+        ),
+        (
+            "13a-turn1",
+            include_str!("../../tests/fixtures/openai-codex/13a-turn1.json"),
+        ),
+        (
+            "13b-turn2-replay",
+            include_str!("../../tests/fixtures/openai-codex/13b-turn2-replay.json"),
+        ),
+        (
+            "14a-tool-turn1",
+            include_str!("../../tests/fixtures/openai-codex/14a-tool-turn1.json"),
+        ),
+        (
+            "14b-tool-turn2-output",
+            include_str!("../../tests/fixtures/openai-codex/14b-tool-turn2-output.json"),
+        ),
+    ];
+    RAW.iter()
+        .map(|(name, raw)| {
+            let doc: serde_json::Value =
+                serde_json::from_str(raw).unwrap_or_else(|e| panic!("{name} is valid JSON: {e}"));
+            assert_eq!(
+                doc["status"].as_i64(),
+                Some(200),
+                "{name} was accepted live"
+            );
+            (*name, doc["request_body"].clone())
+        })
+        .collect()
+}
+
+/// A request in the shape grok actually sends, with every parameter the codex
+/// endpoint rejects deliberately set — so a test that passes proves the
+/// suppression, not merely that nobody set them.
+fn codex_request() -> ConversationRequest {
+    ConversationRequest {
+        temperature: Some(0.7),
+        top_p: Some(0.95),
+        max_output_tokens: Some(4096),
+        prompt_cache_key: Some("cache-key-1".to_string()),
+        reasoning_effort: Some(crate::ReasoningEffort::Medium),
+        codex_compat: true,
+        ..ConversationRequest::from_items(vec![
+            ConversationItem::system("You are a helpful assistant."),
+            ConversationItem::user("Reply with exactly: pong"),
+        ])
+        .with_model("gpt-5.6-sol")
+    }
+}
+
+fn body_of(req: &ConversationRequest) -> serde_json::Value {
+    let mapped: rs::CreateResponse = req.into();
+    serde_json::to_value(&mapped).expect("CreateResponse serializes")
+}
+
+#[test]
+fn codex_compat_forces_store_false_and_drops_the_rejected_parameters() {
+    let body = body_of(&codex_request());
+
+    assert_eq!(
+        body.get("store"),
+        Some(&serde_json::json!(false)),
+        "the endpoint 400s without an explicit store:false — {body}"
+    );
+    assert_eq!(
+        body.get("include"),
+        Some(&serde_json::json!(["reasoning.encrypted_content"])),
+        "encrypted reasoning is what makes multi-turn replay work with store:false — {body}"
+    );
+    for rejected in ["temperature", "top_p", "max_output_tokens"] {
+        assert!(
+            body.get(rejected).is_none(),
+            "`{rejected}` is an Unsupported parameter 400 on this endpoint, and it \
+             was set on the request — {body}"
+        );
+    }
+    // grok sends its system prompt as an input item; `instructions` is optional
+    // (spike case 07 omitted it and got a 200).
+    assert!(body.get("instructions").is_none(), "{body}");
+}
+
+#[test]
+fn without_codex_compat_the_responses_body_is_exactly_what_it_was() {
+    // The xAI regression: every first-party and third-party Responses provider
+    // must serialize identically to the pre-gx mapping.
+    let mut req = codex_request();
+    req.codex_compat = false;
+    let body = body_of(&req);
+
+    // Compared as f32: these round-trip through `f32` on the request, so the
+    // JSON number is the widened `0.699999988079071`, not `0.7`.
+    let as_f32 = |key: &str| {
+        body.get(key)
+            .and_then(serde_json::Value::as_f64)
+            .map(|v| v as f32)
+    };
+    assert_eq!(as_f32("temperature"), Some(0.7));
+    assert_eq!(as_f32("top_p"), Some(0.95));
+    assert_eq!(
+        body.get("max_output_tokens"),
+        Some(&serde_json::json!(4096))
+    );
+    assert!(
+        body.get("store").is_none(),
+        "store stays unset off the codex path — {body}"
+    );
+    assert!(
+        body.get("include").is_none(),
+        "include stays unset off the codex path — {body}"
+    );
+}
+
+#[test]
+fn codex_compat_defaults_to_off() {
+    assert!(!ConversationRequest::default().codex_compat);
+    assert!(
+        !body_of(&ConversationRequest::from_items(vec![
+            ConversationItem::user("hi")
+        ]))
+        .as_object()
+        .expect("object")
+        .contains_key("store")
+    );
+}
+
+#[test]
+fn every_key_gx_emits_appears_in_a_known_good_body_with_the_same_type() {
+    // Unknown top-level fields are a 400, so gx's key set must be a subset of
+    // what the endpoint has demonstrably accepted.
+    let fixtures = codex_fixtures();
+    let mut accepted: std::collections::BTreeMap<String, &'static str> =
+        std::collections::BTreeMap::new();
+    for (_, body) in &fixtures {
+        for (key, value) in body.as_object().expect("fixture body is an object") {
+            accepted.insert(key.clone(), json_kind(value));
+        }
+    }
+    // `stream` is set by the sampler after this mapping, not by it.
+    assert!(accepted.contains_key("stream"));
+
+    let mut req = codex_request();
+    req.tools = vec![ToolSpec {
+        name: "read_file".to_string(),
+        description: Some("Read a file".to_string()),
+        parameters: serde_json::json!({"type": "object", "properties": {}}),
+    }];
+    req.tool_choice = Some(ConversationToolChoice::Auto);
+    let body = body_of(&req);
+
+    for (key, value) in body.as_object().expect("object") {
+        let want = accepted.get(key).unwrap_or_else(|| {
+            panic!(
+                "gx emits top-level `{key}`, which no known-good body carries; \
+                 the endpoint 400s on unknown fields. Accepted: {:?}",
+                accepted.keys().collect::<Vec<_>>()
+            )
+        });
+        assert_eq!(
+            &json_kind(value),
+            want,
+            "`{key}` has a different JSON type than the known-good bodies"
+        );
+    }
+}
+
+#[test]
+fn the_known_good_bodies_agree_with_what_codex_compat_emits() {
+    for (name, body) in codex_fixtures() {
+        assert_eq!(
+            body.get("store"),
+            Some(&serde_json::json!(false)),
+            "{name}: every accepted body carries store:false"
+        );
+        for rejected in ["temperature", "top_p", "max_output_tokens"] {
+            assert!(
+                body.get(rejected).is_none(),
+                "{name}: no accepted body carries `{rejected}`"
+            );
+        }
+        // The reasoning-replay cases carry the include gx always sends.
+        if name.starts_with("13") || name.starts_with("14") {
+            assert_eq!(
+                body.get("include"),
+                Some(&serde_json::json!(["reasoning.encrypted_content"])),
+                "{name}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_codex_tool_round_trip_replays_the_items_the_endpoint_accepted() {
+    // Mirrors fixture 14b: the assistant's function_call and its
+    // function_call_output must both survive the mapping, in order.
+    let mut req = ConversationRequest::from_items(vec![
+        ConversationItem::user("Call the get_marker tool and reply with only its result."),
+        ConversationItem::assistant_tool_calls(vec![ToolCall {
+            id: "call_abc".into(),
+            name: "get_marker".to_string(),
+            arguments: "{}".into(),
+        }]),
+        ConversationItem::tool_result("call_abc", "MARKER-7731"),
+    ])
+    .with_model("gpt-5.6-sol");
+    req.codex_compat = true;
+    req.tools = vec![ToolSpec {
+        name: "get_marker".to_string(),
+        description: Some("Returns the marker string".to_string()),
+        parameters: serde_json::json!({"type": "object", "properties": {}}),
+    }];
+
+    let body = body_of(&req);
+    let kinds: Vec<&str> = body["input"]
+        .as_array()
+        .expect("input items")
+        .iter()
+        .filter_map(|i| i.get("type").and_then(serde_json::Value::as_str))
+        .collect();
+
+    let fixture = codex_fixtures()
+        .into_iter()
+        .find(|(name, _)| *name == "14b-tool-turn2-output")
+        .expect("fixture")
+        .1;
+    let want: Vec<&str> = fixture["input"]
+        .as_array()
+        .expect("input items")
+        .iter()
+        .filter_map(|i| i.get("type").and_then(serde_json::Value::as_str))
+        .collect();
+
+    assert_eq!(kinds, want, "item order/types must match the accepted body");
+    assert_eq!(body.get("store"), Some(&serde_json::json!(false)));
+}
+
+fn json_kind(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "bool",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}

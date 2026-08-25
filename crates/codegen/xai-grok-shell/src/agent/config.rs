@@ -3646,6 +3646,7 @@ fn default_models(endpoints: &EndpointsConfig) -> IndexMap<String, ModelEntryCon
                 compaction_at_tokens: m.compaction_at_tokens,
                 show_model_fingerprint: m.show_model_fingerprint,
                 stream_tool_calls: None,
+                codex_compat: None,
                 laziness_detector: LazinessDetectorPerModelConfig::default(),
             };
             (key, config)
@@ -3765,8 +3766,19 @@ pub struct ModelEntryConfig {
     /// Per-model opt-in: BYOK endpoints that don't understand the flag should leave this unset to avoid request errors.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_tool_calls: Option<bool>,
+    /// gx: shape the Responses body for OpenAI's ChatGPT/Codex endpoint
+    /// (`https://chatgpt.com/backend-api/codex/responses`), whose body
+    /// validator is strict where the public Responses API is lenient: `store`
+    /// must be an explicit `false`, and `temperature` / `top_p` /
+    /// `max_output_tokens` are each rejected outright. With this set the
+    /// sampler emits that shape and adds
+    /// `include: ["reasoning.encrypted_content"]` so multi-turn reasoning
+    /// replays. Per-model opt-in; every other provider is unaffected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_compat: Option<bool>,
     /// Per-model Layer-3 LazinessDetector configuration.
     /// Defaults to the all-disabled state via `#[serde(default)]`.
+
     #[serde(default, skip_serializing_if = "is_default_laziness_detector")]
     pub laziness_detector: LazinessDetectorPerModelConfig,
 }
@@ -3833,6 +3845,8 @@ pub struct ConfigModelOverride {
     pub compaction_at_tokens: Option<CompactionAtTokens>,
     pub show_model_fingerprint: Option<bool>,
     pub stream_tool_calls: Option<bool>,
+    // gx: see `ModelEntryConfig::codex_compat`.
+    pub codex_compat: Option<bool>,
 }
 impl ConfigModelOverride {
     pub(crate) fn apply(
@@ -3939,6 +3953,10 @@ impl ConfigModelOverride {
         if self.stream_tool_calls.is_some() {
             entry.info.stream_tool_calls = self.stream_tool_calls;
         }
+        // gx: per-model opt-in for the ChatGPT/Codex body shape.
+        if self.codex_compat.is_some() {
+            entry.info.codex_compat = self.codex_compat;
+        }
         if self.api_key.is_some() {
             entry.api_key.clone_from(&self.api_key);
         }
@@ -4032,9 +4050,13 @@ pub struct ModelInfo {
     pub show_model_fingerprint: bool,
     /// When `Some(true)`, the sampler injects `stream_tool_calls: true`
     pub stream_tool_calls: Option<bool>,
+    /// gx: see `ModelEntryConfig::codex_compat`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_compat: Option<bool>,
     /// Per-model Layer-3 LazinessDetector configuration. Defaults to the all-disabled state.
     /// The feature is per-model opt-in, with a second-step `max_nudges_per_session > 0` opt-in for actually injecting nudges.
     /// See [`LazinessDetectorPerModelConfig`].
+
     #[serde(default)]
     pub laziness_detector: LazinessDetectorPerModelConfig,
 }
@@ -4078,6 +4100,7 @@ impl ModelInfo {
             compaction_at_tokens: None,
             show_model_fingerprint: false,
             stream_tool_calls: None,
+            codex_compat: None,
             laziness_detector: LazinessDetectorPerModelConfig::default(),
         }
     }
@@ -4118,6 +4141,7 @@ impl ModelInfo {
             compaction_at_tokens: entry.compaction_at_tokens,
             show_model_fingerprint: entry.show_model_fingerprint,
             stream_tool_calls: entry.stream_tool_calls,
+            codex_compat: entry.codex_compat,
             laziness_detector: entry.laziness_detector.clone(),
         }
     }
@@ -4814,6 +4838,7 @@ pub(crate) fn resolve_aux_model_sampling_config(
                 compaction_at_tokens: None,
                 show_model_fingerprint: false,
                 stream_tool_calls: None,
+                codex_compat: None,
                 laziness_detector: LazinessDetectorPerModelConfig::default(),
             },
             mtls_cert_dir: None,
@@ -4955,6 +4980,8 @@ pub(crate) fn sampling_config_for_model(
         max_retries: info.max_retries,
         rate_limit_retry_threshold: info.rate_limit_retry_threshold,
         stream_tool_calls: info.stream_tool_calls.unwrap_or(false),
+        // gx: per-model ChatGPT/Codex body shaping.
+        codex_compat: info.codex_compat.unwrap_or(false),
         idle_timeout_secs: None,
         client_identifier: None,
         deployment_id,
@@ -5036,6 +5063,7 @@ fn resolve_hidden_default_web_search_sampling_config(
             compaction_at_tokens: None,
             show_model_fingerprint: false,
             stream_tool_calls: None,
+            codex_compat: None,
             laziness_detector: LazinessDetectorPerModelConfig::default(),
         },
         mtls_cert_dir: None,

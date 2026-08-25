@@ -142,6 +142,14 @@ image = { workspace = true, features = ["png", "jpeg", "tiff", "gif", "webp"] }
 # ID generation
 uuid = { workspace = true, features = ["v4"] }
 
+# gx: the OpenAI token refresh in `openai_codex_auth.rs` (one blocking JSON
+# POST to auth.openai.com, run on its own thread). Already in the dependency
+# graph via xai-grok-http / xai-grok-sampler.
+reqwest = { workspace = true, features = ["blocking", "json"] }
+# Grok TLS policy (backend pin, OS roots, GROK_EXTRA_CA_BUNDLE) for the same
+# blocking client; required by clippy's disallowed-methods policy.
+xai-grok-extra-ca = { workspace = true }
+
 # Path computation (plan file, etc.)
 shellexpand = "3.1"
 
@@ -197,8 +205,6 @@ xai-grok-agent = { workspace = true }
 # In-process leader-cluster harness (mock inference server; no cycle:
 # xai-grok-test-support depends on neither the pager nor the shell).
 xai-grok-test-support = { workspace = true, features = [] }
-# Provider install for the in-process leader-cluster tests.
-xai-grok-extra-ca = { workspace = true }
 
 [[bench]]
 name = "render"

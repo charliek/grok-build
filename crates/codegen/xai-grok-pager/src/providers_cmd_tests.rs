@@ -35,6 +35,16 @@ fn no_env(_: &str) -> Option<String> {
     None
 }
 
+/// A fixed install-time context. Tests must never resolve this machine's own
+/// binary path or read the real `~/.codex/auth.json`, so every `install_at`
+/// call takes this instead of `PresetContext::detect()`.
+fn ctx() -> PresetContext {
+    PresetContext::fixed(GX_BIN, Some(FIXTURE_ACCOUNT))
+}
+
+const GX_BIN: &str = "/opt/gx/bin/gx";
+const FIXTURE_ACCOUNT: &str = "acct-fixture-abc123";
+
 /// A synthetic two-generation preset table: `install` semantics are about
 /// *shipped default history*, which the real presets do not have yet (they are
 /// all first generation). Testing against this table exercises the upgrade rule
@@ -61,6 +71,7 @@ const SYNTH_PRESETS: &[ProviderPreset] = &[ProviderPreset {
     id: "synth",
     label: "Synthetic",
     install: true,
+    rejects_static_key: false,
     note: None,
     fields: SYNTH_PROVIDER_FIELDS,
     models: &[ModelPreset {
@@ -76,7 +87,7 @@ const SYNTH_PRESETS: &[ProviderPreset] = &[ProviderPreset {
 #[test]
 fn install_writes_every_installable_preset_and_no_api_keys() {
     let dir = home();
-    let report = install_at(dir.path(), PRESETS, false).expect("install");
+    let report = install_at(dir.path(), PRESETS, false, &ctx()).expect("install");
     let body = providers_body(dir.path());
 
     for preset in PRESETS.iter().filter(|p| p.install) {
@@ -102,12 +113,20 @@ fn install_writes_every_installable_preset_and_no_api_keys() {
             "install must never write key material, found one on {id}"
         );
     }
-    // The Phase-2 skeletons are data-only in this build.
+    // Every shipped preset installs in this build, OpenAI included.
+    assert!(PRESETS.iter().all(|p| p.install));
+    assert!(body.contains("[model_providers.openai-codex]"), "{body}");
+    assert!(body.contains("[model_providers.openai-api]"), "{body}");
+    // `openai-api` deliberately ships no models: which OpenAI models a key can
+    // reach is account-specific, so a shipped catalog would only go stale.
     assert!(
-        !body.contains("openai-codex"),
-        "openai-codex must not install"
+        PRESETS
+            .iter()
+            .find(|p| p.id == "openai-api")
+            .expect("openai-api preset")
+            .models
+            .is_empty()
     );
-    assert!(!body.contains("openai-api"), "openai-api must not install");
 
     assert!(report.changed);
     assert!(
@@ -127,7 +146,7 @@ fn install_writes_every_installable_preset_and_no_api_keys() {
 #[test]
 fn install_mirrors_the_live_glm_openrouter_and_fireworks_shapes() {
     let dir = home();
-    install_at(dir.path(), PRESETS, false).expect("install");
+    install_at(dir.path(), PRESETS, false, &ctx()).expect("install");
     let parsed = parse_providers(dir.path());
 
     let glm = &parsed["model"]["glm-5.3"];
@@ -217,10 +236,10 @@ fn install_mirrors_the_live_glm_openrouter_and_fireworks_shapes() {
 #[test]
 fn install_second_run_is_byte_identical_and_reports_no_change() {
     let dir = home();
-    install_at(dir.path(), PRESETS, false).expect("first install");
+    install_at(dir.path(), PRESETS, false, &ctx()).expect("first install");
     let first = providers_body(dir.path());
 
-    let report = install_at(dir.path(), PRESETS, false).expect("second install");
+    let report = install_at(dir.path(), PRESETS, false, &ctx()).expect("second install");
     let second = providers_body(dir.path());
 
     assert_eq!(first, second, "second install must be byte-identical");
@@ -235,13 +254,13 @@ fn install_second_run_is_byte_identical_and_reports_no_change() {
 fn install_writes_providers_toml_0600_and_reclamps_a_loosened_file() {
     use std::os::unix::fs::PermissionsExt as _;
     let dir = home();
-    let first = install_at(dir.path(), PRESETS, false).expect("install");
+    let first = install_at(dir.path(), PRESETS, false, &ctx()).expect("install");
     let path = providers_path(dir.path());
     assert_eq!(mode_of(&path), 0o600, "providers.toml must be owner-only");
     assert_eq!(first.reclamped_from, None, "a fresh file is born 0600");
 
     fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
-    let report = install_at(dir.path(), PRESETS, false).expect("second install");
+    let report = install_at(dir.path(), PRESETS, false, &ctx()).expect("second install");
     assert_eq!(
         mode_of(&path),
         0o600,
@@ -257,7 +276,7 @@ fn install_writes_providers_toml_0600_and_reclamps_a_loosened_file() {
     );
 
     // And once it is back at 0600, nothing is reported.
-    let quiet = install_at(dir.path(), PRESETS, false).expect("third install");
+    let quiet = install_at(dir.path(), PRESETS, false, &ctx()).expect("third install");
     assert_eq!(quiet.reclamped_from, None);
 }
 
@@ -279,12 +298,12 @@ fn install_never_creates_or_touches_config_toml() {
     fs::write(&config, "[ui]\ncompact_mode = true\n").unwrap();
     let before = fs::read_to_string(&config).unwrap();
 
-    install_at(dir.path(), PRESETS, false).expect("install");
+    install_at(dir.path(), PRESETS, false, &ctx()).expect("install");
     assert_eq!(fs::read_to_string(&config).unwrap(), before);
 
     // And with no config.toml at all, install must not invent one.
     let empty = home();
-    install_at(empty.path(), PRESETS, false).expect("install");
+    install_at(empty.path(), PRESETS, false, &ctx()).expect("install");
     assert!(!empty.path().join("config.toml").exists());
 }
 
@@ -319,7 +338,7 @@ model_provider = "my-own"
     )
     .unwrap();
 
-    install_at(dir.path(), PRESETS, false).expect("install");
+    install_at(dir.path(), PRESETS, false, &ctx()).expect("install");
     let body = providers_body(dir.path());
 
     assert!(body.contains("# my own header comment"), "{body}");
@@ -335,7 +354,7 @@ model_provider = "my-own"
     assert!(body.contains(r#"env_key = "FIREWORKS_API_KEY""#), "{body}");
 
     // Still idempotent on top of a hand-edited file.
-    install_at(dir.path(), PRESETS, false).expect("second install");
+    install_at(dir.path(), PRESETS, false, &ctx()).expect("second install");
     assert_eq!(providers_body(dir.path()), body);
 }
 
@@ -357,7 +376,7 @@ model = "hand-picked-wire-id"
     )
     .unwrap();
 
-    let report = install_at(dir.path(), SYNTH_PRESETS, false).expect("install");
+    let report = install_at(dir.path(), SYNTH_PRESETS, false, &ctx()).expect("install");
     let parsed = parse_providers(dir.path());
 
     // Equal to an older shipped default -> upgraded.
@@ -457,7 +476,7 @@ stream_tool_calls = false
     .unwrap();
     let before = fs::read_to_string(&path).unwrap();
 
-    let report = install_at(dir.path(), PRESETS, false).expect("install");
+    let report = install_at(dir.path(), PRESETS, false, &ctx()).expect("install");
     let parsed = parse_providers(dir.path());
 
     // No new Fireworks tables — every Fireworks entry already existed. (The
@@ -551,7 +570,7 @@ model = "hand-picked-wire-id"
     )
     .unwrap();
 
-    let report = install_at(dir.path(), SYNTH_PRESETS, true).expect("forced install");
+    let report = install_at(dir.path(), SYNTH_PRESETS, true, &ctx()).expect("forced install");
     let parsed = parse_providers(dir.path());
 
     assert_eq!(
@@ -591,7 +610,7 @@ env_key = "SYNTH_API_KEY"
     )
     .unwrap();
 
-    let report = install_at(dir.path(), SYNTH_PRESETS, false).expect("install");
+    let report = install_at(dir.path(), SYNTH_PRESETS, false, &ctx()).expect("install");
     let body = providers_body(dir.path());
 
     assert_eq!(
@@ -607,7 +626,7 @@ env_key = "SYNTH_API_KEY"
     assert!(body.contains(r#"[model."synth/model.v1"]"#), "{body}");
 
     // Idempotent: the skip repeats, byte for byte.
-    install_at(dir.path(), SYNTH_PRESETS, false).expect("second install");
+    install_at(dir.path(), SYNTH_PRESETS, false, &ctx()).expect("second install");
     assert_eq!(providers_body(dir.path()), body);
 }
 
@@ -622,7 +641,7 @@ base_url = "https://stock-grok.example.test/v1"
     )
     .unwrap();
 
-    let report = install_at(dir.path(), SYNTH_PRESETS, false).expect("install");
+    let report = install_at(dir.path(), SYNTH_PRESETS, false, &ctx()).expect("install");
     assert_eq!(
         report.shadows_config,
         vec![ShadowConflict {
@@ -644,7 +663,7 @@ base_url = "https://stock-grok.example.test/v1"
         "providers.toml still gets the shipped value; it wins for gx"
     );
     // The warning is stable across runs.
-    let again = install_at(dir.path(), SYNTH_PRESETS, false).expect("second install");
+    let again = install_at(dir.path(), SYNTH_PRESETS, false, &ctx()).expect("second install");
     assert_eq!(again.shadows_config, report.shadows_config);
 }
 
@@ -655,7 +674,7 @@ fn install_refuses_to_overwrite_a_malformed_providers_toml() {
     let junk = "this is not = = toml [[[\n";
     fs::write(&path, junk).unwrap();
 
-    let err = install_at(dir.path(), PRESETS, false).expect_err("must refuse");
+    let err = install_at(dir.path(), PRESETS, false, &ctx()).expect_err("must refuse");
     assert!(
         err.to_string().contains("not valid TOML"),
         "unexpected error: {err}"
@@ -668,7 +687,7 @@ fn install_reports_a_non_table_top_level_key_instead_of_clobbering_it() {
     let dir = home();
     let path = providers_path(dir.path());
     fs::write(&path, "model_providers = \"oops\"\n").unwrap();
-    let err = install_at(dir.path(), PRESETS, false).expect_err("must refuse");
+    let err = install_at(dir.path(), PRESETS, false, &ctx()).expect_err("must refuse");
     assert!(err.to_string().contains("is not a table"), "got: {err}");
 }
 
@@ -691,7 +710,7 @@ env_key = "SYNTH_API_KEY"
     let junk = "[model_providers]\nsynth = \"not-a-table\"\n";
     fs::write(&path, junk).unwrap();
 
-    let err = install_at(dir.path(), SYNTH_PRESETS, false).expect_err("must abort");
+    let err = install_at(dir.path(), SYNTH_PRESETS, false, &ctx()).expect_err("must abort");
     let text = format!("{err:#}");
     assert!(text.contains("model_providers.synth"), "got: {text}");
     assert!(text.contains("is not a table"), "got: {text}");
@@ -704,7 +723,7 @@ fn install_aborts_on_an_inline_table_entry_it_would_otherwise_step_over() {
     let path = providers_path(dir.path());
     let junk = "[model_providers]\nsynth = { base_url = \"https://x.example.test\" }\n";
     fs::write(&path, junk).unwrap();
-    let err = install_at(dir.path(), SYNTH_PRESETS, false).expect_err("must abort");
+    let err = install_at(dir.path(), SYNTH_PRESETS, false, &ctx()).expect_err("must abort");
     assert!(err.to_string().contains("is not a table"), "got: {err}");
     assert_eq!(fs::read_to_string(&path).unwrap(), junk, "file untouched");
 }
@@ -735,7 +754,7 @@ api_key = "sk-providers-secret-2222"
     )
     .unwrap();
 
-    let report = install_at(dir.path(), SYNTH_PRESETS, false).expect("install");
+    let report = install_at(dir.path(), SYNTH_PRESETS, false, &ctx()).expect("install");
     assert_eq!(
         report.shadows_config,
         vec![ShadowConflict {
@@ -765,7 +784,7 @@ api_key = "sk-same-on-both-sides"
 "#;
     fs::write(dir.path().join("config.toml"), entry).unwrap();
     fs::write(providers_path(dir.path()), entry).unwrap();
-    let report = install_at(dir.path(), SYNTH_PRESETS, false).expect("install");
+    let report = install_at(dir.path(), SYNTH_PRESETS, false, &ctx()).expect("install");
     assert!(
         report
             .shadows_config
@@ -783,7 +802,7 @@ api_key = "sk-same-on-both-sides"
 #[test]
 fn set_key_writes_api_key_and_unset_key_removes_it() {
     let dir = home();
-    install_at(dir.path(), PRESETS, false).expect("install");
+    install_at(dir.path(), PRESETS, false, &ctx()).expect("install");
 
     set_key_at(dir.path(), "fireworks", "fw_secret_value_1234").expect("set-key");
     let parsed = parse_providers(dir.path());
@@ -858,17 +877,20 @@ base_url = "https://mine.example.test/v1"
 #[test]
 fn set_key_rejects_an_empty_key_and_an_unknown_provider() {
     let dir = home();
-    install_at(dir.path(), PRESETS, false).expect("install");
+    install_at(dir.path(), PRESETS, false, &ctx()).expect("install");
     let before = providers_body(dir.path());
 
     let err = set_key_at(dir.path(), "fireworks", "   ").expect_err("empty key");
     assert!(err.to_string().contains("empty key"), "got: {err}");
 
-    let err = set_key_at(dir.path(), "openai-codex", "sk-x").expect_err("phase-2 preset");
+    // A static key on the OAuth provider would *outrank* its auth helper in
+    // credential resolution, silently disabling the ChatGPT login.
+    let err = set_key_at(dir.path(), "openai-codex", "sk-x").expect_err("oauth provider");
     assert!(
-        err.to_string().contains("not available in this build"),
+        err.to_string().contains("does not take an API key"),
         "got: {err}"
     );
+    assert!(!err.to_string().contains("sk-x"), "got: {err}");
 
     let err = set_key_at(dir.path(), "not-a-provider", "sk-x").expect_err("unknown provider");
     assert!(err.to_string().contains("unknown provider"), "got: {err}");
@@ -883,7 +905,7 @@ fn set_key_rejects_an_empty_key_and_an_unknown_provider() {
 #[test]
 fn unset_key_on_an_undefined_provider_is_an_error_not_a_write() {
     let dir = home();
-    install_at(dir.path(), PRESETS, false).expect("install");
+    install_at(dir.path(), PRESETS, false, &ctx()).expect("install");
     let before = providers_body(dir.path());
     let err = unset_key_at(dir.path(), "not-a-provider").expect_err("unknown provider");
     assert!(err.to_string().contains("not defined"), "got: {err}");
@@ -955,7 +977,7 @@ model = "hand-picked-wire-id" # mine
     )
     .unwrap();
 
-    install_at(dir.path(), SYNTH_PRESETS, false).expect("install");
+    install_at(dir.path(), SYNTH_PRESETS, false, &ctx()).expect("install");
     let body = providers_body(dir.path());
     assert!(
         body.contains(&format!("context_window = {CURRENT_CTX}")),
@@ -970,7 +992,7 @@ model = "hand-picked-wire-id" # mine
         "an upgrade dropped the comment above the key:\n{body}"
     );
 
-    install_at(dir.path(), SYNTH_PRESETS, true).expect("forced install");
+    install_at(dir.path(), SYNTH_PRESETS, true, &ctx()).expect("forced install");
     let body = providers_body(dir.path());
     assert!(body.contains(r#"model = "synth-wire-id""#), "{body}");
     assert!(
@@ -1028,13 +1050,24 @@ fn piped_key_round_trips_into_providers_toml() {
 #[test]
 fn status_covers_configured_unconfigured_and_env_key_cases() {
     let dir = home();
-    install_at(dir.path(), PRESETS, false).expect("install");
+    install_at(dir.path(), PRESETS, false, &ctx()).expect("install");
     set_key_at(dir.path(), "zai-coding-plan", "zai-key-abcdefgh").expect("set-key");
 
     let env = |name: &str| match name {
         "OPENROUTER_API_KEY" => Some("sk-or-env-value-wxyz".to_owned()),
         _ => None,
     };
+    // An entry a user might add by hand and never configure: `status` must
+    // still list it, and say it is not set up. Every shipped preset installs,
+    // so the "not configured" rendering needs a provider that did not.
+    fs::write(
+        providers_path(dir.path()),
+        format!(
+            "{}\n[model_providers.hand-written]\nbase_url = \"https://example.test/v1\"\n",
+            providers_body(dir.path())
+        ),
+    )
+    .unwrap();
     let report = status_report(dir.path(), None, &env);
     let rendered = render_status(&report, 0);
 
@@ -1073,23 +1106,31 @@ fn status_covers_configured_unconfigured_and_env_key_cases() {
     );
     assert_eq!(fireworks.models.len(), 5);
 
-    // openai-codex is a preset but is not installed in this build.
     let codex = report
         .providers
         .iter()
         .find(|p| p.id == "openai-codex")
         .expect("openai-codex listed");
-    assert!(!codex.in_providers && !codex.in_config);
+    assert!(codex.in_providers && !codex.in_config);
+    assert_eq!(codex.models.len(), 3, "the three ChatGPT-plan models");
+    assert!(
+        codex.env_keys.is_empty(),
+        "an env_key would shadow the auth helper"
+    );
 
     // Rendered shapes.
     assert!(
         rendered.contains("configured   yes  (providers.toml)"),
         "{rendered}"
     );
+    // Every preset installs, so the "not configured" line comes from a
+    // provider that is defined nowhere -- see the synthetic entry above, which
+    // is in providers.toml but is not a preset.
     assert!(
-        rendered.contains("configured   no   (run `gx providers install`)"),
-        "{rendered}"
+        !rendered.contains("configured   no   (run `gx providers install`)"),
+        "everything shipped is installed:\n{rendered}"
     );
+    assert!(rendered.contains("hand-written"), "{rendered}");
     assert!(
         rendered.contains("key          yes  …efgh  (providers.toml api_key)"),
         "{rendered}"
@@ -1109,7 +1150,7 @@ fn status_covers_configured_unconfigured_and_env_key_cases() {
 #[test]
 fn status_never_prints_more_than_the_last_four_characters_of_a_key() {
     let dir = home();
-    install_at(dir.path(), PRESETS, false).expect("install");
+    install_at(dir.path(), PRESETS, false, &ctx()).expect("install");
     let secret = "fw_super_secret_key_material_7777";
     set_key_at(dir.path(), "fireworks", secret).expect("set-key");
 
@@ -1498,7 +1539,7 @@ fn install_and_set_key_never_echo_a_malformed_providers_toml_source_line() {
 
     // `{e:#}` is how anyhow errors reach stderr at the top level: the whole
     // chain, not just the outermost message.
-    let err = install_at(dir.path(), PRESETS, false).expect_err("must refuse");
+    let err = install_at(dir.path(), PRESETS, false, &ctx()).expect_err("must refuse");
     let text = format!("{err:#}");
     assert!(text.contains("not valid TOML"), "got: {text}");
     assert!(
@@ -1525,7 +1566,7 @@ fn install_never_echoes_a_malformed_config_toml_source_line() {
     // too) — and must not be quoted back on the way past.
     let dir = home();
     fs::write(dir.path().join("config.toml"), leaky_toml()).unwrap();
-    let report = install_at(dir.path(), PRESETS, false).expect("install proceeds");
+    let report = install_at(dir.path(), PRESETS, false, &ctx()).expect("install proceeds");
     assert_no_key_fragment("install report", &format!("{report:?}"));
     assert_no_key_fragment("providers.toml body", &providers_body(dir.path()));
 }
@@ -1552,7 +1593,7 @@ fn install_refuses_a_providers_toml_over_the_runtime_cap() {
     let big = format!("# {}\n", "x".repeat(MAX_PROVIDERS_BYTES as usize));
     fs::write(&path, &big).unwrap();
 
-    let err = install_at(dir.path(), PRESETS, false).expect_err("must refuse");
+    let err = install_at(dir.path(), PRESETS, false, &ctx()).expect_err("must refuse");
     let text = format!("{err:#}");
     assert!(text.contains("providers.toml limit"), "got: {text}");
     assert_eq!(
@@ -1579,7 +1620,7 @@ fn a_providers_toml_that_is_not_a_regular_file_is_never_opened() {
     let dir = home();
     fs::create_dir(providers_path(dir.path())).unwrap();
 
-    let err = install_at(dir.path(), PRESETS, false).expect_err("must refuse");
+    let err = install_at(dir.path(), PRESETS, false, &ctx()).expect_err("must refuse");
     assert!(
         format!("{err:#}").contains("not a regular file"),
         "got: {err:#}"
@@ -1602,7 +1643,7 @@ fn an_oversized_config_toml_aborts_install_but_only_warns_in_status() {
     let config = dir.path().join("config.toml");
     fs::write(&config, "x".repeat(MAX_CONFIG_BYTES as usize + 1)).unwrap();
 
-    let err = install_at(dir.path(), PRESETS, false).expect_err("must abort");
+    let err = install_at(dir.path(), PRESETS, false, &ctx()).expect_err("must abort");
     let text = format!("{err:#}");
     assert!(text.contains("config.toml limit"), "got: {text}");
     assert!(
@@ -1631,7 +1672,7 @@ fn install_warns_when_the_rendered_file_would_exceed_the_runtime_cap() {
     let padding = "x".repeat(MAX_PROVIDERS_BYTES as usize - 32);
     fs::write(&path, format!("# {padding}\n")).unwrap();
 
-    let report = install_at(dir.path(), PRESETS, false).expect("install");
+    let report = install_at(dir.path(), PRESETS, false, &ctx()).expect("install");
     assert!(
         report
             .exceeds_runtime_cap
@@ -1798,14 +1839,14 @@ fn clap_parses_every_providers_subcommand() {
     ));
     assert!(matches!(
         parse(&["gx", "providers", "login", "openai"]),
-        ProvidersCommand::Login(Phase2Args {
-            provider: Phase2Provider::Openai
+        ProvidersCommand::Login(AuthTargetArgs {
+            provider: AuthTarget::Openai
         })
     ));
     assert!(matches!(
         parse(&["gx", "providers", "token", "openai"]),
-        ProvidersCommand::Token(Phase2Args {
-            provider: Phase2Provider::Openai
+        ProvidersCommand::Token(AuthTargetArgs {
+            provider: AuthTarget::Openai
         })
     ));
 }
@@ -1833,21 +1874,8 @@ fn clap_rejects_a_key_passed_as_a_positional_argument() {
     );
     assert!(
         PagerArgs::try_parse_from(["gx", "providers", "login", "anthropic"]).is_err(),
-        "only the declared Phase-2 providers parse"
+        "only the declared auth targets parse"
     );
-}
-
-#[test]
-fn phase2_placeholders_announce_themselves_without_pretending_to_work() {
-    assert_eq!(
-        phase2_unavailable_message("login", Phase2Provider::Openai),
-        "gx providers login openai: not yet available in this build"
-    );
-    assert_eq!(
-        phase2_unavailable_message("token", Phase2Provider::Openai),
-        "gx providers token openai: not yet available in this build"
-    );
-    assert_eq!(PHASE2_EXIT_CODE, 2);
 }
 
 #[test]
@@ -1925,9 +1953,507 @@ fn every_preset_is_shaped_for_the_providers_layer_allowlist() {
     // The OAuth preset must not carry env_key: a static credential beats the
     // auth-provider token in resolution and would shadow the codex login.
     let codex = PRESETS.iter().find(|p| p.id == "openai-codex").unwrap();
-    assert!(!codex.install, "openai-codex is Phase 2, not installed yet");
     assert!(
         codex.fields.iter().all(|f| f.key != "env_key"),
         "openai-codex must not carry env_key"
+    );
+    assert!(
+        codex.rejects_static_key,
+        "`set-key openai-codex` must refuse: an api_key outranks the auth helper"
+    );
+    // The rule the two OpenAI providers exist to keep apart.
+    let api = PRESETS.iter().find(|p| p.id == "openai-api").unwrap();
+    assert!(!api.rejects_static_key);
+    assert!(api.fields.iter().any(|f| f.key == "env_key"));
+}
+
+// ---------------------------------------------------------------------------
+// the OpenAI presets
+// ---------------------------------------------------------------------------
+
+fn model_entry<'a>(parsed: &'a toml::Value, id: &str) -> &'a toml::Value {
+    parsed["model"]
+        .get(id)
+        .unwrap_or_else(|| panic!("model `{id}` was installed"))
+}
+
+#[test]
+fn the_openai_codex_preset_matches_the_shape_the_spike_proved() {
+    let dir = home();
+    install_at(dir.path(), PRESETS, false, &ctx()).expect("install");
+    let parsed = parse_providers(dir.path());
+    let provider = &parsed["model_providers"]["openai-codex"];
+
+    assert_eq!(
+        provider["base_url"].as_str(),
+        Some("https://chatgpt.com/backend-api/codex")
+    );
+    assert_eq!(provider["api_backend"].as_str(), Some("responses"));
+    // No env_key and no api_key: either one outranks the auth helper in
+    // credential resolution and would shadow the ChatGPT login.
+    assert!(provider.get("env_key").is_none(), "{provider}");
+    assert!(provider.get("api_key").is_none(), "{provider}");
+
+    // The auth-helper seam: gx's own binary, by absolute path, with `args`
+    // present so it execs directly instead of going through a shell.
+    let auth = &provider["auth"];
+    assert_eq!(auth["command"].as_str(), Some(GX_BIN));
+    assert_eq!(
+        auth["args"]
+            .as_array()
+            .expect("args")
+            .iter()
+            .filter_map(toml::Value::as_str)
+            .collect::<Vec<_>>(),
+        vec!["providers", "token", "openai"]
+    );
+    assert_eq!(
+        auth["timeout_secs"].as_integer(),
+        Some(TOKEN_HELPER_TIMEOUT_SECS),
+        "the 30s default is too tight for a lock wait plus a refresh"
+    );
+
+    let headers = &provider["extra_headers"];
+    assert_eq!(
+        headers[CHATGPT_ACCOUNT_HEADER].as_str(),
+        Some(FIXTURE_ACCOUNT)
+    );
+    assert_eq!(headers["originator"].as_str(), Some(GX_ORIGINATOR));
+
+    for id in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+        let entry = model_entry(&parsed, id);
+        assert_eq!(entry["model"].as_str(), Some(id), "wire id == catalog id");
+        assert_eq!(entry["model_provider"].as_str(), Some("openai-codex"));
+        // codex-rs's own value for the gpt-5.6 family.
+        assert_eq!(entry["context_window"].as_integer(), Some(272_000), "{id}");
+        assert_eq!(entry["codex_compat"].as_bool(), Some(true), "{id}");
+        assert_eq!(entry["supports_reasoning_effort"].as_bool(), Some(true));
+        assert_eq!(entry["reasoning_effort"].as_str(), Some("medium"));
+        assert_eq!(
+            entry["reasoning_efforts"]
+                .as_array()
+                .expect("efforts")
+                .iter()
+                .filter_map(toml::Value::as_str)
+                .collect::<Vec<_>>(),
+            vec!["low", "medium", "high", "xhigh"],
+            "{id}: the endpoint rejects `minimal`"
+        );
+        // Never a temperature/top_p/max_completion_tokens: the endpoint 400s on
+        // each of them, and codex_compat drops them, but shipping one would
+        // still be a lie in the catalog.
+        for rejected in ["temperature", "top_p", "max_completion_tokens"] {
+            assert!(
+                entry.get(rejected).is_none(),
+                "{id} must not ship {rejected}"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_openai_api_preset_is_a_plain_key_provider_with_no_catalog() {
+    let dir = home();
+    install_at(dir.path(), PRESETS, false, &ctx()).expect("install");
+    let provider = &parse_providers(dir.path())["model_providers"]["openai-api"];
+
+    assert_eq!(
+        provider["base_url"].as_str(),
+        Some("https://api.openai.com/v1")
+    );
+    assert_eq!(provider["api_backend"].as_str(), Some("responses"));
+    assert_eq!(provider["env_key"].as_str(), Some("OPENAI_API_KEY"));
+    assert!(
+        provider.get("auth").is_none(),
+        "a key provider mints nothing"
+    );
+
+    let parsed = parse_providers(dir.path());
+    let openai_api_models = parsed["model"]
+        .as_table()
+        .expect("model table")
+        .values()
+        .filter(|v| v.get("model_provider").and_then(toml::Value::as_str) == Some("openai-api"))
+        .count();
+    assert_eq!(openai_api_models, 0);
+}
+
+#[test]
+fn install_omits_the_account_header_and_says_so_when_codex_has_no_account() {
+    let dir = home();
+    let ctx = PresetContext::fixed(GX_BIN, None);
+    let report = install_at(dir.path(), PRESETS, false, &ctx).expect("install");
+
+    let headers = &parse_providers(dir.path())["model_providers"]["openai-codex"]["extra_headers"];
+    assert!(
+        headers.get(CHATGPT_ACCOUNT_HEADER).is_none(),
+        "an empty header value is worse than no header: {headers}"
+    );
+    assert_eq!(headers["originator"].as_str(), Some(GX_ORIGINATOR));
+    // The spike showed the account header is optional today, so this is a
+    // warning and not a failure — but it must be said.
+    assert!(
+        report
+            .context_notes
+            .iter()
+            .any(|n| n.contains("account id")),
+        "{:?}",
+        report.context_notes
+    );
+}
+
+#[test]
+fn install_refreshes_a_moved_binary_and_a_switched_account_without_force() {
+    let dir = home();
+    install_at(dir.path(), PRESETS, false, &ctx()).expect("first install");
+
+    // gx was reinstalled elsewhere and the user signed into another ChatGPT
+    // account: both values are machine-derived, so re-running `install` must
+    // fix them rather than treat them as hand edits.
+    let moved = PresetContext::fixed("/usr/local/bin/gx", Some("acct-second-999"));
+    let report = install_at(dir.path(), PRESETS, false, &moved).expect("second install");
+
+    let provider = &parse_providers(dir.path())["model_providers"]["openai-codex"];
+    assert_eq!(
+        provider["auth"]["command"].as_str(),
+        Some("/usr/local/bin/gx")
+    );
+    assert_eq!(
+        provider["extra_headers"][CHATGPT_ACCOUNT_HEADER].as_str(),
+        Some("acct-second-999")
+    );
+    assert!(
+        report
+            .refreshed_fields
+            .contains(&"model_providers.openai-codex.auth".to_owned()),
+        "{:?}",
+        report.refreshed_fields
+    );
+    assert!(
+        report
+            .refreshed_fields
+            .contains(&"model_providers.openai-codex.extra_headers".to_owned()),
+        "{:?}",
+        report.refreshed_fields
+    );
+    assert!(report.kept_fields.is_empty(), "{:?}", report.kept_fields);
+}
+
+#[test]
+fn install_leaves_a_hand_written_auth_helper_and_headers_alone() {
+    let dir = home();
+    install_at(dir.path(), PRESETS, false, &ctx()).expect("install");
+    // A helper that is emphatically not gx's shape, and a header bag with an
+    // extra entry of the user's own.
+    fs::write(
+        providers_path(dir.path()),
+        r#"
+[model_providers.openai-codex]
+base_url = "https://chatgpt.com/backend-api/codex"
+api_backend = "responses"
+auth = { command = "/opt/vault/mint-openai", args = ["--scope", "codex"] }
+extra_headers = { originator = "gx", "x-team" = "platform" }
+"#,
+    )
+    .unwrap();
+
+    let report = install_at(dir.path(), PRESETS, false, &ctx()).expect("install");
+    let provider = &parse_providers(dir.path())["model_providers"]["openai-codex"];
+
+    assert_eq!(
+        provider["auth"]["command"].as_str(),
+        Some("/opt/vault/mint-openai")
+    );
+    assert_eq!(
+        provider["extra_headers"]["x-team"].as_str(),
+        Some("platform")
+    );
+    assert!(
+        report
+            .kept_fields
+            .contains(&"model_providers.openai-codex.auth".to_owned()),
+        "{:?}",
+        report.kept_fields
+    );
+    assert!(
+        report
+            .kept_fields
+            .contains(&"model_providers.openai-codex.extra_headers".to_owned()),
+        "{:?}",
+        report.kept_fields
+    );
+}
+
+#[test]
+fn install_is_still_byte_identical_on_a_second_run_with_the_openai_presets() {
+    let dir = home();
+    install_at(dir.path(), PRESETS, false, &ctx()).expect("first install");
+    let first = providers_body(dir.path());
+    let report = install_at(dir.path(), PRESETS, false, &ctx()).expect("second install");
+    assert_eq!(providers_body(dir.path()), first);
+    assert!(!report.changed);
+    assert!(report.refreshed_fields.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// status: account drift
+// ---------------------------------------------------------------------------
+
+/// Like [`write_codex_fixture`], with a chosen account id.
+fn write_codex_fixture_for(dir: &Path, exp: i64, account: &str) -> PathBuf {
+    let path = dir.join("auth.json");
+    let token = fixture_jwt(serde_json::json!({
+        "exp": exp,
+        "https://api.openai.com/auth": {
+            "chatgpt_account_id": account,
+            "chatgpt_plan_type": "pro",
+        },
+    }));
+    let doc = serde_json::json!({
+        "auth_mode": "chatgpt",
+        "tokens": {
+            "id_token": "id-token-fixture",
+            "access_token": token,
+            "refresh_token": "refresh-token-fixture",
+        },
+    });
+    fs::write(&path, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
+    path
+}
+
+#[test]
+fn status_flags_an_installed_account_header_that_no_longer_matches() {
+    let dir = home();
+    install_at(dir.path(), PRESETS, false, &ctx()).expect("install");
+    // The user signed into a different ChatGPT account after installing.
+    let auth = write_codex_fixture_for(dir.path(), 1_800_000_000, "acct-second-999");
+
+    let rendered = render_status(
+        &status_report(dir.path(), Some(&auth), &no_env),
+        1_800_000_000 - 600,
+    );
+
+    assert!(rendered.contains("STALE HEADER"), "{rendered}");
+    assert!(rendered.contains("gx providers install"), "{rendered}");
+    // Redacted on both sides — never the full account id.
+    assert!(!rendered.contains("acct-second-999"), "{rendered}");
+    assert!(!rendered.contains(FIXTURE_ACCOUNT), "{rendered}");
+}
+
+#[test]
+fn status_notices_an_account_switch_once_and_then_stops() {
+    let dir = home();
+    let auth = write_codex_fixture_for(dir.path(), 1_800_000_000, FIXTURE_ACCOUNT);
+    // First look: nothing cached, so nothing to report — and the account is
+    // remembered.
+    let rendered = render_status(&status_report(dir.path(), Some(&auth), &no_env), 0);
+    assert!(!rendered.contains("ACCOUNT CHANGED"), "{rendered}");
+
+    let auth = write_codex_fixture_for(dir.path(), 1_800_000_000, "acct-second-999");
+    let rendered = render_status(&status_report(dir.path(), Some(&auth), &no_env), 0);
+    assert!(rendered.contains("ACCOUNT CHANGED"), "{rendered}");
+
+    // The cache was refreshed, so the same switch is not reported forever.
+    let rendered = render_status(&status_report(dir.path(), Some(&auth), &no_env), 0);
+    assert!(!rendered.contains("ACCOUNT CHANGED"), "{rendered}");
+}
+
+#[test]
+fn status_reports_the_same_refresh_verdict_the_token_command_acts_on() {
+    let dir = home();
+    let exp = 1_800_000_000_i64;
+    let auth = write_codex_fixture(dir.path(), exp);
+    let report = status_report(dir.path(), Some(&auth), &no_env);
+
+    // Comfortably inside the token's life.
+    let fresh = render_codex_status(report.codex.as_ref().expect("codex"), exp - 3_600);
+    assert!(fresh.contains("refresh      fresh (JWT exp)"), "{fresh}");
+
+    // Inside the 5-minute skew: still valid, but gx will refresh it.
+    let due = render_codex_status(report.codex.as_ref().expect("codex"), exp - 60);
+    assert!(due.contains("REFRESH DUE"), "{due}");
+}
+
+// ---------------------------------------------------------------------------
+// status: the installed auth helper
+// ---------------------------------------------------------------------------
+
+#[test]
+fn status_warns_when_the_installed_helper_path_no_longer_exists() {
+    // The preset bakes gx's own absolute path into `auth.command` so the helper
+    // works without gx on PATH — which means moving or rebuilding the binary
+    // leaves a dangling reference. grok's symptom is a helper that will not
+    // spawn, several layers from here; this line is what names the cause.
+    let dir = home();
+    install_at(dir.path(), PRESETS, false, &ctx()).expect("install");
+    let auth = write_codex_fixture(dir.path(), 1_800_000_000);
+
+    let rendered = render_status(&status_report(dir.path(), Some(&auth), &no_env), 0);
+
+    assert!(rendered.contains("HELPER MISSING"), "{rendered}");
+    assert!(rendered.contains(GX_BIN), "{rendered}");
+    assert!(
+        rendered.contains("helper path missing (binary moved?)"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("gx providers install"), "{rendered}");
+}
+
+#[test]
+fn status_says_nothing_about_a_helper_that_exists_or_one_resolved_from_path() {
+    let dir = home();
+    let auth = write_codex_fixture(dir.path(), 1_800_000_000);
+    let helper = dir.path().join("gx");
+    fs::write(&helper, "#!/bin/sh\nexit 0\n").unwrap();
+
+    let write_helper = |command: &str| {
+        fs::write(
+            providers_path(dir.path()),
+            format!(
+                "[model_providers.openai-codex]\n\
+                 auth = {{ command = \"{command}\", args = [\"providers\", \"token\", \"openai\"] }}\n"
+            ),
+        )
+        .unwrap();
+    };
+
+    write_helper(&helper.display().to_string());
+    let rendered = render_status(&status_report(dir.path(), Some(&auth), &no_env), 0);
+    assert!(!rendered.contains("HELPER MISSING"), "{rendered}");
+
+    // A bare command is resolved against PATH when it is spawned; `status` has
+    // no business second-guessing that.
+    write_helper("gx");
+    let rendered = render_status(&status_report(dir.path(), Some(&auth), &no_env), 0);
+    assert!(!rendered.contains("HELPER MISSING"), "{rendered}");
+}
+
+// ---------------------------------------------------------------------------
+// install: which auth tables count as gx's own
+// ---------------------------------------------------------------------------
+
+/// The `auth` value out of a one-line `[model_providers.openai-codex]` fixture.
+fn auth_value(inline: &str) -> toml::Value {
+    let src = format!("[model_providers.openai-codex]\nauth = {inline}\n");
+    toml::from_str::<toml::Value>(&src).expect("toml")["model_providers"]["openai-codex"]["auth"]
+        .clone()
+}
+
+#[test]
+fn only_a_machine_derived_gx_helper_counts_as_gx_shipped() {
+    // `install` rewrites a "gx-shipped" auth table without `--force`, so this
+    // predicate decides whose value may be silently replaced. It must recognize
+    // exactly what gx writes and nothing else: the args say *what* is invoked,
+    // the command says gx is what invokes it (a wrapper script calling the same
+    // args is the user's), and an unexpected key means a hand edit that
+    // replacing the whole inline table would delete.
+    let shipped =
+        |inline: &str| is_shipped_dynamic_shape(DynamicValue::GxTokenHelper, &auth_value(inline));
+
+    // The two shapes gx itself can write: an absolute path, and the bare `gx`
+    // fallback for when `current_exe` fails.
+    assert!(shipped(
+        r#"{ command = "/opt/gx/bin/gx", args = ["providers", "token", "openai"], timeout_secs = 120 }"#
+    ));
+    assert!(shipped(
+        r#"{ command = "gx", args = ["providers", "token", "openai"] }"#
+    ));
+    // A gx installed somewhere else entirely — still gx, still refreshable.
+    assert!(shipped(
+        r#"{ command = "/home/u/.cargo/bin/gx", args = ["providers", "token", "openai"], timeout_secs = 300 }"#
+    ));
+
+    // A wrapper that happens to call gx's args: rewriting `command` would drop
+    // the user's wrapper out of the chain.
+    assert!(!shipped(
+        r#"{ command = "/usr/local/bin/gx-with-vault", args = ["providers", "token", "openai"] }"#
+    ));
+    // Relative paths resolve against the *caller's* cwd, which gx never writes.
+    assert!(!shipped(
+        r#"{ command = "./gx", args = ["providers", "token", "openai"] }"#
+    ));
+    assert!(!shipped(
+        r#"{ command = "bin/gx", args = ["providers", "token", "openai"] }"#
+    ));
+    // Right args, entirely different program.
+    assert!(!shipped(
+        r#"{ command = "/opt/vault/mint", args = ["providers", "token", "openai"] }"#
+    ));
+    // gx, but doing something gx never asked for.
+    assert!(!shipped(
+        r#"{ command = "/opt/gx/bin/gx", args = ["providers", "token", "openai", "--json"] }"#
+    ));
+    assert!(!shipped(r#"{ command = "/opt/gx/bin/gx", args = [] }"#));
+    assert!(!shipped(r#"{ command = "/opt/gx/bin/gx" }"#));
+    // A field gx does not ship: the user added it, and a wholesale replacement
+    // would silently delete it.
+    assert!(!shipped(
+        r#"{ command = "/opt/gx/bin/gx", args = ["providers", "token", "openai"], env = { GROK_DEBUG = "1" } }"#
+    ));
+    assert!(!shipped(
+        r#"{ command = "/opt/gx/bin/gx", args = ["providers", "token", "openai"], cwd = "/tmp" }"#
+    ));
+    // No command at all, and not a table.
+    assert!(!shipped(r#"{ args = ["providers", "token", "openai"] }"#));
+    assert!(!shipped(r#""gx providers token openai""#));
+}
+
+#[test]
+fn install_keeps_a_user_wrapper_that_calls_gxs_own_helper_args() {
+    // The end-to-end shape of the case above: the args match gx's exactly, so
+    // only the `command` check keeps this out of `install`'s hands.
+    let dir = home();
+    install_at(dir.path(), PRESETS, false, &ctx()).expect("install");
+    fs::write(
+        providers_path(dir.path()),
+        r#"
+[model_providers.openai-codex]
+base_url = "https://chatgpt.com/backend-api/codex"
+auth = { command = "/usr/local/bin/gx-through-vault", args = ["providers", "token", "openai"], timeout_secs = 120 }
+"#,
+    )
+    .unwrap();
+
+    let report = install_at(dir.path(), PRESETS, false, &ctx()).expect("second install");
+
+    assert_eq!(
+        parse_providers(dir.path())["model_providers"]["openai-codex"]["auth"]["command"].as_str(),
+        Some("/usr/local/bin/gx-through-vault"),
+        "a user's wrapper is not a moved gx binary"
+    );
+    assert!(
+        report
+            .kept_fields
+            .contains(&"model_providers.openai-codex.auth".to_owned()),
+        "{:?}",
+        report.kept_fields
+    );
+}
+
+#[test]
+fn install_keeps_a_gx_helper_carrying_a_field_gx_never_ships() {
+    let dir = home();
+    install_at(dir.path(), PRESETS, false, &ctx()).expect("install");
+    fs::write(
+        providers_path(dir.path()),
+        r#"
+[model_providers.openai-codex]
+base_url = "https://chatgpt.com/backend-api/codex"
+auth = { command = "/somewhere/else/gx", args = ["providers", "token", "openai"], timeout_secs = 120, env = { GROK_AUTH_DEBUG = "1" } }
+"#,
+    )
+    .unwrap();
+
+    let report = install_at(dir.path(), PRESETS, false, &ctx()).expect("second install");
+    let auth = &parse_providers(dir.path())["model_providers"]["openai-codex"]["auth"];
+
+    assert_eq!(auth["command"].as_str(), Some("/somewhere/else/gx"));
+    assert_eq!(auth["env"]["GROK_AUTH_DEBUG"].as_str(), Some("1"));
+    assert!(
+        report
+            .kept_fields
+            .contains(&"model_providers.openai-codex.auth".to_owned()),
+        "{:?}",
+        report.kept_fields
     );
 }

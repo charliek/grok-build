@@ -14126,6 +14126,7 @@ dependencies = [
  "rand 0.9.5",
  "ratatui",
  "regex",
+ "reqwest 0.12.24",
  "serde",
  "serde_json",
  "serial_test",

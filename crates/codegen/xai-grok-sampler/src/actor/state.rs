@@ -86,6 +86,7 @@ mod tests {
             max_retries: None,
             rate_limit_retry_threshold: None,
             stream_tool_calls: false,
+            codex_compat: false,
             idle_timeout_secs: None,
             reasoning_effort: None,
             origin_client: None,

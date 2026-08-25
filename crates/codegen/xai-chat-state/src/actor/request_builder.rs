@@ -98,6 +98,10 @@ impl ChatStateActor {
             // Execute completed tool calls on a Length-truncated turn instead
             // of failing it; text-only salvage stays behind `CompletePartial`.
             length_policy: xai_grok_sampling_types::LengthPolicy::CompleteToolCalls,
+            // gx: the sampler also stamps this in
+            // `apply_conversation_defaults`, which every request path passes
+            // through -- including the ones this builder does not construct.
+            codex_compat: self.state.sampling_config.codex_compat.unwrap_or(false),
         }
     }
 }
