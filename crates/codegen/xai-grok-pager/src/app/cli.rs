@@ -44,6 +44,9 @@ pub enum Command {
     Mcp(crate::mcp_cmd::McpArgs),
     /// Manage plugins and marketplace sources
     Plugin(crate::plugin_cmd::PluginArgs),
+    // gx: manage the gx-only providers layer ($GROK_HOME/providers.toml).
+    /// Manage gx model providers (providers.toml)
+    Providers(crate::providers_cmd::ProvidersArgs),
     /// Manage cross-session memory
     Memory(crate::memory_cmd::MemoryArgs),
     /// List available models and exit
