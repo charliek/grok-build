@@ -49,11 +49,17 @@ jobs:
         with:
           persist-credentials: false
 
+      # ubuntu-22.04's apt protobuf-compiler is 3.12, which predates default
+      # proto3-optional support and fails the tools-api codegen. Install a
+      # pinned modern protoc release binary instead (same minor as the 3.21
+      # line that ubuntu-24.04/brew ship and the codegen is known-good with).
       - name: Install protoc (Linux)
         if: runner.os == 'Linux'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
+          curl -fsSL -o /tmp/protoc.zip \
+            https://github.com/protocolbuffers/protobuf/releases/download/v21.12/protoc-21.12-linux-x86_64.zip
+          echo "3a4c1e5f2516c639d3079b1586e703fc7bcfa2136d58bda24d1d54f949c315e8  /tmp/protoc.zip" | sha256sum -c -
+          sudo unzip -q -o /tmp/protoc.zip -d /usr/local bin/protoc 'include/*'
           protoc --version
 
       - name: Install protoc (macOS)
