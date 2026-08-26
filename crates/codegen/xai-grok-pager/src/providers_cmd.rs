@@ -490,16 +490,39 @@ const OPENROUTER_PROVIDER_FIELDS: &[PresetField] = &[
     PresetField::new("env_key", &[s("OPENROUTER_API_KEY")]),
 ];
 
-const OX_ALPHA_FIELDS: &[PresetField] = &[
-    PresetField::new("model", &[s("stealth/ox-alpha")]),
-    PresetField::new("name", &[s("Ox Alpha (OpenRouter)")]),
+// `openrouter/ox-alpha` (`stealth/ox-alpha`) was OpenRouter's stealth test
+// alias; it started 404ing and OpenRouter revealed it as Z.AI's GLM-5.3
+// Flash. Retired 2026-08-26 in favor of the model below, addressed directly
+// by its real wire id rather than the alias. This is a straight removal from
+// `PRESETS`, not a replacement-in-place: `install` only adds/upgrades entries
+// it finds in `PRESETS`, so a user's existing `[model."openrouter/ox-alpha"]`
+// is left exactly as it was, forever — `install` never deletes an entry that
+// falls out of the shipped catalog.
+//
+// `reasoning_effort` / `supports_reasoning_effort` / `reasoning_efforts`: a
+// live probe against OpenRouter's `chat_completions` API (2026-08-26)
+// confirmed `z-ai/glm-5.3-flash` accepts `reasoning_effort`.
+const GLM_53_FLASH_FIELDS: &[PresetField] = &[
+    PresetField::new("model", &[s("z-ai/glm-5.3-flash")]),
+    PresetField::new("name", &[s("GLM 5.3 Flash (OpenRouter)")]),
     PresetField::new(
         "description",
-        &[s("Stealth reasoning model via OpenRouter.")],
+        &[s(
+            "Fast Z.AI coding model via OpenRouter, replacing the retired stealth \
+             Ox Alpha test alias (2026-08-26).",
+        )],
     ),
     PresetField::new("model_provider", &[s("openrouter")]),
-    PresetField::new("context_window", &[i(200_000)]),
+    PresetField::new("context_window", &[i(1_048_576)]),
+    // Kept `false`: a lenient host, but consistent with every other
+    // third-party preset here.
     PresetField::new("stream_tool_calls", &[b(false)]),
+    PresetField::new("supports_reasoning_effort", &[b(true)]),
+    PresetField::new("reasoning_effort", &[s("high")]),
+    PresetField::new(
+        "reasoning_efforts",
+        &[l(&["low", "medium", "high", "xhigh", "max"])],
+    ),
 ];
 
 // -- Fireworks ---------------------------------------------------------------
@@ -756,8 +779,8 @@ pub(crate) const PRESETS: &[ProviderPreset] = &[
         note: Some(ALSO_WORKS_ON_STOCK),
         fields: OPENROUTER_PROVIDER_FIELDS,
         models: &[ModelPreset {
-            id: "openrouter/ox-alpha",
-            fields: OX_ALPHA_FIELDS,
+            id: "openrouter/glm-5.3-flash",
+            fields: GLM_53_FLASH_FIELDS,
         }],
     },
     ProviderPreset {

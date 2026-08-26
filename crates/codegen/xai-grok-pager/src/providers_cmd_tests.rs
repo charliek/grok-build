@@ -181,10 +181,21 @@ fn install_mirrors_the_live_glm_openrouter_and_fireworks_shapes() {
         vec!["ZHIPU_API_KEY", "ZAI_API_KEY"]
     );
 
-    let ox = &parsed["model"]["openrouter/ox-alpha"];
-    assert_eq!(ox["model"].as_str(), Some("stealth/ox-alpha"));
-    assert_eq!(ox["context_window"].as_integer(), Some(200_000));
-    assert_eq!(ox["stream_tool_calls"].as_bool(), Some(false));
+    let glm_flash = &parsed["model"]["openrouter/glm-5.3-flash"];
+    assert_eq!(glm_flash["model"].as_str(), Some("z-ai/glm-5.3-flash"));
+    assert_eq!(glm_flash["context_window"].as_integer(), Some(1_048_576));
+    assert_eq!(glm_flash["stream_tool_calls"].as_bool(), Some(false));
+    assert_eq!(glm_flash["supports_reasoning_effort"].as_bool(), Some(true));
+    assert_eq!(glm_flash["reasoning_effort"].as_str(), Some("high"));
+    assert_eq!(
+        glm_flash["reasoning_efforts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(toml::Value::as_str)
+            .collect::<Vec<_>>(),
+        vec!["low", "medium", "high", "xhigh", "max"]
+    );
 
     // Five Fireworks models, every one with an explicit context window, a
     // fully-qualified wire id, and streamed tool calls off.
