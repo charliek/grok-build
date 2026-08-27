@@ -41,7 +41,7 @@ backend — verified against this repo's release layout:
 
 ```bash
 mise use -g "github:charliek/grok-build"            # latest release, activated globally
-# or pin: mise install "github:charliek/grok-build@gx-v1.0.10-gx.2"
+# or pin: mise install "github:charliek/grok-build@gx-v1.0.10-gx.4"
 gx --version
 ```
 
@@ -218,6 +218,9 @@ session state. gx neutralizes the two places that would otherwise collide:
   from this fork's own GitHub releases (above), never from xAI's update service.
 - **Stock grok is unaffected.** It never reads `providers.toml`, never sees the gx
   leader socket, and its own updater behaves exactly as upstream ships it.
+- **Splash mark.** A gx binary paints the StrideLabs owl on the welcome screen (and
+  the compact minimal-mode card). Stock `grok` still shows the Grok `g`. Copy next to
+  the mark ("Grok Build", version badge) is unchanged.
 
 One rough edge, cosmetic only: the two binaries share a **models cache** under
 `$GROK_HOME`, and each build's provider/model set differs, so alternating between `gx`
