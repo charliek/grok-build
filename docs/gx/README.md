@@ -34,6 +34,20 @@ This is a real, if narrow, operational trap; see Known limitations below.
 
 ## Install
 
+### Install via mise (recommended)
+
+The releases are directly installable with [mise](https://mise.jdx.dev)'s GitHub
+backend — verified against this repo's release layout:
+
+```bash
+mise use -g "github:charliek/grok-build"            # latest release, activated globally
+# or pin: mise install "github:charliek/grok-build@gx-v1.0.10-gx.2"
+gx --version
+```
+
+mise auto-selects the platform asset (macos-arm64 / linux-x86_64) and exposes the
+`gx` binary on PATH via its shims.
+
 ### Build from source
 
 ```
