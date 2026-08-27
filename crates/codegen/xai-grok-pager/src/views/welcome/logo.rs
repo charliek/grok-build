@@ -11,6 +11,28 @@ use crate::theme::Theme;
 
 const LOGO: &str = include_str!("../../../assets/logo/logo07.txt");
 const LOGO_SMALL: &str = include_str!("../../../assets/logo/logo05.txt");
+// gx: StrideLabs owl splash on gx builds. Same 5/7-row budget as upstream so
+// welcome layout math stays valid; width is native aspect (17 / 12 cols).
+const LOGO_GX: &str = include_str!("../../../assets/gx/owl07.txt");
+const LOGO_GX_SMALL: &str = include_str!("../../../assets/gx/owl05.txt");
+
+/// gx: the art the welcome screen actually paints. Owl on a stamped gx build,
+/// Grok `g` otherwise (unstamped `cargo test` included).
+fn logo_full() -> &'static str {
+    if xai_grok_version::is_gx_build() {
+        LOGO_GX
+    } else {
+        LOGO
+    }
+}
+
+fn logo_small() -> &'static str {
+    if xai_grok_version::is_gx_build() {
+        LOGO_GX_SMALL
+    } else {
+        LOGO_SMALL
+    }
+}
 
 /// Height at or above which the small logo is shown (below it, no logo).
 const SMALL_LOGO_MIN_HEIGHT: u16 = 22;
@@ -43,9 +65,10 @@ impl LogoTier {
     }
 
     fn art(self) -> Option<&'static str> {
+        // gx: owl on a stamped gx build, Grok `g` otherwise.
         match self {
-            Self::Full => Some(LOGO),
-            Self::Compact => Some(LOGO_SMALL),
+            Self::Full => Some(logo_full()),
+            Self::Compact => Some(logo_small()),
             Self::Hidden => None,
         }
     }
@@ -215,7 +238,11 @@ pub fn full_logo_line_count() -> u16 {
 }
 
 fn full_logo_line_count_for(hidden: bool) -> u16 {
-    if hidden { 0 } else { count_lines(LOGO) }
+    if hidden {
+        0
+    } else {
+        count_lines(logo_full())
+    }
 }
 
 pub fn full_logo_visual_width() -> u16 {
@@ -223,12 +250,16 @@ pub fn full_logo_visual_width() -> u16 {
 }
 
 fn full_logo_visual_width_for(hidden: bool) -> u16 {
-    if hidden { 0 } else { visual_width(LOGO) }
+    if hidden {
+        0
+    } else {
+        visual_width(logo_full())
+    }
 }
 
 pub fn render_full_logo(area: Rect, buf: &mut Buffer, theme: &Theme) {
     if !logo_hidden() {
-        render_into(area, buf, theme, LOGO);
+        render_into(area, buf, theme, logo_full());
     }
 }
 
@@ -237,7 +268,7 @@ pub fn compact_logo_line_count() -> u16 {
     if logo_hidden() {
         0
     } else {
-        count_lines(LOGO_SMALL)
+        count_lines(logo_small())
     }
 }
 
@@ -245,7 +276,7 @@ pub fn compact_logo_line_count() -> u16 {
 /// No-op when the logo is hidden.
 pub fn render_compact_logo(area: Rect, buf: &mut Buffer, theme: &Theme) {
     if !logo_hidden() {
-        render_into(area, buf, theme, LOGO_SMALL);
+        render_into(area, buf, theme, logo_small());
     }
 }
 
@@ -258,13 +289,16 @@ mod tests {
         assert!(pick_logo_for(SMALL_LOGO_MIN_HEIGHT - 1, false).is_none());
         assert_eq!(
             pick_logo_for(SMALL_LOGO_MIN_HEIGHT, false),
-            Some(LOGO_SMALL)
+            Some(logo_small())
         );
         assert_eq!(
             pick_logo_for(FULL_LOGO_MIN_HEIGHT - 1, false),
-            Some(LOGO_SMALL)
+            Some(logo_small())
         );
-        assert_eq!(pick_logo_for(FULL_LOGO_MIN_HEIGHT, false), Some(LOGO));
+        assert_eq!(
+            pick_logo_for(FULL_LOGO_MIN_HEIGHT, false),
+            Some(logo_full())
+        );
     }
 
     // The braille art has no legacy-safe stand-in, so every height tier must collapse to no logo when the legacy-console flag is set
@@ -278,10 +312,10 @@ mod tests {
     #[test]
     fn hero_box_always_uses_full_logo() {
         // The box renders the full logo regardless of height (it's laid out beside the menu), and it's the large variant, never the small one
-        assert_eq!(full_logo_line_count_for(false), count_lines(LOGO));
-        assert_eq!(full_logo_visual_width_for(false), visual_width(LOGO));
-        assert!(full_logo_line_count_for(false) > count_lines(LOGO_SMALL));
-        assert!(full_logo_visual_width_for(false) > visual_width(LOGO_SMALL));
+        assert_eq!(full_logo_line_count_for(false), count_lines(logo_full()));
+        assert_eq!(full_logo_visual_width_for(false), visual_width(logo_full()));
+        assert!(full_logo_line_count_for(false) > count_lines(logo_small()));
+        assert!(full_logo_visual_width_for(false) > visual_width(logo_small()));
     }
 
     #[test]
@@ -294,11 +328,38 @@ mod tests {
     fn compact_logo_line_count_matches_small_logo_when_visible() {
         // The minimal welcome card budgets exactly the small logo's rows
         if !logo_hidden() {
-            assert_eq!(compact_logo_line_count(), count_lines(LOGO_SMALL));
-            assert!(compact_logo_line_count() < count_lines(LOGO));
+            assert_eq!(compact_logo_line_count(), count_lines(logo_small()));
+            assert!(compact_logo_line_count() < count_lines(logo_full()));
             assert!(compact_logo_line_count() > 0);
         } else {
             assert_eq!(compact_logo_line_count(), 0);
+        }
+    }
+
+    // gx: owl art keeps the upstream 5/7-row budget (layout tests in welcome/mod.rs
+    // key off height) and is a few cols wider (native aspect).
+    #[test]
+    fn gx_owl_art_matches_row_budget() {
+        assert_eq!(count_lines(LOGO_GX), 7);
+        assert_eq!(count_lines(LOGO_GX_SMALL), 5);
+        assert_eq!(visual_width(LOGO_GX), 17);
+        assert_eq!(visual_width(LOGO_GX_SMALL), 12);
+        assert_eq!(count_lines(LOGO_GX), count_lines(LOGO));
+        assert_eq!(count_lines(LOGO_GX_SMALL), count_lines(LOGO_SMALL));
+        assert!(visual_width(LOGO_GX) > visual_width(LOGO_GX_SMALL));
+        assert!(visual_width(LOGO_GX) > visual_width(LOGO));
+    }
+
+    // gx: flavor gate — stamped gx builds paint the owl; unstamped cargo test
+    // (and stock grok) keep the Grok `g`.
+    #[test]
+    fn logo_helpers_follow_gx_build_flavor() {
+        if xai_grok_version::is_gx_build() {
+            assert_eq!(logo_full(), LOGO_GX);
+            assert_eq!(logo_small(), LOGO_GX_SMALL);
+        } else {
+            assert_eq!(logo_full(), LOGO);
+            assert_eq!(logo_small(), LOGO_SMALL);
         }
     }
 
