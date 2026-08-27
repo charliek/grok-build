@@ -466,6 +466,17 @@ const ZAI_PROVIDER_FIELDS: &[PresetField] = &[
     PresetField::new("env_key", &[l(&["ZHIPU_API_KEY", "ZAI_API_KEY"])]),
 ];
 
+// Both zai-coding-plan models share these fields; factored out so the
+// per-model arrays below only spell out what actually varies.
+const ZAI_MODEL_PROVIDER: PresetField = PresetField::new("model_provider", &[s("zai-coding-plan")]);
+const ZAI_CONTEXT_WINDOW: PresetField = PresetField::new("context_window", &[i(1_000_000)]);
+const ZAI_MAX_COMPLETION_TOKENS: PresetField =
+    PresetField::new("max_completion_tokens", &[i(131_072)]);
+const ZAI_SUPPORTS_REASONING_EFFORT: PresetField =
+    PresetField::new("supports_reasoning_effort", &[b(true)]);
+const ZAI_REASONING_EFFORTS: PresetField =
+    PresetField::new("reasoning_efforts", &[l(&["low", "high", "max"])]);
+
 const GLM_53_FIELDS: &[PresetField] = &[
     PresetField::new("model", &[s("glm-5.3")]),
     PresetField::new("name", &[s("GLM 5.3 (Z.AI)")]),
@@ -473,13 +484,42 @@ const GLM_53_FIELDS: &[PresetField] = &[
         "description",
         &[s("Z.AI flagship coding model. Thinking is always on.")],
     ),
-    PresetField::new("model_provider", &[s("zai-coding-plan")]),
-    PresetField::new("context_window", &[i(1_000_000)]),
-    PresetField::new("max_completion_tokens", &[i(131_072)]),
-    PresetField::new("supports_reasoning_effort", &[b(true)]),
+    ZAI_MODEL_PROVIDER,
+    ZAI_CONTEXT_WINDOW,
+    ZAI_MAX_COMPLETION_TOKENS,
+    ZAI_SUPPORTS_REASONING_EFFORT,
     PresetField::new("reasoning_effort", &[s("max")]),
-    PresetField::new("reasoning_efforts", &[l(&["low", "high", "max"])]),
+    ZAI_REASONING_EFFORTS,
     PresetField::new("system_prompt_label", &[s("GLM 5.3")]),
+];
+
+// `glm-5.3-flash` is the fast sibling of `glm-5.3` on Z.AI's coding-plan API,
+// verified reachable there on 2026-08-27. `context_window` and
+// `max_completion_tokens` mirror `glm-5.3` (Z.AI documents the same limits for
+// both), and `reasoning_efforts` mirrors it exactly rather than probing a
+// wider menu: GLM's API silently ignores unknown effort values instead of
+// rejecting them, so matching the proven sibling's shape beats guessing.
+//
+// Z.AI's coding-plan API also lists a `glm-5.3-highspeed` model, but it is
+// tier-gated: the API returns "current subscription plan does not yet
+// include access" (verified live, 2026-08-27). It is deliberately left out of
+// this catalog; see `docs/gx/README.md` for how to add it by hand if the plan
+// is upgraded.
+const ZAI_GLM_53_FLASH_FIELDS: &[PresetField] = &[
+    PresetField::new("model", &[s("glm-5.3-flash")]),
+    PresetField::new("name", &[s("GLM 5.3 Flash (Z.AI)")]),
+    PresetField::new(
+        "description",
+        &[s(
+            "Fast Z.AI coding-plan model, verified on the coding plan (2026-08-27).",
+        )],
+    ),
+    ZAI_MODEL_PROVIDER,
+    ZAI_CONTEXT_WINDOW,
+    ZAI_MAX_COMPLETION_TOKENS,
+    ZAI_SUPPORTS_REASONING_EFFORT,
+    PresetField::new("reasoning_effort", &[s("high")]),
+    ZAI_REASONING_EFFORTS,
 ];
 
 // -- OpenRouter --------------------------------------------------------------
@@ -492,37 +532,120 @@ const OPENROUTER_PROVIDER_FIELDS: &[PresetField] = &[
 
 // `openrouter/ox-alpha` (`stealth/ox-alpha`) was OpenRouter's stealth test
 // alias; it started 404ing and OpenRouter revealed it as Z.AI's GLM-5.3
-// Flash. Retired 2026-08-26 in favor of the model below, addressed directly
-// by its real wire id rather than the alias. This is a straight removal from
-// `PRESETS`, not a replacement-in-place: `install` only adds/upgrades entries
-// it finds in `PRESETS`, so a user's existing `[model."openrouter/ox-alpha"]`
+// Flash. Retired 2026-08-26 in favor of `openrouter/glm-5.3-flash`, addressed
+// directly by its real wire id rather than the alias. That model has now
+// itself been retired (2026-08-27): the user's Z.AI coding-plan subscription
+// covers `glm-5.3-flash` directly (see `ZAI_GLM_53_FLASH_FIELDS` above), so a
+// metered OpenRouter duplicate of the same model is redundant. Both of these
+// are a straight removal from `PRESETS`, not a replacement-in-place:
+// `install` only adds/upgrades entries it finds in `PRESETS`, so a user's
+// existing `[model."openrouter/ox-alpha"]` or `[model."openrouter/glm-5.3-flash"]`
 // is left exactly as it was, forever — `install` never deletes an entry that
 // falls out of the shipped catalog.
-//
-// `reasoning_effort` / `supports_reasoning_effort` / `reasoning_efforts`: a
-// live probe against OpenRouter's `chat_completions` API (2026-08-26)
-// confirmed `z-ai/glm-5.3-flash` accepts `reasoning_effort`.
-const GLM_53_FLASH_FIELDS: &[PresetField] = &[
-    PresetField::new("model", &[s("z-ai/glm-5.3-flash")]),
-    PresetField::new("name", &[s("GLM 5.3 Flash (OpenRouter)")]),
+
+// Every OpenRouter model preset shares these fields; factored out so the
+// per-model arrays below only spell out what actually varies. Mirrors the
+// Fireworks factoring pattern.
+const OPENROUTER_MODEL_PROVIDER: PresetField =
+    PresetField::new("model_provider", &[s("openrouter")]);
+// Kept `false`: a lenient host, but consistent with every other third-party
+// preset here.
+const OPENROUTER_NO_STREAM_TOOL_CALLS: PresetField =
+    PresetField::new("stream_tool_calls", &[b(false)]);
+
+// The three OpenRouter GPT-5.6 twins mirror the `openai-codex` preset's
+// effort shape exactly: OpenRouter passes `reasoning_effort` straight through
+// to OpenAI, so the same accepted menu applies (none/low/medium/high/xhigh,
+// `minimal` rejected — see `OPENAI_CODEX_EFFORTS` above). `context_window`
+// mirrors codex-rs's own value for the gpt-5.6 family.
+const OPENROUTER_GPT_CONTEXT_WINDOW: PresetField =
+    PresetField::new("context_window", &[i(272_000)]);
+const OPENROUTER_GPT_SUPPORTS_EFFORT: PresetField =
+    PresetField::new("supports_reasoning_effort", &[b(true)]);
+const OPENROUTER_GPT_EFFORT: PresetField = PresetField::new("reasoning_effort", &[s("medium")]);
+const OPENROUTER_GPT_EFFORTS: PresetField = PresetField::new(
+    "reasoning_efforts",
+    &[l(&["low", "medium", "high", "xhigh"])],
+);
+
+// Verified on OpenRouter with tools support; pricing verified 2026-08-27.
+// OpenRouter reports no `reasoning_effort` support for this model, so it
+// carries none of the effort fields (unlike every other model in this file).
+const OPENROUTER_MINIMAX_M3_FIELDS: &[PresetField] = &[
+    PresetField::new("model", &[s("minimax/minimax-m3")]),
+    PresetField::new("name", &[s("MiniMax M3 (OpenRouter)")]),
     PresetField::new(
         "description",
         &[s(
-            "Fast Z.AI coding model via OpenRouter, replacing the retired stealth \
-             Ox Alpha test alias (2026-08-26).",
+            "Cheap 1M-context generalist via OpenRouter ($0.30/$1.20 per M tokens, \
+             verified 2026-08-27).",
         )],
     ),
-    PresetField::new("model_provider", &[s("openrouter")]),
+    OPENROUTER_MODEL_PROVIDER,
     PresetField::new("context_window", &[i(1_048_576)]),
-    // Kept `false`: a lenient host, but consistent with every other
-    // third-party preset here.
-    PresetField::new("stream_tool_calls", &[b(false)]),
-    PresetField::new("supports_reasoning_effort", &[b(true)]),
-    PresetField::new("reasoning_effort", &[s("high")]),
+    OPENROUTER_NO_STREAM_TOOL_CALLS,
+];
+
+// The OpenRouter GPT-5.6 twins are a ChatGPT-plan overflow route: when the
+// `openai-codex` plan-metered preset above is rate-limited or unavailable,
+// these route the same models through OpenRouter's metered billing instead.
+// Verified on OpenRouter with tools support; pricing verified 2026-08-27.
+// Note the batch-vs-interactive pricing nuance: OpenRouter's `:batch` variants
+// of these models are half-price again but async-only, so they are not
+// substitutes for this preset's interactive, synchronous use.
+const OPENROUTER_GPT_SOL_FIELDS: &[PresetField] = &[
+    PresetField::new("model", &[s("openai/gpt-5.6-sol")]),
+    PresetField::new("name", &[s("GPT-5.6 Sol (OpenRouter, metered)")]),
     PresetField::new(
-        "reasoning_efforts",
-        &[l(&["low", "medium", "high", "xhigh", "max"])],
+        "description",
+        &[s(
+            "ChatGPT-plan overflow route for GPT-5.6 Sol via OpenRouter, metered per \
+             token; currently half of OpenAI-direct pricing ($2/$10 vs $4/$20 per M, \
+             verified 2026-08-27).",
+        )],
     ),
+    OPENROUTER_MODEL_PROVIDER,
+    OPENROUTER_GPT_CONTEXT_WINDOW,
+    OPENROUTER_NO_STREAM_TOOL_CALLS,
+    OPENROUTER_GPT_SUPPORTS_EFFORT,
+    OPENROUTER_GPT_EFFORT,
+    OPENROUTER_GPT_EFFORTS,
+];
+
+const OPENROUTER_GPT_TERRA_FIELDS: &[PresetField] = &[
+    PresetField::new("model", &[s("openai/gpt-5.6-terra")]),
+    PresetField::new("name", &[s("GPT-5.6 Terra (OpenRouter, metered)")]),
+    PresetField::new(
+        "description",
+        &[s(
+            "ChatGPT-plan overflow route for GPT-5.6 Terra via OpenRouter, metered per \
+             token; matches OpenAI-direct pricing ($2/$12 per M, verified 2026-08-27).",
+        )],
+    ),
+    OPENROUTER_MODEL_PROVIDER,
+    OPENROUTER_GPT_CONTEXT_WINDOW,
+    OPENROUTER_NO_STREAM_TOOL_CALLS,
+    OPENROUTER_GPT_SUPPORTS_EFFORT,
+    OPENROUTER_GPT_EFFORT,
+    OPENROUTER_GPT_EFFORTS,
+];
+
+const OPENROUTER_GPT_LUNA_FIELDS: &[PresetField] = &[
+    PresetField::new("model", &[s("openai/gpt-5.6-luna")]),
+    PresetField::new("name", &[s("GPT-5.6 Luna (OpenRouter, metered)")]),
+    PresetField::new(
+        "description",
+        &[s(
+            "ChatGPT-plan overflow route for GPT-5.6 Luna via OpenRouter, metered per \
+             token; the cheapest 5.6 model ($0.20/$1.20 per M, verified 2026-08-27).",
+        )],
+    ),
+    OPENROUTER_MODEL_PROVIDER,
+    OPENROUTER_GPT_CONTEXT_WINDOW,
+    OPENROUTER_NO_STREAM_TOOL_CALLS,
+    OPENROUTER_GPT_SUPPORTS_EFFORT,
+    OPENROUTER_GPT_EFFORT,
+    OPENROUTER_GPT_EFFORTS,
 ];
 
 // -- Fireworks ---------------------------------------------------------------
@@ -766,10 +889,16 @@ pub(crate) const PRESETS: &[ProviderPreset] = &[
         rejects_static_key: false,
         note: Some(ALSO_WORKS_ON_STOCK),
         fields: ZAI_PROVIDER_FIELDS,
-        models: &[ModelPreset {
-            id: "glm-5.3",
-            fields: GLM_53_FIELDS,
-        }],
+        models: &[
+            ModelPreset {
+                id: "glm-5.3",
+                fields: GLM_53_FIELDS,
+            },
+            ModelPreset {
+                id: "glm-5.3-flash",
+                fields: ZAI_GLM_53_FLASH_FIELDS,
+            },
+        ],
     },
     ProviderPreset {
         id: "openrouter",
@@ -778,10 +907,24 @@ pub(crate) const PRESETS: &[ProviderPreset] = &[
         rejects_static_key: false,
         note: Some(ALSO_WORKS_ON_STOCK),
         fields: OPENROUTER_PROVIDER_FIELDS,
-        models: &[ModelPreset {
-            id: "openrouter/glm-5.3-flash",
-            fields: GLM_53_FLASH_FIELDS,
-        }],
+        models: &[
+            ModelPreset {
+                id: "openrouter/minimax-m3",
+                fields: OPENROUTER_MINIMAX_M3_FIELDS,
+            },
+            ModelPreset {
+                id: "openrouter/gpt-5.6-sol",
+                fields: OPENROUTER_GPT_SOL_FIELDS,
+            },
+            ModelPreset {
+                id: "openrouter/gpt-5.6-terra",
+                fields: OPENROUTER_GPT_TERRA_FIELDS,
+            },
+            ModelPreset {
+                id: "openrouter/gpt-5.6-luna",
+                fields: OPENROUTER_GPT_LUNA_FIELDS,
+            },
+        ],
     },
     ProviderPreset {
         id: "fireworks",
