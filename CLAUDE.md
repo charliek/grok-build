@@ -47,6 +47,10 @@ with a `// gx:` comment where it has to live inside a file upstream also owns (`
   `// gx:` markers in `crates/codegen/xai-grok-shell/src/sampling/conversation.rs` and
   `crates/codegen/xai-grok-shell/src/session/helpers/session_compact.rs` where the
   codex/OpenAI-compat response shape needs sanitizing.
+- **Welcome splash:** `crates/codegen/xai-grok-pager/assets/gx/` (owl braille + SVG
+  snapshot) and a `// gx:` gate in
+  `crates/codegen/xai-grok-pager/src/views/welcome/logo.rs` (`is_gx_build()` picks the
+  owl; same 5/7-row budget as upstream). Never overwrite `assets/logo/`.
 - **Coexistence:** `crates/codegen/xai-grok-shell/src/leader/lock.rs` (leader socket
   naming), `crates/codegen/xai-grok-update/src/auto_update.rs` (updater neutered),
   `crates/codegen/xai-grok-version/src/lib.rs` (`is_gx_build`, the single build-flavor
