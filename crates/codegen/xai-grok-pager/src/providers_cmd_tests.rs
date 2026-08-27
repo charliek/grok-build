@@ -139,6 +139,11 @@ fn install_writes_every_installable_preset_and_no_api_keys() {
             .added_entries
             .contains(&"model.\"glm-5.3\"".to_owned())
     );
+    assert!(
+        report
+            .added_entries
+            .contains(&"model.\"glm-5.3-flash\"".to_owned())
+    );
     assert!(report.kept_fields.is_empty());
     assert!(report.upgraded_fields.is_empty());
 }
@@ -166,6 +171,35 @@ fn install_mirrors_the_live_glm_openrouter_and_fireworks_shapes() {
         vec!["low", "high", "max"]
     );
 
+    let glm_flash_zai = &parsed["model"]["glm-5.3-flash"];
+    assert_eq!(glm_flash_zai["model"].as_str(), Some("glm-5.3-flash"));
+    assert_eq!(
+        glm_flash_zai["model_provider"].as_str(),
+        Some("zai-coding-plan")
+    );
+    assert_eq!(
+        glm_flash_zai["context_window"].as_integer(),
+        Some(1_000_000)
+    );
+    assert_eq!(
+        glm_flash_zai["max_completion_tokens"].as_integer(),
+        Some(131_072)
+    );
+    assert_eq!(
+        glm_flash_zai["supports_reasoning_effort"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(glm_flash_zai["reasoning_effort"].as_str(), Some("high"));
+    assert_eq!(
+        glm_flash_zai["reasoning_efforts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(toml::Value::as_str)
+            .collect::<Vec<_>>(),
+        vec!["low", "high", "max"]
+    );
+
     let zai = &parsed["model_providers"]["zai-coding-plan"];
     assert_eq!(
         zai["base_url"].as_str(),
@@ -181,21 +215,49 @@ fn install_mirrors_the_live_glm_openrouter_and_fireworks_shapes() {
         vec!["ZHIPU_API_KEY", "ZAI_API_KEY"]
     );
 
-    let glm_flash = &parsed["model"]["openrouter/glm-5.3-flash"];
-    assert_eq!(glm_flash["model"].as_str(), Some("z-ai/glm-5.3-flash"));
-    assert_eq!(glm_flash["context_window"].as_integer(), Some(1_048_576));
-    assert_eq!(glm_flash["stream_tool_calls"].as_bool(), Some(false));
-    assert_eq!(glm_flash["supports_reasoning_effort"].as_bool(), Some(true));
-    assert_eq!(glm_flash["reasoning_effort"].as_str(), Some("high"));
-    assert_eq!(
-        glm_flash["reasoning_efforts"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(toml::Value::as_str)
-            .collect::<Vec<_>>(),
-        vec!["low", "medium", "high", "xhigh", "max"]
-    );
+    // `openrouter/glm-5.3-flash` was retired (2026-08-27): the Z.AI
+    // coding-plan `glm-5.3-flash` above covers the same model directly, so a
+    // metered OpenRouter duplicate would be redundant. `install` never
+    // deletes an entry that falls out of the shipped catalog, so an existing
+    // install keeps whatever it already wrote for that id -- there is
+    // nothing left to assert about it here.
+    assert!(parsed["model"].get("openrouter/glm-5.3-flash").is_none());
+
+    let minimax = &parsed["model"]["openrouter/minimax-m3"];
+    assert_eq!(minimax["model"].as_str(), Some("minimax/minimax-m3"));
+    assert_eq!(minimax["context_window"].as_integer(), Some(1_048_576));
+    assert_eq!(minimax["stream_tool_calls"].as_bool(), Some(false));
+    // OpenRouter reports no reasoning_effort support for this model.
+    assert!(minimax.get("supports_reasoning_effort").is_none());
+    assert!(minimax.get("reasoning_effort").is_none());
+    assert!(minimax.get("reasoning_efforts").is_none());
+
+    for (id, wire) in [
+        ("openrouter/gpt-5.6-sol", "openai/gpt-5.6-sol"),
+        ("openrouter/gpt-5.6-terra", "openai/gpt-5.6-terra"),
+        ("openrouter/gpt-5.6-luna", "openai/gpt-5.6-luna"),
+    ] {
+        let entry = &parsed["model"][id];
+        assert_eq!(entry["model"].as_str(), Some(wire), "{id}");
+        assert_eq!(entry["context_window"].as_integer(), Some(272_000), "{id}");
+        assert_eq!(entry["stream_tool_calls"].as_bool(), Some(false), "{id}");
+        assert_eq!(
+            entry["supports_reasoning_effort"].as_bool(),
+            Some(true),
+            "{id}"
+        );
+        assert_eq!(entry["reasoning_effort"].as_str(), Some("medium"), "{id}");
+        assert_eq!(
+            entry["reasoning_efforts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(toml::Value::as_str)
+                .collect::<Vec<_>>(),
+            vec!["low", "medium", "high", "xhigh"],
+            "{id}"
+        );
+    }
 
     // Five Fireworks models, every one with an explicit context window, a
     // fully-qualified wire id, and streamed tool calls off.
@@ -1089,7 +1151,10 @@ fn status_covers_configured_unconfigured_and_env_key_cases() {
         .expect("zai present");
     assert!(zai.in_providers && !zai.in_config);
     assert_eq!(zai.key, KeySource::ProvidersFile("…efgh".to_owned()));
-    assert_eq!(zai.models, vec!["glm-5.3".to_owned()]);
+    assert_eq!(
+        zai.models,
+        vec!["glm-5.3".to_owned(), "glm-5.3-flash".to_owned()]
+    );
 
     let openrouter = report
         .providers
@@ -1155,7 +1220,10 @@ fn status_covers_configured_unconfigured_and_env_key_cases() {
         "{rendered}"
     );
     assert!(rendered.contains("models       5  ("), "{rendered}");
-    assert!(rendered.contains("models       1  (glm-5.3)"), "{rendered}");
+    assert!(
+        rendered.contains("models       2  (glm-5.3, glm-5.3-flash)"),
+        "{rendered}"
+    );
 }
 
 #[test]
