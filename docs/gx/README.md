@@ -170,17 +170,34 @@ entry point for both the providers layer and the codex credential.
 | Fireworks | `fireworks/kimi-k2p7-code` | low / medium / high / xhigh / max | high |
 | Fireworks | `fireworks/deepseek-v4-flash` | low / medium / high / xhigh / max | high |
 | Z.AI | `glm-5.3` | low / high / max | max |
-| OpenRouter | `openrouter/glm-5.3-flash` | low / medium / high / xhigh / max | high |
+| Z.AI | `glm-5.3-flash` | low / high / max | high |
+| OpenRouter | `openrouter/minimax-m3` | none | n/a |
+| OpenRouter | `openrouter/gpt-5.6-sol` | low / medium / high / xhigh | medium |
+| OpenRouter | `openrouter/gpt-5.6-terra` | low / medium / high / xhigh | medium |
+| OpenRouter | `openrouter/gpt-5.6-luna` | low / medium / high / xhigh | medium |
 | OpenAI (ChatGPT plan) | `gpt-5.6-sol` / `gpt-5.6-terra` / `gpt-5.6-luna` | low / medium / high / xhigh | medium |
 
-`openrouter/glm-5.3-flash` replaces the retired `openrouter/ox-alpha` preset (2026-08-26):
-OpenRouter's stealth `ox-alpha` alias started 404ing and was revealed as Z.AI's GLM-5.3
-Flash, so the preset now addresses it directly by its real wire id, `z-ai/glm-5.3-flash`.
-`gx providers install` never deletes an entry that falls out of the shipped catalog, so an
-existing `[model."openrouter/ox-alpha"]` from an earlier install is left in place; remove
-it by hand from `providers.toml` once you have switched to the new model.
+`glm-5.3-highspeed` also exists on Z.AI's coding-plan API but is tier-gated (the API
+returns "current subscription plan does not yet include access"); add it by hand to
+`providers.toml` if your plan is upgraded to include it.
 
-Fireworks and GLM entries carry `stream_tool_calls = false` (Fireworks) and an explicit
+`openrouter/glm-5.3-flash` was retired (2026-08-27): the Z.AI coding-plan `glm-5.3-flash`
+above now covers the same model directly, so a metered OpenRouter duplicate was redundant.
+`gx providers install` never deletes an entry that falls out of the shipped catalog, so an
+existing `[model."openrouter/glm-5.3-flash"]` (and, further back, `[model."openrouter/ox-alpha"]`)
+from an earlier install is left in place; remove it by hand from `providers.toml` if you no
+longer want it.
+
+In its place, OpenRouter now ships `openrouter/minimax-m3` (a cheap 1M-context generalist,
+$0.30/$1.20 per M tokens) and OpenRouter twins of the three ChatGPT-plan GPT-5.6 models —
+`openrouter/gpt-5.6-sol` / `-terra` / `-luna` — as a metered overflow route for when the
+`openai-codex` plan-metered preset is rate-limited or unavailable; sol is currently half of
+OpenAI-direct pricing ($2/$10 vs $4/$20 per M) while terra and luna match it. All four were
+verified on OpenRouter with tools support, pricing verified 2026-08-27. One pricing nuance:
+OpenRouter's `:batch` variants of these models are half-price again but async-only, so they
+are not substitutes for this preset's interactive, synchronous use.
+
+Fireworks, GLM, and OpenRouter entries carry `stream_tool_calls = false` and an explicit
 `context_window` gx sets itself, since grok's model catalog has no entry for a
 third-party id. Run `gx providers status` to see exactly what's configured and where
 each value came from (`providers.toml` vs `config.toml` vs environment).
