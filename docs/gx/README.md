@@ -48,6 +48,18 @@ gx --version
 mise auto-selects the platform asset (macos-arm64 / linux-x86_64) and exposes the
 `gx` binary on PATH via its shims.
 
+**Fresh releases take up to a day to appear via `latest`.** mise's default
+`minimum_release_age` is 24 hours (a supply-chain cooling-off window), so right after
+a gx cut, `mise upgrade github:charliek/grok-build` or `@latest` will report "up to
+date" on the previous tag. To take a new release immediately, pin the exact tag as
+above, or bypass the age filter once:
+
+```bash
+mise upgrade github:charliek/grok-build --minimum-release-age 0
+```
+
+After 24 hours a plain `mise upgrade github:charliek/grok-build` picks it up normally.
+
 ### Build from source
 
 ```
