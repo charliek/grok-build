@@ -156,7 +156,13 @@ cargo test -p xai-grok-config --locked
 cargo test -p xai-grok-pager --lib --locked -- \
   --skip doctor_cmd::tests::fake_standalone_facts_compose_through_shared_view \
   --skip diagnostics::fix::tests::shell_aliases_expand_to_exact_argv_and_bypass_is_explicit
-cargo test -p xai-grok-update --locked
+# Skip the two install.sh tests that require the monorepo desktop tree
+# (same skips as .github/workflows/ci.yml -- keep the lists in sync):
+# this extract has no frontend/apps/grok-desktop, and the tests panic
+# instead of skipping when desktop_install_sh_path() is None.
+cargo test -p xai-grok-update --locked -- \
+  --skip install_scripts_allow_custom_https_proxy_url \
+  --skip install_scripts_refuse_bad_proxy_url_for_deployment_key
 cargo test -p xai-grok-version --locked
 cargo test -p xai-grok-shell --lib --locked -- leader:: agent::model_providers::tests:: session_compact
 cargo test -p xai-grok-shell --locked --test test_sampling_client
