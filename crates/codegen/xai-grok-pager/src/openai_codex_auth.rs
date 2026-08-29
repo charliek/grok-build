@@ -193,7 +193,9 @@ pub(crate) fn codex_auth_json_path() -> Option<PathBuf> {
     if let Some(home) = std::env::var_os("CODEX_HOME").filter(|v| !v.is_empty()) {
         return Some(PathBuf::from(home).join("auth.json"));
     }
-    dirs::home_dir().map(|h| h.join(".codex").join("auth.json"))
+    // gx: home-anchored `~/.codex` must go through `xai_dirs::home_dir` (upstream
+    // renamed `xai-grok-home` and banned `dirs::home_dir` in clippy.toml).
+    xai_dirs::home_dir().map(|h| h.join(".codex").join("auth.json"))
 }
 
 /// `.gx-auth.lock` beside `auth.json`. A separate file on purpose: a lock byte
