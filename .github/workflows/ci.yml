@@ -75,7 +75,13 @@ jobs:
           --skip diagnostics::fix::tests::shell_aliases_expand_to_exact_argv_and_bypass_is_explicit
 
       - name: Test xai-grok-update
-        run: cargo test -p xai-grok-update --locked
+        # Two upstream install.sh tests require frontend/apps/grok-desktop
+        # (the monorepo desktop tree). This extract does not ship it, so
+        # desktop_install_sh_path() is None and they panic rather than skip.
+        run: >-
+          cargo test -p xai-grok-update --locked --
+          --skip install_scripts_allow_custom_https_proxy_url
+          --skip install_scripts_refuse_bad_proxy_url_for_deployment_key
 
       - name: Test xai-grok-version
         run: cargo test -p xai-grok-version --locked
