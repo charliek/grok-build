@@ -103,6 +103,8 @@ fn command_needs_pre_sandbox_policy_heal(command: Option<&Command>) -> bool {
             | Command::Login { .. }
             | Command::Mcp(_)
             | Command::Plugin(_)
+            // gx: `gx providers` never boots an agent; no pre-sandbox policy heal.
+            | Command::Providers(_)
             | Command::Memory(_)
             | Command::Sessions(_)
             | Command::Usage(_)
