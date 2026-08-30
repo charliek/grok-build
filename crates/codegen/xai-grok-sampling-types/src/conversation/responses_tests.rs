@@ -2120,3 +2120,132 @@ fn without_codex_compat_system_role_input_items_stay_system() {
         "no item should become \"developer\" off the codex path — {body}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// gx: codex_compat drops reasoning items whose `id` the Codex endpoint
+// rejects. Verified live (2026-08-30): `backend-api/codex/responses` 400s
+// on `input[5].id: ''` when a GLM/Fireworks reasoning sibling (empty id by
+// construction — see `synthesized_reasoning_item`) is replayed after a
+// mid-session model switch. Omitting the id field *or* dropping the item
+// both returned 200; the typed `ReasoningItem.id: String` cannot omit, so
+// gx drops. Off the codex path the empty id must still serialize.
+// ---------------------------------------------------------------------------
+
+fn mixed_history_with_empty_id_reasoning() -> ConversationRequest {
+    ConversationRequest::from_items(vec![
+        ConversationItem::system("You are a helpful assistant."),
+        ConversationItem::user("workspace context"),
+        ConversationItem::user("skills reminder"),
+        ConversationItem::user("mcp reminder"),
+        ConversationItem::user("tell me a joke"),
+        ConversationItem::Reasoning(synthesized_reasoning_item("thinking")),
+        ConversationItem::assistant("a joke"),
+        ConversationItem::user("another"),
+    ])
+    .with_model("gpt-5.6-sol")
+}
+
+#[test]
+fn codex_compat_drops_empty_id_reasoning_items() {
+    let mut req = mixed_history_with_empty_id_reasoning();
+    req.codex_compat = true;
+    let body = body_of(&req);
+    let input = body["input"].as_array().expect("input items");
+
+    assert_eq!(
+        input.len(),
+        7,
+        "the empty-id reasoning sibling must be dropped — {body}"
+    );
+    for (i, item) in input.iter().enumerate() {
+        if let Some(id) = item.get("id").and_then(serde_json::Value::as_str) {
+            assert!(
+                super::responses::is_codex_item_id(id),
+                "input[{i}].id {id:?} would 400 on the Codex endpoint — {body}"
+            );
+        }
+        assert_ne!(
+            item.get("type").and_then(serde_json::Value::as_str),
+            Some("reasoning"),
+            "no reasoning item should remain when the only one had an empty id — {body}"
+        );
+    }
+    let roles: Vec<&str> = input
+        .iter()
+        .filter_map(|item| item.get("role").and_then(serde_json::Value::as_str))
+        .collect();
+    assert_eq!(
+        roles,
+        vec![
+            "developer",
+            "user",
+            "user",
+            "user",
+            "user",
+            "assistant",
+            "user"
+        ],
+        "dropping the reasoning sibling must preserve the remaining order — {body}"
+    );
+}
+
+#[test]
+fn codex_compat_keeps_reasoning_items_with_valid_ids() {
+    let mut req = ConversationRequest::from_items(vec![
+        ConversationItem::user("hi"),
+        reasoning_sibling("rs_abc-123", "thinking", Some("enc")),
+        ConversationItem::assistant("hello"),
+    ])
+    .with_model("gpt-5.6-sol");
+    req.codex_compat = true;
+
+    let body = body_of(&req);
+    let input = body["input"].as_array().expect("input items");
+    let reasoning = input
+        .iter()
+        .find(|item| item.get("type").and_then(serde_json::Value::as_str) == Some("reasoning"))
+        .expect("valid-id reasoning must be kept");
+    assert_eq!(
+        reasoning.get("id").and_then(serde_json::Value::as_str),
+        Some("rs_abc-123"),
+        "a Codex-native id must survive — {body}"
+    );
+}
+
+#[test]
+fn codex_compat_drops_reasoning_items_with_invalid_id_characters() {
+    let mut req = ConversationRequest::from_items(vec![
+        ConversationItem::user("hi"),
+        reasoning_sibling("rs:not valid", "thinking", None),
+        ConversationItem::assistant("hello"),
+    ])
+    .with_model("gpt-5.6-sol");
+    req.codex_compat = true;
+
+    let body = body_of(&req);
+    let input = body["input"].as_array().expect("input items");
+    assert!(
+        !input
+            .iter()
+            .any(|item| item.get("type").and_then(serde_json::Value::as_str)
+                == Some("reasoning")),
+        "ids with characters outside [A-Za-z0-9_-] must be dropped — {body}"
+    );
+}
+
+#[test]
+fn without_codex_compat_empty_id_reasoning_items_stay() {
+    let mut req = mixed_history_with_empty_id_reasoning();
+    req.codex_compat = false;
+    let body = body_of(&req);
+    let input = body["input"].as_array().expect("input items");
+    let reasoning = input
+        .iter()
+        .find(|item| item.get("type").and_then(serde_json::Value::as_str) == Some("reasoning"))
+        .expect("empty-id reasoning must still serialize off the codex path");
+    assert_eq!(
+        reasoning.get("id").and_then(serde_json::Value::as_str),
+        Some(""),
+        "xAI regression: empty ids must not be rewritten off the codex path — {body}"
+    );
+}
