@@ -191,6 +191,19 @@ pub(super) fn build_responses_input(req: &ConversationRequest) -> rs::InputParam
     // empirically accepted (200) and semantically equivalent (both roles
     // outrank "user" in the Responses API's instruction hierarchy). Left
     // alone off the codex path to avoid an xAI regression.
+    //
+    // The same endpoint 400s on `id: ""` (and any id with characters outside
+    // `[A-Za-z0-9_-]`): "Invalid 'input[N].id': ''. Expected an ID that
+    // contains letters, numbers, underscores, or dashes". Chat-completions
+    // providers (GLM, Fireworks, …) synthesize reasoning items with an empty
+    // id (`synthesized_reasoning_item`); switching to an openai-codex model
+    // mid-session then replays them and every turn 400s. `rs::ReasoningItem.id`
+    // is a required `String`, so the empty value cannot be omitted through the
+    // typed mapping — drop those items instead. A live POST that omitted the
+    // id field *or* dropped the item both returned 200; dropping is what the
+    // typed API can do. Foreign-provider summaries have no `encrypted_content`
+    // Codex could replay anyway. Valid `rs_*` ids from a prior Codex turn are
+    // kept. Left alone off the codex path to avoid an xAI regression.
     if req.codex_compat {
         for item in &mut items {
             if let rs::InputItem::EasyMessage(msg) = item
@@ -199,9 +212,21 @@ pub(super) fn build_responses_input(req: &ConversationRequest) -> rs::InputParam
                 msg.role = rs::Role::Developer;
             }
         }
+        items.retain(|item| match item {
+            rs::InputItem::Item(rs::Item::Reasoning(r)) => is_codex_item_id(&r.id),
+            _ => true,
+        });
     }
 
     rs::InputParam::Items(items)
+}
+
+/// gx: Codex input-item ids are non-empty `[A-Za-z0-9_-]`; empty fails live.
+pub(crate) fn is_codex_item_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
 /// Inject the `type: "reasoning_text"` discriminator the API requires.
