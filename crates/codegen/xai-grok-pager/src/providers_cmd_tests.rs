@@ -2375,6 +2375,10 @@ fn status_warns_when_the_installed_helper_path_no_longer_exists() {
         rendered.contains("helper path missing (binary moved?)"),
         "{rendered}"
     );
+    assert!(
+        rendered.contains("falls back to this binary at runtime"),
+        "{rendered}"
+    );
     assert!(rendered.contains("gx providers install"), "{rendered}");
 }
 

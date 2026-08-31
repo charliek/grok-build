@@ -81,7 +81,10 @@ pub use paths::{
     sessions_cwd_dir_in, set_dir_owner_only, system_config_dir, user_grok_home,
 };
 // gx: the providers layer's public surface (the `gx providers` CLI writes this file).
-pub use providers_layer::{PROVIDERS_FILENAME, PROVIDERS_LAYER_TABLES, providers_layer_path};
+pub use providers_layer::{
+    GX_TOKEN_HELPER_ARGS, PROVIDERS_FILENAME, PROVIDERS_LAYER_TABLES, gx_helper_replacement,
+    providers_layer_path, stale_gx_helper_fallback,
+};
 pub use validation::{
     RequirementsError, RequirementsLayer, RequirementsSource, load_merged_requirements,
     requirements_layers, validate_requirements,
