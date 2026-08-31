@@ -94,7 +94,8 @@ jobs:
           cargo test -p xai-grok-shell --lib --locked -- \
             leader:: \
             agent::model_providers::tests:: \
-            session_compact
+            session_compact \
+            auth::auth_provider::tests::resolve_auth_program
 
       - name: Test xai-grok-shell (test_sampling_client)
         run: cargo test -p xai-grok-shell --locked --test test_sampling_client
