@@ -297,6 +297,38 @@ fn resolve_program(command: &str, cwd: Option<&std::path::Path>) -> std::path::P
     std::path::PathBuf::from(command)
 }
 
+/// gx: mise/cargo reinstalls leave a dangling absolute helper path in
+/// `providers.toml`. Fall back to this binary (or PATH `gx`) so ChatGPT
+/// turns don't 401 after an upgrade; `gx providers install` persists the
+/// new path. The predicate runs on the raw trimmed command *before* any
+/// cwd join, so a relative `bin/gx` is never rewritten.
+fn resolve_auth_program(
+    command: &str,
+    args: Option<&[String]>,
+    cwd: Option<&std::path::Path>,
+) -> std::path::PathBuf {
+    let command = command.trim();
+    let command = match args.and_then(|a| {
+        xai_grok_config::stale_gx_helper_fallback(
+            command,
+            Some(a),
+            &xai_grok_config::gx_helper_replacement(),
+        )
+    }) {
+        Some(fallback) => {
+            tracing::warn!(
+                missing = %command,
+                fallback = %fallback,
+                "gx: openai-codex helper path is gone; falling back so ChatGPT auth still mints. \
+                 Re-run `gx providers install` to persist the new path"
+            );
+            fallback
+        }
+        None => command.to_owned(),
+    };
+    resolve_program(&command, cwd)
+}
+
 async fn mint_provider_token(
     provider: &AuthProviderRef,
     mark_expired: bool,
@@ -329,7 +361,9 @@ async fn mint_provider_token(
 
     let mut cmd = match config.args {
         Some(ref args) => {
-            let program = resolve_program(config.command.trim(), cwd.as_deref());
+            // gx: `resolve_auth_program` (not `resolve_program`) so a stale
+            // baked gx helper path still mints after a mise upgrade.
+            let program = resolve_auth_program(config.command.trim(), Some(args), cwd.as_deref());
             let mut cmd = tokio::process::Command::new(program);
             cmd.args(args);
             cmd

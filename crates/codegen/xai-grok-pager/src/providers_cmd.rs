@@ -285,7 +285,7 @@ impl PresetContext {
 /// The args gx's own auth helper is always invoked with. Also the signature
 /// `install` recognizes when deciding whether an existing `auth` entry is a
 /// gx-shipped one whose binary path may be refreshed.
-pub(crate) const TOKEN_HELPER_ARGS: &[&str] = &["providers", "token", "openai"];
+pub(crate) const TOKEN_HELPER_ARGS: &[&str] = xai_grok_config::GX_TOKEN_HELPER_ARGS;
 
 /// Budget grok gives the helper: enough for every case that ends in a token —
 /// one refresh round trip, its single `invalid_grant` retry, and a wait behind
@@ -2356,8 +2356,8 @@ fn render_codex_status(codex: &CodexAuthStatus, now_unix: i64) -> String {
     }
     if let Some(command) = &codex.helper_path_missing {
         out.push_str(&format!(
-            "  HELPER MISSING   {command}: helper path missing (binary moved?) — rerun \
-             `gx providers install`\n"
+            "  HELPER MISSING   {command}: helper path missing (binary moved?) — gx falls \
+             back to this binary at runtime; rerun `gx providers install` to persist\n"
         ));
     }
     if codex.has_api_key {

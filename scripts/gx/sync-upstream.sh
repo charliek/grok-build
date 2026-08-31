@@ -164,7 +164,7 @@ cargo test -p xai-grok-update --locked -- \
   --skip install_scripts_allow_custom_https_proxy_url \
   --skip install_scripts_refuse_bad_proxy_url_for_deployment_key
 cargo test -p xai-grok-version --locked
-cargo test -p xai-grok-shell --lib --locked -- leader:: agent::model_providers::tests:: session_compact
+cargo test -p xai-grok-shell --lib --locked -- leader:: agent::model_providers::tests:: session_compact auth::auth_provider::tests::resolve_auth_program
 cargo test -p xai-grok-shell --locked --test test_sampling_client
 cargo test -p xai-grok-shell --locked --bin chat-history-downgrade
 echo "  gate passed"
