@@ -187,6 +187,47 @@ pub(crate) fn filter_providers_layer(value: toml::Value, source: &Path) -> Optio
     Some(toml::Value::Table(kept))
 }
 
+/// gx: the args the openai-codex preset bakes into `auth.args`. Shared with
+/// `gx providers install` so the runtime fallback recognizes the same helper.
+pub const GX_TOKEN_HELPER_ARGS: &[&str] = &["providers", "token", "openai"];
+
+/// gx: command to spawn when a baked helper path is gone: this binary when it
+/// is named `gx`, otherwise the bare `gx` on PATH.
+pub fn gx_helper_replacement() -> String {
+    match std::env::current_exe() {
+        Ok(path) if path.is_file() && path.file_name().is_some_and(|n| n == "gx") => {
+            path.to_string_lossy().into_owned()
+        }
+        _ => "gx".to_owned(),
+    }
+}
+
+/// gx: if `command` is an absolute path to a missing `gx` binary invoked with
+/// the shipped helper args, return `replacement`. `None` means leave it.
+///
+/// Narrow on purpose: a wrapper whose filename is not `gx`, a relative path,
+/// or different args is the user's and must not be rewritten.
+pub fn stale_gx_helper_fallback(
+    command: &str,
+    args: Option<&[String]>,
+    replacement: &str,
+) -> Option<String> {
+    let path = Path::new(command);
+    if !path.is_absolute() || !path.file_name().is_some_and(|n| n == "gx") {
+        return None;
+    }
+    let args_match = args.is_some_and(|a| {
+        a.len() == GX_TOKEN_HELPER_ARGS.len()
+            && a.iter()
+                .map(String::as_str)
+                .eq(GX_TOKEN_HELPER_ARGS.iter().copied())
+    });
+    if !args_match || path.is_file() {
+        return None;
+    }
+    Some(replacement.to_owned())
+}
+
 #[cfg(test)]
 #[path = "providers_layer_tests.rs"]
 mod tests;

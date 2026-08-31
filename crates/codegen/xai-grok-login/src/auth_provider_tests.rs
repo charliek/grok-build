@@ -805,7 +805,53 @@ fn resolve_program_resolves_against_cwd() {
     );
 }
 
-/// The `args` form (the portable, no-shell shape a desktop or Windows helper should use) resolves a relative program against the provider's `cwd`.
+/// gx: a mise upgrade deletes the versioned directory baked into
+/// `auth.command`. Spawn must fall back rather than 401 ChatGPT turns.
+#[test]
+fn resolve_auth_program_falls_back_when_baked_gx_is_gone() {
+    let args: Vec<String> = xai_grok_config::GX_TOKEN_HELPER_ARGS
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+    let missing = "/no/such/gx-install/gx";
+    assert_eq!(
+        super::resolve_auth_program(missing, Some(&args), None),
+        std::path::PathBuf::from(xai_grok_config::gx_helper_replacement()),
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let present = dir.path().join("gx");
+    std::fs::write(&present, "#!/bin/sh\n").unwrap();
+    assert_eq!(
+        super::resolve_auth_program(&present.to_string_lossy(), Some(&args), None),
+        present,
+        "an existing helper must still be used"
+    );
+    assert_eq!(
+        super::resolve_auth_program(missing, None, None),
+        std::path::PathBuf::from(missing),
+        "shell form (no args) is not the shipped helper"
+    );
+}
+
+/// gx: cwd-joining a relative `bin/gx` must not look like a baked absolute
+/// helper. The predicate runs on the raw command first.
+#[test]
+fn resolve_auth_program_does_not_rewrite_relative_bin_gx() {
+    let args: Vec<String> = xai_grok_config::GX_TOKEN_HELPER_ARGS
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+    let cwd = std::path::Path::new("/opt/tools");
+    assert_eq!(
+        super::resolve_auth_program("bin/gx", Some(&args), Some(cwd)),
+        cwd.join("bin/gx"),
+        "a relative helper is the user's, even if cwd-join would be a missing /opt/tools/bin/gx"
+    );
+}
+
+/// The `args` form (the portable, no-shell shape a desktop/Windows helper
+/// should use) resolves a relative program against the provider's `cwd`.
 #[cfg(unix)]
 #[tokio::test]
 async fn provider_resolves_relative_program_against_cwd() {
