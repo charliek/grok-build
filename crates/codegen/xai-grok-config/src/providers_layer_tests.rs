@@ -614,3 +614,122 @@ fn symlink_to_oversized_providers_toml_is_skipped() {
 
     assert!(load_providers_layer_for(Some(home.path()), true).is_none());
 }
+
+// -- stale openai-codex helper path (mise upgrade) -------------------------
+
+fn helper_args() -> Vec<String> {
+    GX_TOKEN_HELPER_ARGS
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect()
+}
+
+#[test]
+fn stale_gx_helper_fallback_replaces_a_missing_absolute_gx() {
+    let missing = "/no/such/gx-install/gx";
+    assert!(
+        !std::path::Path::new(missing).exists(),
+        "fixture path must not exist on this host"
+    );
+    assert_eq!(
+        stale_gx_helper_fallback(missing, Some(&helper_args()), "/now/gx"),
+        Some("/now/gx".to_owned()),
+    );
+}
+
+#[test]
+fn stale_gx_helper_fallback_keeps_an_existing_gx() {
+    let dir = tempfile::tempdir().unwrap();
+    let present = dir.path().join("gx");
+    std::fs::write(&present, "#!/bin/sh\n").unwrap();
+    assert_eq!(
+        stale_gx_helper_fallback(
+            &present.to_string_lossy(),
+            Some(&helper_args()),
+            "/now/gx",
+        ),
+        None,
+        "a helper that still exists must keep minting through that path"
+    );
+}
+
+#[test]
+fn stale_gx_helper_fallback_ignores_wrappers_wrong_args_and_relative_paths() {
+    let missing_wrapper = "/no/such/gx-with-vault";
+    let missing_gx = "/no/such/gx-install/gx";
+    assert_eq!(
+        stale_gx_helper_fallback(missing_wrapper, Some(&helper_args()), "/now/gx"),
+        None,
+        "filename is not gx: a user wrapper"
+    );
+    assert_eq!(
+        stale_gx_helper_fallback(
+            missing_gx,
+            Some(&[
+                "providers".into(),
+                "token".into(),
+                "openai".into(),
+                "--json".into()
+            ]),
+            "/now/gx",
+        ),
+        None,
+        "extra arg: not the shipped helper"
+    );
+    assert_eq!(
+        stale_gx_helper_fallback(missing_gx, None, "/now/gx"),
+        None,
+        "shell form (no args) is not the shipped helper"
+    );
+    assert_eq!(
+        stale_gx_helper_fallback("gx", Some(&helper_args()), "/now/gx"),
+        None,
+        "bare gx is resolved against PATH at spawn time"
+    );
+    assert_eq!(
+        stale_gx_helper_fallback("./gx", Some(&helper_args()), "/now/gx"),
+        None,
+        "relative paths are never something gx itself baked"
+    );
+}
+
+#[test]
+fn stale_gx_helper_fallback_replaces_a_leftover_directory_named_gx() {
+    let dir = tempfile::tempdir().unwrap();
+    let leftover = dir.path().join("gx");
+    std::fs::create_dir(&leftover).unwrap();
+    assert_eq!(
+        stale_gx_helper_fallback(
+            &leftover.to_string_lossy(),
+            Some(&helper_args()),
+            "/now/gx",
+        ),
+        Some("/now/gx".to_owned()),
+        "a directory named gx is not a helper we can exec"
+    );
+}
+
+/// Load must surface the file as-is. Spawn-time fallback is what mints after
+/// a mise upgrade; rewriting here would make inspect/status disagree with disk.
+#[test]
+fn load_does_not_rewrite_a_missing_openai_codex_helper() {
+    let home = tempfile::tempdir().unwrap();
+    let missing = home.path().join("gone").join("gx");
+    let body = format!(
+        "[model_providers.openai-codex]\n\
+         auth = {{ command = \"{}\", args = [\"providers\", \"token\", \"openai\"], timeout_secs = 120 }}\n",
+        missing.display()
+    );
+    write(home.path(), PROVIDERS_FILENAME, &body);
+
+    let layer = load_providers_layer_for(Some(home.path()), true).expect("layer loads");
+    assert_eq!(
+        layer["model_providers"]["openai-codex"]["auth"]["command"].as_str(),
+        Some(missing.to_str().unwrap()),
+    );
+    assert_eq!(
+        std::fs::read_to_string(providers_layer_path(home.path())).unwrap(),
+        body,
+        "the layer must never write providers.toml on load"
+    );
+}
