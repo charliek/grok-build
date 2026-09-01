@@ -806,6 +806,9 @@ const OPENAI_CODEX_PROVIDER_FIELDS: &[PresetField] = &[
 const OPENAI_CODEX_MODEL_PROVIDER: PresetField =
     PresetField::new("model_provider", &[s("openai-codex")]);
 const OPENAI_CODEX_CONTEXT_WINDOW: PresetField = PresetField::new("context_window", &[i(272_000)]);
+// gx: cosmetic stamp; existing installs infer this from codex_compat +
+// the ChatGPT Codex URL (see xai_grok_shell::agent::reasoning_family).
+const OPENAI_CODEX_FAMILY: PresetField = PresetField::new("model_family", &[s("openai-codex")]);
 const OPENAI_CODEX_COMPAT: PresetField = PresetField::new("codex_compat", &[b(true)]);
 const OPENAI_CODEX_SUPPORTS_EFFORT: PresetField =
     PresetField::new("supports_reasoning_effort", &[b(true)]);
@@ -826,6 +829,7 @@ const OPENAI_SOL_FIELDS: &[PresetField] = &[
     ),
     OPENAI_CODEX_MODEL_PROVIDER,
     OPENAI_CODEX_CONTEXT_WINDOW,
+    OPENAI_CODEX_FAMILY,
     OPENAI_CODEX_COMPAT,
     OPENAI_CODEX_SUPPORTS_EFFORT,
     OPENAI_CODEX_EFFORT,
@@ -838,6 +842,7 @@ const OPENAI_TERRA_FIELDS: &[PresetField] = &[
     PresetField::new("description", &[s("GPT-5.6 Terra via your ChatGPT plan.")]),
     OPENAI_CODEX_MODEL_PROVIDER,
     OPENAI_CODEX_CONTEXT_WINDOW,
+    OPENAI_CODEX_FAMILY,
     OPENAI_CODEX_COMPAT,
     OPENAI_CODEX_SUPPORTS_EFFORT,
     OPENAI_CODEX_EFFORT,
@@ -853,6 +858,7 @@ const OPENAI_LUNA_FIELDS: &[PresetField] = &[
     ),
     OPENAI_CODEX_MODEL_PROVIDER,
     OPENAI_CODEX_CONTEXT_WINDOW,
+    OPENAI_CODEX_FAMILY,
     OPENAI_CODEX_COMPAT,
     OPENAI_CODEX_SUPPORTS_EFFORT,
     OPENAI_CODEX_EFFORT,

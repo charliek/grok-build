@@ -58,6 +58,9 @@ jobs:
       - name: Test xai-grok-sampling-types
         run: cargo test -p xai-grok-sampling-types --locked
 
+      - name: Test xai-grok-sampler (lib)
+        run: cargo test -p xai-grok-sampler --lib --locked
+
       - name: Test xai-grok-config
         run: cargo test -p xai-grok-config --locked
 
@@ -94,6 +97,7 @@ jobs:
           cargo test -p xai-grok-shell --lib --locked -- \
             leader:: \
             agent::model_providers::tests:: \
+            agent::reasoning_family \
             session_compact \
             auth::auth_provider::tests::resolve_auth_program
 

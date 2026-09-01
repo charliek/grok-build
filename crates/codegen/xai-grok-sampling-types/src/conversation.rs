@@ -682,6 +682,52 @@ impl ConversationRequest {
     pub fn strip_images(&mut self) -> Vec<Arc<str>> {
         strip_images_where(&mut self.items, |_| true)
     }
+
+    /// gx: clear `encrypted_content` on every reasoning sibling. Request-local
+    /// recovery after a foreign-blob 400; does not resize `items`. Returns
+    /// how many blobs were cleared (0 means a retry cannot change the body).
+    pub fn strip_encrypted_content(&mut self) -> usize {
+        let mut n = 0;
+        for item in &mut self.items {
+            if let ConversationItem::Reasoning(r) = item
+                && r.encrypted_content.take().is_some()
+            {
+                n += 1;
+            }
+        }
+        n
+    }
+}
+
+#[cfg(test)]
+mod strip_encrypted_content_tests {
+    use super::*;
+
+    #[test]
+    fn strip_encrypted_content_clears_blobs_and_is_idempotent() {
+        let mut req = ConversationRequest::from_items(vec![
+            ConversationItem::user("u"),
+            ConversationItem::Reasoning(synthesized_reasoning_item("empty")),
+            reasoning_with_blob(),
+            ConversationItem::assistant("a"),
+        ]);
+        assert_eq!(req.strip_encrypted_content(), 1);
+        assert!(req.items.iter().all(|i| match i {
+            ConversationItem::Reasoning(r) => r.encrypted_content.is_none(),
+            _ => true,
+        }));
+        assert_eq!(req.strip_encrypted_content(), 0);
+    }
+
+    fn reasoning_with_blob() -> ConversationItem {
+        ConversationItem::Reasoning(rs::ReasoningItem {
+            id: "rs_x".into(),
+            summary: vec![],
+            content: None,
+            encrypted_content: Some("enc".into()),
+            status: None,
+        })
+    }
 }
 
 /// Strip only `urls`.
