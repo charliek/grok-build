@@ -280,6 +280,17 @@ residue.
 
 Being upfront about the rough edges:
 
+- **Mid-session provider switches.** Codex (ChatGPT plan) sealed reasoning
+  (`encrypted_content`) is not decryptable by Grok, and Grok's sealed
+  blobs are not decryptable by Codex. A **user** `/model` switch between
+  those two may lossily compact (upstream family-switch). Independently,
+  gx drops foreign sealed reasoning on the Codex wire and, on a Grok
+  `encrypted_content` 400, strips sealed blobs from that request and
+  retries once. Chat Completions hops (GLM, Kimi, OpenRouter) keep
+  history: they ignore item ids and sealed blobs. Resume/load does not
+  compact. Empty-id reasoning from GLM/Fireworks no longer 400s Codex
+  (`1.0.12+gx.6` and this change). A `1.0.10+gx.4` binary does not have
+  these fixes — upgrade.
 - **Third-party retry/429 tuning is stock-xAI-tuned.** gx does not have bespoke
   backoff/retry curves for Fireworks, Z.AI, OpenRouter, or OpenAI — it inherits
   whatever grok's sampler does for xAI's own API, which may not be ideal for a

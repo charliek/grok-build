@@ -356,8 +356,11 @@ impl SamplingError {
 
     /// The server rejected the request because the conversation history
     /// contains `encrypted_content` from a different model family that the
-    /// current model cannot decrypt. Never retryable — the user must start
-    /// a new session.
+    /// current model cannot decrypt. Not generically retryable (`is_retryable`
+    /// stays false). gx recovers by stripping every sealed blob from the
+    /// in-flight request and retrying once (`RetryWithEncryptedContentStrip`);
+    /// the friendly "start a new session" path is only if that retry still
+    /// 400s or `max_retries == 0`.
     pub fn is_encrypted_content_error(&self) -> bool {
         matches!(
             self,
@@ -1390,7 +1393,7 @@ mod tests {
         assert!(err.is_encrypted_content_error());
         assert!(
             !err.is_retryable(),
-            "encrypted_content errors must not be retried"
+            "encrypted_content errors must not be generically retried"
         );
     }
 

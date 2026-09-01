@@ -1022,6 +1022,7 @@ impl acp::Agent for MvpAgent {
                             restore_model_id.clone(),
                         ),
                         None,
+                        false,
                     )
                     .await
                 {
@@ -2229,6 +2230,7 @@ impl acp::Agent for MvpAgent {
                 self,
                 args,
                 effort_override,
+                true,
             )
             .await;
         if res.is_ok()

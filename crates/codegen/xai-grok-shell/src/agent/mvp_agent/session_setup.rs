@@ -608,6 +608,7 @@ impl MvpAgent {
                     self,
                     acp::SetSessionModelRequest::new(session_id.clone(), acp::ModelId::new(model_id)),
                     switch_effort,
+                    false,
                 )
                 .await
             });
@@ -1447,6 +1448,7 @@ impl MvpAgent {
                 self,
                 acp::SetSessionModelRequest::new(session_id.to_owned(), model_id),
                 restore_effort,
+                false,
             )
             .await
             {

@@ -2194,7 +2194,7 @@ fn codex_compat_keeps_reasoning_items_with_valid_ids() {
     let mut req = ConversationRequest::from_items(vec![
         ConversationItem::user("hi"),
         reasoning_sibling("rs_abc-123", "thinking", Some("enc")),
-        ConversationItem::assistant("hello"),
+        ConversationItem::assistant_with_model("hello", "gpt-5.6-sol"),
     ])
     .with_model("gpt-5.6-sol");
     req.codex_compat = true;
@@ -2209,6 +2209,13 @@ fn codex_compat_keeps_reasoning_items_with_valid_ids() {
         reasoning.get("id").and_then(serde_json::Value::as_str),
         Some("rs_abc-123"),
         "a Codex-native id must survive — {body}"
+    );
+    assert_eq!(
+        reasoning
+            .get("encrypted_content")
+            .and_then(serde_json::Value::as_str),
+        Some("enc"),
+        "same-model sealed blob must survive — {body}"
     );
 }
 
@@ -2227,8 +2234,7 @@ fn codex_compat_drops_reasoning_items_with_invalid_id_characters() {
     assert!(
         !input
             .iter()
-            .any(|item| item.get("type").and_then(serde_json::Value::as_str)
-                == Some("reasoning")),
+            .any(|item| item.get("type").and_then(serde_json::Value::as_str) == Some("reasoning")),
         "ids with characters outside [A-Za-z0-9_-] must be dropped — {body}"
     );
 }
@@ -2248,4 +2254,169 @@ fn without_codex_compat_empty_id_reasoning_items_stay() {
         Some(""),
         "xAI regression: empty ids must not be rewritten off the codex path — {body}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// gx: Codex drops *foreign* sealed reasoning, identified by the following
+// assistant's model_id vs req.model — not by id prefix. `rs_` is not
+// OpenAI-exclusive (`rs_grokbuild_legacy` in test_sampling_client).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn codex_compat_drops_foreign_sealed_reasoning() {
+    let mut req = ConversationRequest::from_items(vec![
+        ConversationItem::user("hi"),
+        reasoning_sibling(
+            "tco_res-uuid_call-uuid-0",
+            "xai thought",
+            Some("tco_SEALED"),
+        ),
+        ConversationItem::assistant_with_model("done", "grok-4.6"),
+        ConversationItem::user("now on sol"),
+    ])
+    .with_model("gpt-5.6-sol");
+    req.codex_compat = true;
+
+    let body = body_of(&req);
+    let input = body["input"].as_array().expect("input items");
+    assert!(
+        !input.iter().any(|item| {
+            item.get("type").and_then(serde_json::Value::as_str) == Some("reasoning")
+        }),
+        "Grok-minted sealed reasoning must not reach Codex — {body}"
+    );
+}
+
+#[test]
+fn codex_compat_drops_unknown_provenance_sealed_reasoning() {
+    let mut req = ConversationRequest::from_items(vec![
+        ConversationItem::user("hi"),
+        reasoning_sibling("rs_orphan", "thought", Some("enc")),
+        ConversationItem::assistant("no model_id"),
+    ])
+    .with_model("gpt-5.6-sol");
+    req.codex_compat = true;
+
+    let body = body_of(&req);
+    let input = body["input"].as_array().expect("input items");
+    assert!(
+        !input.iter().any(|item| {
+            item.get("type").and_then(serde_json::Value::as_str) == Some("reasoning")
+        }),
+        "sealed reasoning with no assistant.model_id must not reach Codex — {body}"
+    );
+}
+
+#[test]
+fn codex_compat_keeps_foreign_unsealed_valid_id_reasoning() {
+    // Summary-only (no encrypted_content) from another model is safe to
+    // replay: Codex never tries to decrypt it.
+    let mut req = ConversationRequest::from_items(vec![
+        ConversationItem::user("hi"),
+        reasoning_sibling("tco_summary_only", "visible summary", None),
+        ConversationItem::assistant_with_model("done", "grok-4.6"),
+    ])
+    .with_model("gpt-5.6-sol");
+    req.codex_compat = true;
+
+    let body = body_of(&req);
+    let input = body["input"].as_array().expect("input items");
+    let reasoning = input
+        .iter()
+        .find(|item| item.get("type").and_then(serde_json::Value::as_str) == Some("reasoning"))
+        .expect("unsealed valid-id reasoning must be kept");
+    assert_eq!(
+        reasoning.get("id").and_then(serde_json::Value::as_str),
+        Some("tco_summary_only"),
+        "{body}"
+    );
+}
+
+#[test]
+fn without_codex_compat_foreign_sealed_reasoning_stays() {
+    let mut req = ConversationRequest::from_items(vec![
+        ConversationItem::user("hi"),
+        reasoning_sibling(
+            "rs_grokbuild_legacy",
+            "legacy grok-build reasoning",
+            Some("ENC_BLOB_xyz"),
+        ),
+        ConversationItem::assistant_with_model("a1", "grok-build"),
+    ])
+    .with_model("test-model");
+    req.codex_compat = false;
+
+    let body = body_of(&req);
+    let input = body["input"].as_array().expect("input items");
+    let reasoning = input
+        .iter()
+        .find(|item| item.get("type").and_then(serde_json::Value::as_str) == Some("reasoning"))
+        .expect("non-codex path must not strip sealed blobs");
+    assert_eq!(
+        reasoning.get("id").and_then(serde_json::Value::as_str),
+        Some("rs_grokbuild_legacy")
+    );
+    assert_eq!(
+        reasoning
+            .get("encrypted_content")
+            .and_then(serde_json::Value::as_str),
+        Some("ENC_BLOB_xyz"),
+        "xAI/grok-build round-trip must stay byte-stable off the Codex path — {body}"
+    );
+}
+
+#[test]
+fn session_shaped_codex_body_drops_glm_empty_ids_and_grok_blobs() {
+    let mut req = ConversationRequest::from_items(vec![
+        ConversationItem::user("sol turn"),
+        reasoning_sibling(
+            "rs_0390a5734cda97b6016a952f939a2487d1a42193bd39fe1de4",
+            "sol thought",
+            Some("sol_enc"),
+        ),
+        ConversationItem::assistant_with_model("sol answer", "gpt-5.6-sol"),
+        ConversationItem::user("glm turn"),
+        ConversationItem::Reasoning(synthesized_reasoning_item("glm thought")),
+        ConversationItem::assistant_with_model("glm answer", "glm-5.3"),
+        ConversationItem::user("grok turn"),
+        reasoning_sibling(
+            "tco_res-uuid_call-uuid-0",
+            "grok thought",
+            Some("tco_SEALED"),
+        ),
+        ConversationItem::assistant_with_model("grok answer", "grok-4.6"),
+        ConversationItem::user("back to sol"),
+    ])
+    .with_model("gpt-5.6-sol");
+    req.codex_compat = true;
+
+    let body = body_of(&req);
+    let input = body["input"].as_array().expect("input items");
+    let reasoning: Vec<&serde_json::Value> = input
+        .iter()
+        .filter(|item| item.get("type").and_then(serde_json::Value::as_str) == Some("reasoning"))
+        .collect();
+    assert_eq!(
+        reasoning.len(),
+        1,
+        "only the Sol-minted sealed sibling should remain — {body}"
+    );
+    assert_eq!(
+        reasoning[0].get("id").and_then(serde_json::Value::as_str),
+        Some("rs_0390a5734cda97b6016a952f939a2487d1a42193bd39fe1de4")
+    );
+    assert_eq!(
+        reasoning[0]
+            .get("encrypted_content")
+            .and_then(serde_json::Value::as_str),
+        Some("sol_enc")
+    );
+    for (i, item) in input.iter().enumerate() {
+        if let Some(id) = item.get("id").and_then(serde_json::Value::as_str) {
+            assert!(
+                super::responses::is_codex_item_id(id),
+                "input[{i}].id {id:?} would 400 on Codex — {body}"
+            );
+        }
+    }
 }
