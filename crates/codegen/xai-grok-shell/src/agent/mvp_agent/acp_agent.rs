@@ -61,6 +61,8 @@ impl MvpAgent {
                 args,
                 switch_effort,
                 crate::agent::handlers::model_switch::ConfigNotice::Send,
+                // gx: the gated `/model` path is a user switch: family compact applies.
+                true,
             )
             .await;
         if res.is_ok()
@@ -1069,6 +1071,8 @@ impl acp::Agent for MvpAgent {
                         ),
                         crate::agent::handlers::model_switch::SwitchEffort::Preserve,
                         crate::agent::handlers::model_switch::ConfigNotice::Send,
+                        // gx: unavailable-model restore is not a user switch: no family compact.
+                        false,
                     )
                     .await
                 {
@@ -2253,12 +2257,6 @@ impl acp::Agent for MvpAgent {
         args: acp::SetSessionModelRequest,
     ) -> Result<acp::SetSessionModelResponse, acp::Error> {
         self.set_model_gated(args).await
-    }
-    async fn set_session_config_option(
-        &self,
-        args: acp::SetSessionConfigOptionRequest,
-    ) -> Result<acp::SetSessionConfigOptionResponse, acp::Error> {
-        crate::agent::handlers::config_option::apply(self, args).await
     }
     #[tracing::instrument(
         name = "agent.ext_method",
