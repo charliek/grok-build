@@ -29,6 +29,11 @@ pub(crate) async fn apply(
     args: acp::SetSessionModelRequest,
     effort: SwitchEffort,
     config_notice: ConfigNotice,
+    // gx: only ACP `/model` (user) switches may family-compact. Resume,
+    // new_session, and unavailable-model restore pass false — otherwise
+    // inferred openai-codex vs spawn-default xAI would lossy-compact a
+    // loaded Sol session before the user types.
+    enable_family_compact: bool,
 ) -> Result<acp::SetSessionModelResponse, acp::Error> {
     tracing::info!("Received set session model request {args:?}");
     xai_grok_telemetry::unified_log::info(
@@ -57,14 +62,14 @@ pub(crate) async fn apply(
     let required_agent_type =
         resolve_required_agent_type(Some(model.info().agent_type.as_str()), session_default);
     let previous_model_id = handle.model_id.0.clone();
-    let is_family_switch = {
+    // gx: infer ChatGPT/Codex family when model_family is unset so Sol →
+    // Grok actually compact. See `crate::agent::reasoning_family`.
+    let is_family_switch = enable_family_compact && {
         let models = agent.models_manager.models();
         let old_family = config::find_model_by_id(&models, &previous_model_id)
-            .and_then(|e| e.info.model_family.as_deref());
-        matches!(
-            (old_family, model.info().model_family.as_deref()),
-            (Some(a), Some(b)) if a != b
-        )
+            .map(|e| crate::agent::reasoning_family::reasoning_family(&e.info));
+        let new_family = crate::agent::reasoning_family::reasoning_family(model.info());
+        crate::agent::reasoning_family::families_differ(old_family.flatten(), new_family)
     };
     let mut pending_rebuild_definition: Option<xai_grok_agent::AgentDefinition> = None;
     {
