@@ -178,11 +178,26 @@ impl From<&ConversationRequest> for rs::CreateResponse {
 
 /// Reasoning items stay top-level siblings rather than folding into the assistant, so the input replays the model's original order.
 pub(super) fn build_responses_input(req: &ConversationRequest) -> rs::InputParam {
-    let mut items: Vec<rs::InputItem> = req
-        .items
-        .iter()
-        .flat_map(conversation_item_to_input_items)
-        .collect();
+    let mut items: Vec<rs::InputItem> = if req.codex_compat {
+        req.items
+            .iter()
+            .enumerate()
+            .filter(|(i, item)| match item {
+                ConversationItem::Reasoning(r) => keep_codex_reasoning(
+                    r,
+                    following_assistant_model_id(&req.items, *i),
+                    req.model.as_deref(),
+                ),
+                _ => true,
+            })
+            .flat_map(|(_, item)| conversation_item_to_input_items(item))
+            .collect()
+    } else {
+        req.items
+            .iter()
+            .flat_map(conversation_item_to_input_items)
+            .collect()
+    };
 
     // gx: the ChatGPT/Codex endpoint 400s ("System messages are not allowed")
     // on any input item carrying role:"system" (spike, verified live). Every
@@ -201,9 +216,17 @@ pub(super) fn build_responses_input(req: &ConversationRequest) -> rs::InputParam
     // is a required `String`, so the empty value cannot be omitted through the
     // typed mapping — drop those items instead. A live POST that omitted the
     // id field *or* dropped the item both returned 200; dropping is what the
-    // typed API can do. Foreign-provider summaries have no `encrypted_content`
-    // Codex could replay anyway. Valid `rs_*` ids from a prior Codex turn are
-    // kept. Left alone off the codex path to avoid an xAI regression.
+    // typed API can do.
+    //
+    // Sealed `encrypted_content` is decryptable only by the backend that
+    // minted it. Provenance is the following `AssistantItem.model_id`
+    // (stamped from `response.model` at ingest) compared to `req.model` —
+    // not the id prefix. xAI/grok-build items have used `rs_*` ids
+    // (`rs_grokbuild_legacy` in `test_sampling_client`), so a prefix
+    // heuristic would strip same-family Grok replay off this path and
+    // keep foreign blobs on Codex. Unknown-provenance sealed items are
+    // dropped on Codex (cannot prove decryptable). Left alone off the
+    // codex path so xAI round-trips stay byte-stable.
     if req.codex_compat {
         for item in &mut items {
             if let rs::InputItem::EasyMessage(msg) = item
@@ -219,6 +242,38 @@ pub(super) fn build_responses_input(req: &ConversationRequest) -> rs::InputParam
     }
 
     rs::InputParam::Items(items)
+}
+
+/// gx: keep a reasoning sibling on the Codex wire only when its id is
+/// legal *and* any sealed blob is attributable to this request's model.
+fn keep_codex_reasoning(
+    r: &rs::ReasoningItem,
+    following_assistant_model: Option<&str>,
+    req_model: Option<&str>,
+) -> bool {
+    if !is_codex_item_id(&r.id) {
+        return false;
+    }
+    if r.encrypted_content.is_none() {
+        return true;
+    }
+    matches!(
+        (following_assistant_model, req_model),
+        (Some(got), Some(want)) if got == want
+    )
+}
+
+/// gx: nearest later assistant in this turn. Skip other reasoning /
+/// backend-tool siblings; stop at user/system/tool-result.
+fn following_assistant_model_id(items: &[ConversationItem], from: usize) -> Option<&str> {
+    for item in items.iter().skip(from.saturating_add(1)) {
+        match item {
+            ConversationItem::Reasoning(_) | ConversationItem::BackendToolCall(_) => continue,
+            ConversationItem::Assistant(a) => return a.model_id.as_deref(),
+            _ => return None,
+        }
+    }
+    None
 }
 
 /// gx: Codex input-item ids are non-empty `[A-Za-z0-9_-]`; empty fails live.

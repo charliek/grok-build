@@ -645,6 +645,9 @@ impl MvpAgent {
                     acp::SetSessionModelRequest::new(session_id.clone(), acp::ModelId::new(model_id)),
                     crate::agent::handlers::model_switch::SwitchEffort::Set(switch_effort),
                     crate::agent::handlers::model_switch::ConfigNotice::Skip,
+                    // gx: session setup is not a user switch: no family compact.
+                    false,
+
                 )
                 .await
             });
@@ -1625,6 +1628,9 @@ impl MvpAgent {
                 acp::SetSessionModelRequest::new(session_id.to_owned(), model_id),
                 crate::agent::handlers::model_switch::SwitchEffort::Set(restore_effort),
                 crate::agent::handlers::model_switch::ConfigNotice::Skip,
+                // gx: session restore is not a user switch: no family compact.
+                false,
+
             )
             .await
             {
