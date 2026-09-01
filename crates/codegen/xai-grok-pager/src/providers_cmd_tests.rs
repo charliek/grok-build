@@ -2106,6 +2106,7 @@ fn the_openai_codex_preset_matches_the_shape_the_spike_proved() {
         // codex-rs's own value for the gpt-5.6 family.
         assert_eq!(entry["context_window"].as_integer(), Some(272_000), "{id}");
         assert_eq!(entry["codex_compat"].as_bool(), Some(true), "{id}");
+        assert_eq!(entry["model_family"].as_str(), Some("openai-codex"), "{id}");
         assert_eq!(entry["supports_reasoning_effort"].as_bool(), Some(true));
         assert_eq!(entry["reasoning_effort"].as_str(), Some("medium"));
         assert_eq!(
