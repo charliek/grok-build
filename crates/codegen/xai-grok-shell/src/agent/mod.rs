@@ -14,6 +14,7 @@ pub mod models;
 pub mod mvp_agent;
 pub(crate) mod otel_gate;
 pub(crate) mod proxy;
+pub(crate) mod reasoning_family;
 pub mod relay;
 pub(crate) mod restore_code;
 pub mod roster;

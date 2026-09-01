@@ -477,6 +477,25 @@ async fn apply_retry_decision(
             emit_retrying(event_tx, request_id, *retry_count, max_retries, err);
             true
         }
+        // gx: foreign encrypted_content 400. Strip every sealed blob on
+        // this request (stronger than the mapper's foreign-drop, which
+        // already ran) and retry. Request-local: chat-state is untouched.
+        RetryDecision::RetryWithEncryptedContentStrip => {
+            let stripped = request.strip_encrypted_content();
+            if stripped == 0 {
+                let terminal_event_queued = emit_failed(event_tx, request_id, err);
+                send_completion(completion, Err(clone_error(err)), terminal_event_queued);
+                return false;
+            }
+            tracing::warn!(
+                stripped,
+                error = %err,
+                "stripped encrypted_content from {stripped} reasoning item(s) after a decrypt 400; retrying"
+            );
+            *retry_count += 1;
+            emit_retrying(event_tx, request_id, *retry_count, max_retries, err);
+            true
+        }
         RetryDecision::RetryWithClientRebuild { backoff } => {
             *retry_count += 1;
             emit_retrying(event_tx, request_id, *retry_count, max_retries, err);

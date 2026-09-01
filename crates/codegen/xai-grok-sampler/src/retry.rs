@@ -83,6 +83,11 @@ pub enum RetryDecision {
 
     RetryWithImageStrip,
 
+    /// gx: encrypted_content 400 — clear every sealed blob on this request
+    /// and retry once. Stronger than the Codex mapper's foreign-drop: the
+    /// mapper already ran, so repeating it is a no-op.
+    RetryWithEncryptedContentStrip,
+
     RetryWithClientRebuild {
         backoff: Duration,
     },
@@ -101,8 +106,12 @@ pub fn classify_error(
     if err.is_auth_error() {
         return RetryDecision::EmitToSession(clone_error(err));
     }
+    // gx: dedicated strip-all-blobs recovery, not generic retry.
     if err.is_encrypted_content_error() {
-        return RetryDecision::EmitToSession(clone_error(err));
+        if max_retries == 0 {
+            return RetryDecision::EmitToSession(clone_error(err));
+        }
+        return RetryDecision::RetryWithEncryptedContentStrip;
     }
     if max_retries == 0 {
         return RetryDecision::Fatal(clone_error(err));
@@ -432,14 +441,26 @@ mod tests {
     }
 
     #[test]
-    fn classify_encrypted_content_emits_to_session() {
+    fn classify_encrypted_content_strips_blobs_when_retries_remain() {
         let err = api_err(
             StatusCode::BAD_REQUEST,
             "Could not decrypt the provided encrypted_content",
         );
         match classify_error(&err, 0, 5, RATE_LIMIT_RETRY_THRESHOLD) {
+            RetryDecision::RetryWithEncryptedContentStrip => {}
+            other => panic!("expected RetryWithEncryptedContentStrip, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_encrypted_content_emits_when_retry_budget_is_zero() {
+        let err = api_err(
+            StatusCode::BAD_REQUEST,
+            "Could not decrypt the provided encrypted_content",
+        );
+        match classify_error(&err, 0, 0, RATE_LIMIT_RETRY_THRESHOLD) {
             RetryDecision::EmitToSession(_) => {}
-            other => panic!("expected EmitToSession, got {other:?}"),
+            other => panic!("expected EmitToSession at max_retries=0, got {other:?}"),
         }
     }
 
