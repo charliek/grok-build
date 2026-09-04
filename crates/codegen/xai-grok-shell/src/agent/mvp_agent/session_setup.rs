@@ -782,7 +782,6 @@ impl MvpAgent {
                     crate::agent::handlers::model_switch::ConfigNotice::Skip,
                     // gx: session setup is not a user switch: no family compact.
                     false,
-
                 )
                 .await
             });
@@ -1869,7 +1868,6 @@ impl MvpAgent {
                 crate::agent::handlers::model_switch::ConfigNotice::Skip,
                 // gx: session restore is not a user switch: no family compact.
                 false,
-
             )
             .await
             {
