@@ -90,8 +90,10 @@ jobs:
         run: cargo test -p xai-grok-version --locked
 
       # xai-grok-shell's full suite is huge; restrict to the gx-touched
-      # subset: a filtered --lib run, the sampling-client integration test,
-      # and the chat-history-downgrade bin.
+      # subset: a filtered --lib run and the chat-history-downgrade bin.
+      # (Upstream 1.0.16 deleted the test_sampling_client integration
+      # target; its gx wire-compat coverage lives in
+      # xai-grok-sampling-types unit tests.)
       - name: Test xai-grok-shell (lib subset)
         run: |
           cargo test -p xai-grok-shell --lib --locked -- \
@@ -100,9 +102,6 @@ jobs:
             agent::reasoning_family \
             session_compact \
             auth::auth_provider::tests::resolve_auth_program
-
-      - name: Test xai-grok-shell (test_sampling_client)
-        run: cargo test -p xai-grok-shell --locked --test test_sampling_client
 
       - name: Test xai-grok-shell (chat-history-downgrade bin)
         run: cargo test -p xai-grok-shell --locked --bin chat-history-downgrade
