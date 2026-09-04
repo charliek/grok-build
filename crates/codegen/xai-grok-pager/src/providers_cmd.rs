@@ -1647,32 +1647,55 @@ fn remove_overlay_entry(doc: &mut toml_edit::DocumentMut, parent: &str, child: &
     }
 }
 
-/// `Some` when the overlay table carries a non-empty `api_key`. The value is
-/// cloned so the caller can write it without holding a borrow across the
-/// config.toml mutation; it is never logged.
-fn overlay_api_key(doc: &toml_edit::DocumentMut, provider: &str) -> Option<toml_edit::Value> {
-    let v = doc
-        .get("model_providers")
-        .and_then(|t| t.get(provider))
-        .and_then(|e| e.get("api_key"))
-        .and_then(toml_edit::Item::as_value)?;
-    if v.as_str().is_some_and(|s| s.trim().is_empty()) {
-        return None;
+/// Values on a providers.toml overlay table, cloned so they can be written
+/// into config.toml without holding a borrow. Nested non-value items are
+/// skipped (shipped presets only ever store values / inline tables).
+fn overlay_values(
+    doc: &toml_edit::DocumentMut,
+    parent: &str,
+    child: &str,
+) -> Vec<(String, toml_edit::Value)> {
+    let Some(item) = doc.get(parent).and_then(|t| t.get(child)) else {
+        return Vec::new();
+    };
+    if let Some(table) = item.as_table() {
+        return table
+            .iter()
+            .filter_map(|(k, v)| v.as_value().cloned().map(|val| (k.to_string(), val)))
+            .collect();
     }
-    Some(v.clone())
+    if let Some(table) = item.as_inline_table() {
+        return table
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect();
+    }
+    Vec::new()
 }
 
-fn config_has_api_key(doc: &toml_edit::DocumentMut, provider: &str) -> bool {
-    doc.get("model_providers")
-        .and_then(|t| t.get(provider))
-        .and_then(|e| e.get("api_key"))
-        .and_then(toml_edit::Item::as_value)
-        .is_some_and(|v| !v.as_str().is_some_and(|s| s.trim().is_empty()))
+fn copy_overlay_into_config(
+    providers_doc: &toml_edit::DocumentMut,
+    config_doc: &mut toml_edit::DocumentMut,
+    parent: &str,
+    child: &str,
+) -> Result<()> {
+    let fields = overlay_values(providers_doc, parent, child);
+    if fields.is_empty() {
+        return Ok(());
+    }
+    let (table, _) = entry_table(config_doc, parent, child, "config.toml")?;
+    // Overlay wins for every key it carries: that is what gx was using at
+    // runtime before the partition move (providers.toml shadows config.toml).
+    for (key, value) in fields {
+        set_value_preserving_decor(table, &key, value);
+    }
+    Ok(())
 }
 
 /// Relocate shipped stock-compatible tables out of providers.toml so they
-/// cannot shadow the config.toml copy. Copies `api_key` first when config.toml
-/// has none. An explicit exception to "install never deletes": this is a
+/// cannot shadow the config.toml copy. Copies every overlay field (not just
+/// `api_key`) so a hand-edited `base_url` / `extra_headers` / unknown key
+/// survives. An explicit exception to "install never deletes": this is a
 /// partition move, not a catalog removal.
 fn migrate_stock_overlay(
     providers_doc: &mut toml_edit::DocumentMut,
@@ -1682,18 +1705,18 @@ fn migrate_stock_overlay(
     let mut migrated = Vec::new();
     for preset in presets.iter().filter(|p| p.install && p.stock_compatible) {
         if overlay_entry_present(providers_doc, "model_providers", preset.id) {
-            if let Some(key) = overlay_api_key(providers_doc, preset.id)
-                && !config_has_api_key(config_doc, preset.id)
-            {
-                let (table, _) =
-                    entry_table(config_doc, "model_providers", preset.id, "config.toml")?;
-                set_value_preserving_decor(table, "api_key", key);
-            }
+            copy_overlay_into_config(
+                providers_doc,
+                config_doc,
+                "model_providers",
+                preset.id,
+            )?;
             remove_overlay_entry(providers_doc, "model_providers", preset.id);
             migrated.push(quoted_path("model_providers", preset.id));
         }
         for model in preset.models {
             if overlay_entry_present(providers_doc, "model", model.id) {
+                copy_overlay_into_config(providers_doc, config_doc, "model", model.id)?;
                 remove_overlay_entry(providers_doc, "model", model.id);
                 migrated.push(quoted_path("model", model.id));
             }
@@ -1774,8 +1797,19 @@ pub(crate) fn install_at(
     }
 
     // Writes happen only after both applies (and any overlay migration)
-    // succeeded. A non-table `model_providers` in config.toml must not leave
-    // a half-applied providers.toml behind.
+    // succeeded. Commit config.toml (the destination of migrated keys) *before*
+    // providers.toml (which drops the overlay). A config write failure then
+    // leaves the overlay in place; a later providers write failure leaves a
+    // dual copy that the next install will migrate again — never a lost key.
+    if !stock.is_empty() {
+        // Never stamp the providers.toml header onto config.toml: that file is
+        // shared with stock grok and may already carry [cli]/[ui]/[plugins].
+        let rendered = config_doc.to_string();
+        let outcome = write_toml_file(&config, &rendered, &config_previous)?;
+        report.config_changed = outcome.changed;
+        report.config_reclamped_from = outcome.reclamped_from;
+    }
+
     if !gx_only.is_empty() || !report.migrated_from_providers.is_empty() {
         let mut rendered = providers_doc.to_string();
         if providers_previous.trim().is_empty() {
@@ -1787,15 +1821,6 @@ pub(crate) fn install_at(
         let outcome = write_toml_file(&providers, &rendered, &providers_previous)?;
         report.providers_changed = outcome.changed;
         report.reclamped_from = outcome.reclamped_from;
-    }
-
-    if !stock.is_empty() {
-        // Never stamp the providers.toml header onto config.toml: that file is
-        // shared with stock grok and may already carry [cli]/[ui]/[plugins].
-        let rendered = config_doc.to_string();
-        let outcome = write_toml_file(&config, &rendered, &config_previous)?;
-        report.config_changed = outcome.changed;
-        report.config_reclamped_from = outcome.reclamped_from;
     }
 
     report.changed = report.providers_changed || report.config_changed;
