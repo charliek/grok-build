@@ -184,38 +184,28 @@ fn install_writes_every_installable_preset_and_no_api_keys() {
     assert!(config.contains("[model_providers.meta]"), "{config}");
     // `openai-api` deliberately ships no models: which OpenAI models a key can
     // reach is account-specific, so a shipped catalog would only go stale.
-    assert!(
-        PRESETS
-            .iter()
-            .find(|p| p.id == "openai-api")
-            .expect("openai-api preset")
-            .models
-            .is_empty()
-    );
+    assert!(PRESETS
+        .iter()
+        .find(|p| p.id == "openai-api")
+        .expect("openai-api preset")
+        .models
+        .is_empty());
 
     assert!(report.changed);
     assert!(report.config_changed);
     assert!(report.providers_changed);
-    assert!(
-        report
-            .added_entries
-            .contains(&"model_providers.fireworks".to_owned())
-    );
-    assert!(
-        report
-            .added_entries
-            .contains(&"model.\"glm-5.3\"".to_owned())
-    );
-    assert!(
-        report
-            .added_entries
-            .contains(&"model.\"glm-5.3-flash\"".to_owned())
-    );
-    assert!(
-        report
-            .added_entries
-            .contains(&"model.\"muse-spark-1.3\"".to_owned())
-    );
+    assert!(report
+        .added_entries
+        .contains(&"model_providers.fireworks".to_owned()));
+    assert!(report
+        .added_entries
+        .contains(&"model.\"glm-5.3\"".to_owned()));
+    assert!(report
+        .added_entries
+        .contains(&"model.\"glm-5.3-flash\"".to_owned()));
+    assert!(report
+        .added_entries
+        .contains(&"model.\"muse-spark-1.3\"".to_owned()));
     assert!(report.kept_fields.is_empty());
     assert!(report.upgraded_fields.is_empty());
 }
@@ -591,15 +581,16 @@ fn install_migrates_stock_compatible_overlay_from_providers_toml_to_config_toml(
     fs::write(
         providers_path(dir.path()),
         r#"[model_providers.openrouter]
-base_url = "https://openrouter.ai/api/v1"
+base_url = "https://openrouter.example.test/v1"
 api_backend = "chat_completions"
 env_key = "OPENROUTER_API_KEY"
 api_key = "sk-test-not-real"
+extra_headers = { "X-Title" = "hand-edit" }
 
 [model."openrouter/minimax-m3"]
 model = "minimax/minimax-m3"
 model_provider = "openrouter"
-context_window = 1048576
+context_window = 999999
 stream_tool_calls = false
 
 [model_providers.fireworks]
@@ -618,6 +609,19 @@ env_key = "FIREWORKS_API_KEY"
         config["model_providers"]["openrouter"]["api_key"].as_str(),
         Some("sk-test-not-real"),
         "the overlay api_key must land on config.toml, not be dropped"
+    );
+    assert_eq!(
+        config["model_providers"]["openrouter"]["base_url"].as_str(),
+        Some("https://openrouter.example.test/v1"),
+        "hand-edited overlay fields other than api_key must survive"
+    );
+    assert_eq!(
+        config["model_providers"]["openrouter"]["extra_headers"]["X-Title"].as_str(),
+        Some("hand-edit")
+    );
+    assert_eq!(
+        config["model"]["openrouter/minimax-m3"]["context_window"].as_integer(),
+        Some(999999)
     );
     assert_eq!(config["ui"]["compact_mode"].as_bool(), Some(true));
     assert!(
@@ -797,11 +801,9 @@ model = "hand-picked-wire-id"
     // Missing fields on an existing entry are reported as added fields, not as
     // a new entry.
     assert!(report.added_entries.is_empty());
-    assert!(
-        report
-            .added_fields
-            .contains(&"model_providers.synth.env_key".to_owned())
-    );
+    assert!(report
+        .added_fields
+        .contains(&"model_providers.synth.env_key".to_owned()));
 }
 
 /// Upgrade path for the 2026-08-25 Fireworks reasoning-effort probe: a
@@ -2248,8 +2250,8 @@ fn install_warns_when_the_rendered_file_would_exceed_the_runtime_cap() {
 #[cfg(unix)]
 #[test]
 fn providers_lock_serializes_concurrent_mutators() {
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     let dir = home();
     let lock_path = providers_lock_path(dir.path());
