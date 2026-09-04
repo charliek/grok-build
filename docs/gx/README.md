@@ -305,6 +305,11 @@ Being upfront about the rough edges:
   compact. Empty-id reasoning from GLM/Fireworks no longer 400s Codex
   (`1.0.12+gx.6` and this change). A `1.0.10+gx.4` binary does not have
   these fixes — upgrade.
+- **Muse Spark reasoning does not carry across tool turns.** gx replays
+  assistant tool calls and tool results on Chat Completions, but Meta does
+  not return replayable reasoning on that surface, so each tool result
+  starts a fresh reasoning pass. Same class as GLM/Kimi; Responses replay
+  is future work.
 - **Third-party retry/429 tuning is stock-xAI-tuned.** gx does not have bespoke
   backoff/retry curves for Fireworks, Z.AI, OpenRouter, Meta, or OpenAI — it inherits
   whatever grok's sampler does for xAI's own API, which may not be ideal for a
