@@ -25,6 +25,34 @@ fn parse_providers(home: &Path) -> toml::Value {
     toml::from_str(&providers_body(home)).expect("providers.toml is valid TOML")
 }
 
+fn config_toml(home: &Path) -> PathBuf {
+    home.join("config.toml")
+}
+
+fn config_body(home: &Path) -> String {
+    fs::read_to_string(config_toml(home)).expect("config.toml exists")
+}
+
+fn parse_config(home: &Path) -> toml::Value {
+    toml::from_str(&config_body(home)).expect("config.toml is valid TOML")
+}
+
+fn gx_only_presets() -> Vec<ProviderPreset> {
+    PRESETS
+        .iter()
+        .copied()
+        .filter(|p| !p.stock_compatible)
+        .collect()
+}
+
+fn stock_presets() -> Vec<ProviderPreset> {
+    PRESETS
+        .iter()
+        .copied()
+        .filter(|p| p.stock_compatible)
+        .collect()
+}
+
 #[cfg(unix)]
 fn mode_of(path: &Path) -> u32 {
     use std::os::unix::fs::PermissionsExt as _;
@@ -72,6 +100,7 @@ const SYNTH_PRESETS: &[ProviderPreset] = &[ProviderPreset {
     label: "Synthetic",
     install: true,
     rejects_static_key: false,
+    stock_compatible: false,
     note: None,
     fields: SYNTH_PROVIDER_FIELDS,
     models: &[ModelPreset {
@@ -88,35 +117,71 @@ const SYNTH_PRESETS: &[ProviderPreset] = &[ProviderPreset {
 fn install_writes_every_installable_preset_and_no_api_keys() {
     let dir = home();
     let report = install_at(dir.path(), PRESETS, false, &ctx()).expect("install");
-    let body = providers_body(dir.path());
+    let providers = providers_body(dir.path());
+    let config = config_body(dir.path());
 
     for preset in PRESETS.iter().filter(|p| p.install) {
+        let body = if preset.stock_compatible {
+            &config
+        } else {
+            &providers
+        };
+        let other = if preset.stock_compatible {
+            &providers
+        } else {
+            &config
+        };
+        let header = format!("[{}]", quoted_path("model_providers", preset.id));
         assert!(
-            body.contains(&format!("[{}]", quoted_path("model_providers", preset.id))),
-            "missing provider {} in:\n{body}",
+            body.contains(&header),
+            "missing provider {} in the target file:\n{body}",
+            preset.id
+        );
+        assert!(
+            !other.contains(&header),
+            "stock-compatible and gx-only entries must not be written to both files; {} leaked into the other file:\n{other}",
             preset.id
         );
         for model in preset.models {
+            let model_header = format!("[{}]", quoted_path("model", model.id));
             assert!(
-                body.contains(&format!("[{}]", quoted_path("model", model.id))),
-                "missing model {} in:\n{body}",
+                body.contains(&model_header),
+                "missing model {} in the target file:\n{body}",
+                model.id
+            );
+            assert!(
+                !other.contains(&model_header),
+                "model {} leaked into the other file:\n{other}",
                 model.id
             );
         }
     }
     // Presets carry env_key, never api_key (the header comment mentions the
     // key by name, so check the parsed tables rather than the raw text).
-    let parsed = parse_providers(dir.path());
-    for (id, entry) in parsed["model_providers"].as_table().unwrap() {
-        assert!(
-            entry.get("api_key").is_none(),
-            "install must never write key material, found one on {id}"
-        );
+    for (label, parsed) in [
+        ("providers.toml", parse_providers(dir.path())),
+        ("config.toml", parse_config(dir.path())),
+    ] {
+        if let Some(table) = parsed.get("model_providers").and_then(|t| t.as_table()) {
+            for (id, entry) in table {
+                assert!(
+                    entry.get("api_key").is_none(),
+                    "install must never write key material, found one on {id} in {label}"
+                );
+            }
+        }
     }
     // Every shipped preset installs in this build, OpenAI included.
     assert!(PRESETS.iter().all(|p| p.install));
-    assert!(body.contains("[model_providers.openai-codex]"), "{body}");
-    assert!(body.contains("[model_providers.openai-api]"), "{body}");
+    assert!(
+        providers.contains("[model_providers.openai-codex]"),
+        "{providers}"
+    );
+    assert!(
+        providers.contains("[model_providers.openai-api]"),
+        "{providers}"
+    );
+    assert!(config.contains("[model_providers.meta]"), "{config}");
     // `openai-api` deliberately ships no models: which OpenAI models a key can
     // reach is account-specific, so a shipped catalog would only go stale.
     assert!(
@@ -129,6 +194,8 @@ fn install_writes_every_installable_preset_and_no_api_keys() {
     );
 
     assert!(report.changed);
+    assert!(report.config_changed);
+    assert!(report.providers_changed);
     assert!(
         report
             .added_entries
@@ -144,6 +211,11 @@ fn install_writes_every_installable_preset_and_no_api_keys() {
             .added_entries
             .contains(&"model.\"glm-5.3-flash\"".to_owned())
     );
+    assert!(
+        report
+            .added_entries
+            .contains(&"model.\"muse-spark-1.3\"".to_owned())
+    );
     assert!(report.kept_fields.is_empty());
     assert!(report.upgraded_fields.is_empty());
 }
@@ -152,7 +224,10 @@ fn install_writes_every_installable_preset_and_no_api_keys() {
 fn install_mirrors_the_live_glm_openrouter_and_fireworks_shapes() {
     let dir = home();
     install_at(dir.path(), PRESETS, false, &ctx()).expect("install");
-    let parsed = parse_providers(dir.path());
+    // GLM / OpenRouter / Meta are stock-compatible and land in config.toml;
+    // Fireworks stays gx-only in providers.toml.
+    let parsed = parse_config(dir.path());
+    let fireworks_doc = parse_providers(dir.path());
 
     let glm = &parsed["model"]["glm-5.3"];
     assert_eq!(glm["model"].as_str(), Some("glm-5.3"));
@@ -259,9 +334,72 @@ fn install_mirrors_the_live_glm_openrouter_and_fireworks_shapes() {
         );
     }
 
+    let meta = &parsed["model_providers"]["meta"];
+    assert_eq!(meta["base_url"].as_str(), Some("https://api.meta.ai/v1"));
+    assert_eq!(meta["api_backend"].as_str(), Some("chat_completions"));
+    assert_eq!(
+        meta["env_key"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(toml::Value::as_str)
+            .collect::<Vec<_>>(),
+        vec!["META_API_KEY", "MODEL_API_KEY"]
+    );
+    assert!(meta.get("api_key").is_none());
+
+    for (id, name, desc) in [
+        (
+            "muse-spark-1.3",
+            "Muse Spark 1.3 (Meta)",
+            "Muse Spark 1.3 via Meta Model API. Prompts are not used for training.",
+        ),
+        (
+            "muse-spark-1.3-contributor",
+            "Muse Spark 1.3 Contributor (Meta)",
+            "Discounted Muse Spark 1.3. Your content, including inter-session messages, may be used for product improvement.",
+        ),
+    ] {
+        let entry = &parsed["model"][id];
+        assert_eq!(entry["model"].as_str(), Some(id), "{id}");
+        assert_eq!(entry["name"].as_str(), Some(name), "{id}");
+        assert_eq!(entry["description"].as_str(), Some(desc), "{id}");
+        assert_eq!(entry["model_provider"].as_str(), Some("meta"), "{id}");
+        assert_eq!(
+            entry["context_window"].as_integer(),
+            Some(1_048_576),
+            "{id}"
+        );
+        assert_eq!(
+            entry["max_completion_tokens"].as_integer(),
+            Some(131_072),
+            "{id}"
+        );
+        assert_eq!(entry["stream_tool_calls"].as_bool(), Some(false), "{id}");
+        assert_eq!(
+            entry["supports_reasoning_effort"].as_bool(),
+            Some(true),
+            "{id}"
+        );
+        assert_eq!(entry["reasoning_effort"].as_str(), Some("high"), "{id}");
+        assert_eq!(
+            entry["reasoning_efforts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(toml::Value::as_str)
+                .collect::<Vec<_>>(),
+            vec!["minimal", "low", "medium", "high", "xhigh"],
+            "{id}"
+        );
+        assert!(entry.get("model_family").is_none(), "{id}");
+        assert!(entry.get("codex_compat").is_none(), "{id}");
+        assert!(entry.get("api_key").is_none(), "{id}");
+    }
+
     // Five Fireworks models, every one with an explicit context window, a
     // fully-qualified wire id, and streamed tool calls off.
-    let fireworks: Vec<(&String, &toml::Value)> = parsed["model"]
+    let fireworks: Vec<(&String, &toml::Value)> = fireworks_doc["model"]
         .as_table()
         .unwrap()
         .iter()
@@ -297,11 +435,11 @@ fn install_mirrors_the_live_glm_openrouter_and_fireworks_shapes() {
         );
     }
     assert_eq!(
-        parsed["model"]["fireworks/deepseek-v4-flash"]["model"].as_str(),
+        fireworks_doc["model"]["fireworks/deepseek-v4-flash"]["model"].as_str(),
         Some("accounts/fireworks/models/deepseek-v4-flash-0731")
     );
     assert_eq!(
-        parsed["model"]["fireworks/kimi-k3"]["context_window"].as_integer(),
+        fireworks_doc["model"]["fireworks/kimi-k3"]["context_window"].as_integer(),
         Some(1_048_576)
     );
 }
@@ -310,13 +448,24 @@ fn install_mirrors_the_live_glm_openrouter_and_fireworks_shapes() {
 fn install_second_run_is_byte_identical_and_reports_no_change() {
     let dir = home();
     install_at(dir.path(), PRESETS, false, &ctx()).expect("first install");
-    let first = providers_body(dir.path());
+    let first_providers = providers_body(dir.path());
+    let first_config = config_body(dir.path());
 
     let report = install_at(dir.path(), PRESETS, false, &ctx()).expect("second install");
-    let second = providers_body(dir.path());
+    let second_providers = providers_body(dir.path());
+    let second_config = config_body(dir.path());
 
-    assert_eq!(first, second, "second install must be byte-identical");
+    assert_eq!(
+        first_providers, second_providers,
+        "second install must be byte-identical for providers.toml"
+    );
+    assert_eq!(
+        first_config, second_config,
+        "second install must be byte-identical for config.toml"
+    );
     assert!(!report.changed, "second install must report no change");
+    assert!(!report.config_changed);
+    assert!(!report.providers_changed);
     assert!(report.added_entries.is_empty());
     assert!(report.added_fields.is_empty());
     assert!(report.upgraded_fields.is_empty());
@@ -329,15 +478,24 @@ fn install_writes_providers_toml_0600_and_reclamps_a_loosened_file() {
     let dir = home();
     let first = install_at(dir.path(), PRESETS, false, &ctx()).expect("install");
     let path = providers_path(dir.path());
+    let config = config_toml(dir.path());
     assert_eq!(mode_of(&path), 0o600, "providers.toml must be owner-only");
+    assert_eq!(mode_of(&config), 0o600, "config.toml must be owner-only");
     assert_eq!(first.reclamped_from, None, "a fresh file is born 0600");
+    assert_eq!(first.config_reclamped_from, None);
 
     fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o644)).unwrap();
     let report = install_at(dir.path(), PRESETS, false, &ctx()).expect("second install");
     assert_eq!(
         mode_of(&path),
         0o600,
         "a no-op install must still clamp the mode back"
+    );
+    assert_eq!(
+        mode_of(&config),
+        0o600,
+        "config.toml must also be reclamped"
     );
     // The byte-identical early return is exactly the path a repeat install
     // takes; the clamp must happen there AND be reported, not swallowed.
@@ -347,10 +505,12 @@ fn install_writes_providers_toml_0600_and_reclamps_a_loosened_file() {
         Some(0o644),
         "a loosened key file must be reported loudly, not clamped in silence"
     );
+    assert_eq!(report.config_reclamped_from, Some(0o644));
 
     // And once it is back at 0600, nothing is reported.
     let quiet = install_at(dir.path(), PRESETS, false, &ctx()).expect("third install");
     assert_eq!(quiet.reclamped_from, None);
+    assert_eq!(quiet.config_reclamped_from, None);
 }
 
 #[cfg(unix)]
@@ -365,19 +525,174 @@ fn a_mode_clamp_that_cannot_run_is_an_error_not_a_silent_shrug() {
 }
 
 #[test]
-fn install_never_creates_or_touches_config_toml() {
+fn gx_only_install_does_not_create_or_touch_config_toml() {
     let dir = home();
-    let config = dir.path().join("config.toml");
+    let config = config_toml(dir.path());
     fs::write(&config, "[ui]\ncompact_mode = true\n").unwrap();
     let before = fs::read_to_string(&config).unwrap();
 
-    install_at(dir.path(), PRESETS, false, &ctx()).expect("install");
-    assert_eq!(fs::read_to_string(&config).unwrap(), before);
+    install_at(dir.path(), &gx_only_presets(), false, &ctx()).expect("install");
+    assert_eq!(
+        fs::read_to_string(&config).unwrap(),
+        before,
+        "a gx-only install must leave config.toml untouched"
+    );
 
-    // And with no config.toml at all, install must not invent one.
+    // And with no config.toml at all, a gx-only install must not invent one.
     let empty = home();
-    install_at(empty.path(), PRESETS, false, &ctx()).expect("install");
-    assert!(!empty.path().join("config.toml").exists());
+    install_at(empty.path(), &gx_only_presets(), false, &ctx()).expect("install");
+    assert!(!config_toml(empty.path()).exists());
+}
+
+#[test]
+fn stock_compatible_install_creates_config_toml_and_preserves_unrelated_tables() {
+    let dir = home();
+    let config = config_toml(dir.path());
+    fs::write(
+        &config,
+        "[ui]\ncompact_mode = true\n\n[cli]\nhide_reasoning = true\n",
+    )
+    .unwrap();
+
+    install_at(dir.path(), PRESETS, false, &ctx()).expect("install");
+    let parsed = parse_config(dir.path());
+    assert_eq!(
+        parsed["ui"]["compact_mode"].as_bool(),
+        Some(true),
+        "existing [ui] must survive a stock-compatible install"
+    );
+    assert_eq!(parsed["cli"]["hide_reasoning"].as_bool(), Some(true));
+    assert!(parsed["model_providers"].get("meta").is_some());
+    assert!(parsed["model_providers"].get("zai-coding-plan").is_some());
+    assert!(parsed["model_providers"].get("openrouter").is_some());
+    assert!(parsed["model_providers"].get("fireworks").is_none());
+
+    // And with no config.toml at all, a stock-compatible install creates one.
+    let empty = home();
+    install_at(empty.path(), &stock_presets(), false, &ctx()).expect("install");
+    assert!(config_toml(empty.path()).exists());
+    assert!(
+        !providers_path(empty.path()).exists(),
+        "a stock-only install must not create providers.toml"
+    );
+    let created = parse_config(empty.path());
+    assert!(created["model_providers"].get("meta").is_some());
+    assert!(created["model"].get("muse-spark-1.3").is_some());
+    assert!(created["model"].get("muse-spark-1.3-contributor").is_some());
+}
+
+#[test]
+fn install_migrates_stock_compatible_overlay_from_providers_toml_to_config_toml() {
+    // Pre-partition gx wrote GLM/OpenRouter into providers.toml. After the
+    // split those tables must move to config.toml (with api_key) so the
+    // overlay cannot shadow.
+    let dir = home();
+    fs::write(config_toml(dir.path()), "[ui]\ncompact_mode = true\n").unwrap();
+    fs::write(
+        providers_path(dir.path()),
+        r#"[model_providers.openrouter]
+base_url = "https://openrouter.ai/api/v1"
+api_backend = "chat_completions"
+env_key = "OPENROUTER_API_KEY"
+api_key = "sk-test-not-real"
+
+[model."openrouter/minimax-m3"]
+model = "minimax/minimax-m3"
+model_provider = "openrouter"
+context_window = 1048576
+stream_tool_calls = false
+
+[model_providers.fireworks]
+base_url = "https://api.fireworks.ai/inference/v1"
+api_backend = "chat_completions"
+env_key = "FIREWORKS_API_KEY"
+"#,
+    )
+    .unwrap();
+
+    let report = install_at(dir.path(), PRESETS, false, &ctx()).expect("install");
+    let config = parse_config(dir.path());
+    let providers = parse_providers(dir.path());
+
+    assert_eq!(
+        config["model_providers"]["openrouter"]["api_key"].as_str(),
+        Some("sk-test-not-real"),
+        "the overlay api_key must land on config.toml, not be dropped"
+    );
+    assert_eq!(config["ui"]["compact_mode"].as_bool(), Some(true));
+    assert!(
+        providers
+            .get("model_providers")
+            .and_then(|t| t.get("openrouter"))
+            .is_none(),
+        "openrouter must not remain in providers.toml:\n{}",
+        providers_body(dir.path())
+    );
+    assert!(
+        providers
+            .get("model")
+            .and_then(|t| t.get("openrouter/minimax-m3"))
+            .is_none(),
+        "openrouter models must not remain in providers.toml"
+    );
+    assert!(
+        providers["model_providers"].get("fireworks").is_some(),
+        "gx-only Fireworks must stay in providers.toml"
+    );
+    assert!(
+        report
+            .migrated_from_providers
+            .contains(&"model_providers.openrouter".to_owned()),
+        "{:?}",
+        report.migrated_from_providers
+    );
+    assert!(
+        report
+            .migrated_from_providers
+            .contains(&r#"model."openrouter/minimax-m3""#.to_owned()),
+        "{:?}",
+        report.migrated_from_providers
+    );
+    let debug = format!("{report:?}");
+    assert!(
+        !debug.contains("sk-test-not-real"),
+        "migrated api_key leaked into the report: {debug}"
+    );
+}
+
+#[test]
+fn install_does_not_write_providers_toml_when_config_apply_fails() {
+    let dir = home();
+    fs::write(
+        config_toml(dir.path()),
+        "model_providers = \"managed elsewhere\"\n",
+    )
+    .unwrap();
+
+    let err = install_at(dir.path(), PRESETS, false, &ctx()).expect_err("must abort");
+    assert!(err.to_string().contains("is not a table"), "got: {err}");
+    assert!(
+        !providers_path(dir.path()).exists(),
+        "a failed config.toml apply must not create providers.toml"
+    );
+
+    // An existing providers.toml must stay byte-identical — gx-only apply
+    // would have added fields if we wrote before the config.toml failure.
+    let dir = home();
+    let existing =
+        "[model_providers.fireworks]\nbase_url = \"https://api.fireworks.ai/inference/v1\"\n";
+    fs::write(providers_path(dir.path()), existing).unwrap();
+    fs::write(
+        config_toml(dir.path()),
+        "model_providers = \"managed elsewhere\"\n",
+    )
+    .unwrap();
+    install_at(dir.path(), PRESETS, false, &ctx()).expect_err("must abort");
+    assert_eq!(
+        providers_body(dir.path()),
+        existing,
+        "providers.toml must be unchanged when config.toml apply fails"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -889,7 +1204,7 @@ fn set_key_writes_api_key_and_unset_key_removes_it() {
         Some("FIREWORKS_API_KEY")
     );
 
-    assert!(unset_key_at(dir.path(), "fireworks").expect("unset-key"));
+    assert!(unset_key_at(dir.path(), "fireworks").expect("unset-key").0);
     let parsed = parse_providers(dir.path());
     assert!(
         parsed["model_providers"]["fireworks"]
@@ -904,7 +1219,11 @@ fn set_key_writes_api_key_and_unset_key_removes_it() {
     );
 
     // Removing a key that is not there is a no-op, not an error.
-    assert!(!unset_key_at(dir.path(), "fireworks").expect("second unset-key"));
+    assert!(
+        !unset_key_at(dir.path(), "fireworks")
+            .expect("second unset-key")
+            .0
+    );
 }
 
 #[cfg(unix)]
@@ -931,8 +1250,8 @@ fn set_key_preserves_comments_and_other_entries() {
         &path,
         r#"# keep me
 
-[model_providers.openrouter]
-base_url = "https://openrouter.ai/api/v1"
+[model_providers.fireworks]
+base_url = "https://api.fireworks.ai/inference/v1"
 
 [model_providers.my-own]
 base_url = "https://mine.example.test/v1"
@@ -940,11 +1259,14 @@ base_url = "https://mine.example.test/v1"
     )
     .unwrap();
 
-    set_key_at(dir.path(), "openrouter", "sk-or-secret-9876").expect("set-key");
+    set_key_at(dir.path(), "fireworks", "fw_secret_value_1234").expect("set-key");
     let body = providers_body(dir.path());
     assert!(body.contains("# keep me"), "{body}");
     assert!(body.contains("[model_providers.my-own]"), "{body}");
-    assert!(body.contains(r#"api_key = "sk-or-secret-9876""#), "{body}");
+    assert!(
+        body.contains(r#"api_key = "fw_secret_value_1234""#),
+        "{body}"
+    );
 }
 
 #[test]
@@ -1007,15 +1329,15 @@ fn set_key_keeps_the_comments_attached_to_the_value_it_replaces() {
     let dir = home();
     fs::write(
         providers_path(dir.path()),
-        r#"[model_providers.openrouter]
-base_url = "https://openrouter.ai/api/v1"
+        r#"[model_providers.fireworks]
+base_url = "https://api.fireworks.ai/inference/v1"
 # rotated quarterly
 api_key = "old" # vault-managed
 "#,
     )
     .unwrap();
 
-    set_key_at(dir.path(), "openrouter", "sk-or-new-secret-4321").expect("set-key");
+    set_key_at(dir.path(), "fireworks", "fw_new_secret_4321").expect("set-key");
     let body = providers_body(dir.path());
     assert!(
         body.contains("# vault-managed"),
@@ -1025,10 +1347,7 @@ api_key = "old" # vault-managed
         body.contains("# rotated quarterly"),
         "the comment above the key was lost:\n{body}"
     );
-    assert!(
-        body.contains(r#"api_key = "sk-or-new-secret-4321""#),
-        "{body}"
-    );
+    assert!(body.contains(r#"api_key = "fw_new_secret_4321""#), "{body}");
     assert!(
         !body.contains(r#""old""#),
         "the old value survived:\n{body}"
@@ -1116,6 +1435,133 @@ fn piped_key_round_trips_into_providers_toml() {
     );
 }
 
+#[test]
+fn set_key_on_stock_compatible_provider_writes_config_toml_not_providers() {
+    let dir = home();
+    install_at(dir.path(), PRESETS, false, &ctx()).expect("install");
+    let providers_before = providers_body(dir.path());
+
+    set_key_at(dir.path(), "meta", "sk-test-not-real").expect("set-key");
+
+    let parsed = parse_config(dir.path());
+    assert_eq!(
+        parsed["model_providers"]["meta"]["api_key"].as_str(),
+        Some("sk-test-not-real")
+    );
+    assert_eq!(
+        providers_body(dir.path()),
+        providers_before,
+        "a stock-compatible set-key must not touch providers.toml"
+    );
+    assert!(
+        parse_providers(dir.path())
+            .get("model_providers")
+            .and_then(|t| t.get("meta"))
+            .is_none(),
+        "meta must not be copied into providers.toml"
+    );
+}
+
+#[test]
+fn set_key_on_fireworks_still_writes_providers_toml() {
+    let dir = home();
+    install_at(dir.path(), PRESETS, false, &ctx()).expect("install");
+    let config_before = config_body(dir.path());
+
+    set_key_at(dir.path(), "fireworks", "sk-test-not-real").expect("set-key");
+
+    let parsed = parse_providers(dir.path());
+    assert_eq!(
+        parsed["model_providers"]["fireworks"]["api_key"].as_str(),
+        Some("sk-test-not-real")
+    );
+    assert_eq!(
+        config_body(dir.path()),
+        config_before,
+        "a gx-only set-key must not touch config.toml"
+    );
+}
+
+#[test]
+fn unset_key_removes_api_key_from_config_toml_for_meta() {
+    let dir = home();
+    install_at(dir.path(), PRESETS, false, &ctx()).expect("install");
+    set_key_at(dir.path(), "meta", "sk-test-not-real").expect("set-key");
+    assert_eq!(
+        parse_config(dir.path())["model_providers"]["meta"]["api_key"].as_str(),
+        Some("sk-test-not-real")
+    );
+
+    assert!(unset_key_at(dir.path(), "meta").expect("unset-key").0);
+    assert!(
+        parse_config(dir.path())["model_providers"]["meta"]
+            .get("api_key")
+            .is_none(),
+        "api_key must be gone from config.toml"
+    );
+}
+
+#[test]
+fn set_key_auto_installs_stock_compatible_preset_into_config_toml() {
+    let dir = home();
+    set_key_at(dir.path(), "meta", "sk-test-not-real").expect("set-key");
+    let parsed = parse_config(dir.path());
+    assert_eq!(
+        parsed["model_providers"]["meta"]["base_url"].as_str(),
+        Some("https://api.meta.ai/v1")
+    );
+    assert_eq!(
+        parsed["model_providers"]["meta"]["api_key"].as_str(),
+        Some("sk-test-not-real")
+    );
+    assert!(parsed["model"].get("muse-spark-1.3").is_some());
+    assert!(parsed["model"].get("muse-spark-1.3-contributor").is_some());
+    assert!(
+        !providers_path(dir.path()).exists(),
+        "auto-install of a stock-compatible preset must not create providers.toml"
+    );
+}
+
+#[test]
+fn set_key_auto_install_migrates_stock_compatible_overlay_out_of_providers() {
+    let dir = home();
+    fs::write(
+        providers_path(dir.path()),
+        r#"[model_providers.openrouter]
+base_url = "https://openrouter.ai/api/v1"
+api_backend = "chat_completions"
+env_key = "OPENROUTER_API_KEY"
+api_key = "sk-old-overlay-not-real"
+
+[model."openrouter/minimax-m3"]
+model = "minimax/minimax-m3"
+model_provider = "openrouter"
+
+[model_providers.fireworks]
+base_url = "https://api.fireworks.ai/inference/v1"
+env_key = "FIREWORKS_API_KEY"
+"#,
+    )
+    .unwrap();
+
+    set_key_at(dir.path(), "openrouter", "sk-test-not-real").expect("set-key");
+
+    assert_eq!(
+        parse_config(dir.path())["model_providers"]["openrouter"]["api_key"].as_str(),
+        Some("sk-test-not-real")
+    );
+    let providers = parse_providers(dir.path());
+    assert!(
+        providers
+            .get("model_providers")
+            .and_then(|t| t.get("openrouter"))
+            .is_none(),
+        "the overlay must be gone so it cannot shadow the new key:\n{}",
+        providers_body(dir.path())
+    );
+    assert!(providers["model_providers"].get("fireworks").is_some());
+}
+
 // ---------------------------------------------------------------------------
 // status
 // ---------------------------------------------------------------------------
@@ -1149,8 +1595,8 @@ fn status_covers_configured_unconfigured_and_env_key_cases() {
         .iter()
         .find(|p| p.id == "zai-coding-plan")
         .expect("zai present");
-    assert!(zai.in_providers && !zai.in_config);
-    assert_eq!(zai.key, KeySource::ProvidersFile("…efgh".to_owned()));
+    assert!(!zai.in_providers && zai.in_config);
+    assert_eq!(zai.key, KeySource::ConfigFile("…efgh".to_owned()));
     assert_eq!(
         zai.models,
         vec!["glm-5.3".to_owned(), "glm-5.3-flash".to_owned()]
@@ -1194,9 +1640,27 @@ fn status_covers_configured_unconfigured_and_env_key_cases() {
         "an env_key would shadow the auth helper"
     );
 
+    let meta = report
+        .providers
+        .iter()
+        .find(|p| p.id == "meta")
+        .expect("meta present");
+    assert!(!meta.in_providers && meta.in_config);
+    assert_eq!(
+        meta.models,
+        vec![
+            "muse-spark-1.3".to_owned(),
+            "muse-spark-1.3-contributor".to_owned()
+        ]
+    );
+
     // Rendered shapes.
     assert!(
         rendered.contains("configured   yes  (providers.toml)"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("configured   yes  (config.toml)"),
         "{rendered}"
     );
     // Every preset installs, so the "not configured" line comes from a
@@ -1208,7 +1672,7 @@ fn status_covers_configured_unconfigured_and_env_key_cases() {
     );
     assert!(rendered.contains("hand-written"), "{rendered}");
     assert!(
-        rendered.contains("key          yes  …efgh  (providers.toml api_key)"),
+        rendered.contains("key          yes  …efgh  (config.toml api_key)"),
         "{rendered}"
     );
     assert!(
@@ -1641,13 +2105,29 @@ fn install_and_set_key_never_echo_a_malformed_providers_toml_source_line() {
 
 #[test]
 fn install_never_echoes_a_malformed_config_toml_source_line() {
-    // A config.toml that does not parse is tolerated (it belongs to stock grok
-    // too) — and must not be quoted back on the way past.
+    // A config.toml that does not parse must abort (stock-compatible presets
+    // write there) — and must not be quoted back on the way out.
     let dir = home();
-    fs::write(dir.path().join("config.toml"), leaky_toml()).unwrap();
-    let report = install_at(dir.path(), PRESETS, false, &ctx()).expect("install proceeds");
-    assert_no_key_fragment("install report", &format!("{report:?}"));
-    assert_no_key_fragment("providers.toml body", &providers_body(dir.path()));
+    let config = config_toml(dir.path());
+    fs::write(&config, leaky_toml()).unwrap();
+    let before = fs::read_to_string(&config).unwrap();
+    let err = install_at(dir.path(), PRESETS, false, &ctx()).expect_err("must abort");
+    let text = format!("{err:#}");
+    assert!(text.contains("not valid TOML"), "got: {text}");
+    assert!(
+        text.contains("malformed TOML at line"),
+        "no position in: {text}"
+    );
+    assert_no_key_fragment("install error chain", &text);
+    assert_eq!(
+        fs::read_to_string(&config).unwrap(),
+        before,
+        "malformed config.toml must be left untouched"
+    );
+    assert!(
+        !providers_path(dir.path()).exists(),
+        "install must not write providers.toml when config.toml is malformed"
+    );
 }
 
 #[test]
@@ -2025,6 +2505,11 @@ fn every_preset_is_shaped_for_the_providers_layer_allowlist() {
                     "{} must not list adaptive: grok's ReasoningEffort enum cannot express it",
                     model.id
                 );
+                assert!(
+                    !list.contains(&"ultra"),
+                    "{} must not list ultra: grok's ReasoningEffort enum cannot express it",
+                    model.id
+                );
             }
         }
     }
@@ -2044,6 +2529,28 @@ fn every_preset_is_shaped_for_the_providers_layer_allowlist() {
     let api = PRESETS.iter().find(|p| p.id == "openai-api").unwrap();
     assert!(!api.rejects_static_key);
     assert!(api.fields.iter().any(|f| f.key == "env_key"));
+
+    // Explicit, not inferred from the note string.
+    for id in ["zai-coding-plan", "openrouter", "meta"] {
+        assert!(
+            PRESETS
+                .iter()
+                .find(|p| p.id == id)
+                .unwrap()
+                .stock_compatible,
+            "{id} must write to config.toml"
+        );
+    }
+    for id in ["fireworks", "openai-codex", "openai-api"] {
+        assert!(
+            !PRESETS
+                .iter()
+                .find(|p| p.id == id)
+                .unwrap()
+                .stock_compatible,
+            "{id} must stay in providers.toml"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2268,9 +2775,11 @@ extra_headers = { originator = "gx", "x-team" = "platform" }
 fn install_is_still_byte_identical_on_a_second_run_with_the_openai_presets() {
     let dir = home();
     install_at(dir.path(), PRESETS, false, &ctx()).expect("first install");
-    let first = providers_body(dir.path());
+    let first_providers = providers_body(dir.path());
+    let first_config = config_body(dir.path());
     let report = install_at(dir.path(), PRESETS, false, &ctx()).expect("second install");
-    assert_eq!(providers_body(dir.path()), first);
+    assert_eq!(providers_body(dir.path()), first_providers);
+    assert_eq!(config_body(dir.path()), first_config);
     assert!(!report.changed);
     assert!(report.refreshed_fields.is_empty());
 }

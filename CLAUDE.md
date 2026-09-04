@@ -167,14 +167,15 @@ keep them from stepping on each other:
   makes every update code path a no-op for a gx build. `gx update` prints `gx manages
   its own releases — see docs/gx/README.md` and exits 0. Never reintroduce a path that
   lets a gx build consume a stock grok release, or vice versa.
-- **`providers.toml` vs `config.toml`: NEVER put a fork-only provider or model in the
-  shared `config.toml`.** `config.toml` is byte-for-byte shared with stock grok — an
-  entry stock grok doesn't understand (a third-party `model_provider`, an `api_backend`
-  it has no client for) will 400 at request time on stock grok. Every gx-only
-  provider/model entry belongs in `$GROK_HOME/providers.toml`
-  (`xai_grok_config::providers_layer`), which only a gx build ever reads. `gx providers
-  install` is the only writer of the shipped presets, and it never writes to
-  `config.toml` — check that invariant holds for any new preset or command you add here.
+- **`providers.toml` vs `config.toml`: NEVER put a gx-only provider or model in the
+  shared `config.toml`.** Fireworks and openai-codex (and openai-api) stay in
+  `$GROK_HOME/providers.toml` (`xai_grok_config::providers_layer`), which only a gx
+  build ever reads — an entry stock grok doesn't understand (per-message `model_id` /
+  strict schemas, `codex_compat`, an `api_backend` it has no client for) will 400 at
+  request time on stock grok. **Stock-compatible** presets (GLM, OpenRouter, Meta) are
+  written to `config.toml` by `gx providers install` so stock grok can use them.
+  `providers.toml` remains the gx-only overlay for the rest. Do not write a
+  stock-compatible entry into both files (the overlay would shadow for gx).
 
 ## Secrets
 

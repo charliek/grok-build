@@ -1,19 +1,25 @@
-//! gx: `gx providers` — manage the gx-only providers layer,
-//! `$GROK_HOME/providers.toml`.
+//! gx: `gx providers` — manage third-party provider presets.
 //!
-//! Stock `grok` never reads `providers.toml`
-//! ([`xai_grok_config::providers_layer`]), so every gx-only model/provider
-//! entry lives here instead of in the `config.toml` both binaries share. This
-//! module owns the CLI surface for that file:
+//! Two files, partitioned by whether stock `grok` can consume the shape:
 //!
-//! - `install` — merge the shipped presets into `providers.toml` with
+//! - **Stock-compatible** presets (GLM, OpenRouter, Meta) merge into the shared
+//!   `$GROK_HOME/config.toml` so stock grok can read them.
+//! - **gx-only** presets (Fireworks, openai-codex, openai-api) merge into
+//!   `$GROK_HOME/providers.toml` ([`xai_grok_config::providers_layer`]), which
+//!   stock grok never reads. That overlay still wins for gx, so a stock-
+//!   compatible entry must not also be written there (it would shadow).
+//!
+//! This module owns the CLI surface for both files:
+//!
+//! - `install` — merge the shipped presets into the matching file with
 //!   `toml_edit`, preserving comments, hand-written entries, and unknown
 //!   fields. Adds what is missing; upgrades a field only while its value still
 //!   equals a **shipped default** (current or older); leaves user-modified
 //!   values alone unless `--force`.
-//! - `set-key` / `unset-key` — write or remove `[model_providers.<id>].api_key`.
-//!   The key is never a positional argument: it comes from a no-echo prompt on
-//!   a TTY, or from piped stdin.
+//! - `set-key` / `unset-key` — write or remove `[model_providers.<id>].api_key`
+//!   in the same file `install` uses for that provider. The key is never a
+//!   positional argument: it comes from a no-echo prompt on a TTY, or from
+//!   piped stdin.
 //! - `status` — per-provider configuration, redacted key material, key source,
 //!   model counts, plus the `~/.codex/auth.json` view for `openai-codex`.
 //! - `login openai` — delegate to `codex login` (gx runs no OAuth flow of its
@@ -23,18 +29,19 @@
 //!   [`crate::openai_codex_auth`].
 //!
 //! Invariants:
-//! - `config.toml` is **never** written by this module. Not one code path.
-//! - `providers.toml` is written atomically ([`xai_grok_config::fs_atomic`])
-//!   with mode 0600, under an exclusive advisory lock on
-//!   `providers.toml.lock` so concurrent commands cannot drop each other's
-//!   writes.
+//! - gx-only provider/model entries never go in `config.toml`.
+//! - Both files are written atomically ([`xai_grok_config::fs_atomic`]) with
+//!   mode 0600, under an exclusive advisory lock on `providers.toml.lock` so
+//!   concurrent commands cannot drop each other's writes (one lock covers both
+//!   files).
 //! - No key material ever reaches argv, tracing, or an error message; `status`
 //!   shows at most the last 4 characters of a key. That includes **parse
 //!   diagnostics**: `toml`/`toml_edit` errors echo the offending source line,
 //!   so nothing here ever formats one — see [`parse_position`].
 //! - Every read of `providers.toml` / `config.toml` passes the same pre-read
 //!   gate the runtime layer uses (regular file, size capped) before the path is
-//!   opened.
+//!   opened. A `config.toml` that exists but is not valid TOML aborts rather
+//!   than being overwritten.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -48,7 +55,8 @@ use clap::Subcommand;
 
 const PROVIDERS_AFTER_HELP: &str = "\
 Examples:
-  # Write the shipped presets into ~/.grok/providers.toml (never config.toml)
+  # Stock-compatible presets (GLM, OpenRouter, Meta) -> config.toml
+  # gx-only presets (Fireworks, openai-codex, openai-api) -> providers.toml
   gx providers install
 
   # Store a key (prompted, never echoed; never pass it as an argument)
@@ -72,7 +80,8 @@ pub struct ProvidersArgs {
 
 #[derive(Debug, Subcommand, Clone)]
 pub enum ProvidersCommand {
-    /// Install or update the shipped provider presets in providers.toml
+    /// Install or update the shipped provider presets (stock-compatible into
+    /// config.toml, gx-only into providers.toml)
     Install {
         /// Overwrite values you have edited by hand with the shipped defaults.
         #[arg(long)]
@@ -137,17 +146,33 @@ fn run_login_openai() -> Result<()> {
     std::process::exit(status.code().unwrap_or(1))
 }
 
-/// Sessions read `providers.toml` once at startup; there is no hot-reload
-/// (documented on the providers layer), so every mutating command says so.
-const RESTART_NOTICE: &str = "Restart any running gx sessions to pick up provider changes (providers.toml \
+/// Sessions read config at startup; there is no hot-reload (documented on the
+/// providers layer), so every mutating command says so.
+const RESTART_NOTICE_PROVIDERS: &str = "Restart any running gx sessions to pick up provider changes (providers.toml \
      is read at startup; there is no hot-reload).";
+const RESTART_NOTICE_CONFIG: &str = "Restart any running gx or grok sessions to pick up provider changes \
+     (config.toml is read at startup; there is no hot-reload).";
+const RESTART_NOTICE_BOTH: &str = "Restart any running gx or grok sessions to pick up provider changes \
+     (config.toml and providers.toml are read at startup; there is no hot-reload).";
 
-/// A stock build compiled from this source would write a file nothing reads.
+fn restart_notice(config_changed: bool, providers_changed: bool) -> Option<&'static str> {
+    match (config_changed, providers_changed) {
+        (true, true) => Some(RESTART_NOTICE_BOTH),
+        (true, false) => Some(RESTART_NOTICE_CONFIG),
+        (false, true) => Some(RESTART_NOTICE_PROVIDERS),
+        (false, false) => None,
+    }
+}
+
+/// A stock build compiled from this source still writes stock-compatible
+/// entries to config.toml (stock grok reads those) but gx-only entries in
+/// providers.toml would have no effect.
 fn warn_if_not_gx() {
     if !xai_grok_version::is_gx_build() {
         eprintln!(
-            "warning: this is not a gx build; only gx reads providers.toml, so these \
-             entries will have no effect on this binary."
+            "warning: this is not a gx build; gx-only entries in providers.toml will \
+             have no effect on this binary. Stock-compatible entries in config.toml \
+             still apply."
         );
     }
 }
@@ -436,6 +461,10 @@ pub(crate) struct ProviderPreset {
     /// where a static `api_key` outranks — and therefore silently disables —
     /// the auth helper that is the whole point of the entry.
     pub rejects_static_key: bool,
+    /// Stock grok can consume this shape, so `install` / `set-key` /
+    /// `unset-key` write it to the shared `config.toml`. gx-only presets
+    /// (`false`) stay in `providers.toml`.
+    pub stock_compatible: bool,
     /// Printed by `install` after the entry is written.
     pub note: Option<&'static str>,
     pub fields: &'static [PresetField],
@@ -455,8 +484,8 @@ const fn l(v: &'static [&'static str]) -> PresetValue {
     PresetValue::StrList(v)
 }
 
-const ALSO_WORKS_ON_STOCK: &str = "this shape also works in config.toml on stock grok; gx installs it to \
-     providers.toml so the shared config.toml stays untouched.";
+const ALSO_WORKS_ON_STOCK: &str = "this shape also works in config.toml on stock grok; gx installs it \
+     there so stock grok can read it.";
 
 // -- GLM (Z.AI coding plan) --------------------------------------------------
 
@@ -646,6 +675,74 @@ const OPENROUTER_GPT_LUNA_FIELDS: &[PresetField] = &[
     OPENROUTER_GPT_SUPPORTS_EFFORT,
     OPENROUTER_GPT_EFFORT,
     OPENROUTER_GPT_EFFORTS,
+];
+
+// -- Meta (Muse Spark) -------------------------------------------------------
+//
+// Live probe against Meta's Chat Completions API (2026-09-03) confirmed it
+// validates `reasoning_effort` and 400s with the accepted list on an invalid
+// value. The deserializer names `none|minimal|low|medium|high|xhigh|max`;
+// Muse Spark 1.3 then rejects `none` and `max` (`Supported values: [minimal,
+// low, medium, high, xhigh]`) and rejects `ultra` (`unknown variant`). The
+// shipped menu is exactly those five. Default `high` matches Meta's
+// coding-agents / Muse CLI baseline. `ultra` is also not a grok
+// `ReasoningEffort` variant, so it would be unlistable even if the API took
+// it.
+
+const META_PROVIDER_FIELDS: &[PresetField] = &[
+    PresetField::new("base_url", &[s("https://api.meta.ai/v1")]),
+    PresetField::new("api_backend", &[s("chat_completions")]),
+    PresetField::new("env_key", &[l(&["META_API_KEY", "MODEL_API_KEY"])]),
+];
+
+const META_MODEL_PROVIDER: PresetField = PresetField::new("model_provider", &[s("meta")]);
+const META_CONTEXT_WINDOW: PresetField = PresetField::new("context_window", &[i(1_048_576)]);
+const META_MAX_COMPLETION_TOKENS: PresetField =
+    PresetField::new("max_completion_tokens", &[i(131_072)]);
+const META_NO_STREAM_TOOL_CALLS: PresetField = PresetField::new("stream_tool_calls", &[b(false)]);
+const META_SUPPORTS_REASONING_EFFORT: PresetField =
+    PresetField::new("supports_reasoning_effort", &[b(true)]);
+const META_REASONING_EFFORT: PresetField = PresetField::new("reasoning_effort", &[s("high")]);
+const META_REASONING_EFFORTS: PresetField = PresetField::new(
+    "reasoning_efforts",
+    &[l(&["minimal", "low", "medium", "high", "xhigh"])],
+);
+
+const META_SPARK_FIELDS: &[PresetField] = &[
+    PresetField::new("model", &[s("muse-spark-1.3")]),
+    PresetField::new("name", &[s("Muse Spark 1.3 (Meta)")]),
+    PresetField::new(
+        "description",
+        &[s(
+            "Muse Spark 1.3 via Meta Model API. Prompts are not used for training.",
+        )],
+    ),
+    META_MODEL_PROVIDER,
+    META_CONTEXT_WINDOW,
+    META_MAX_COMPLETION_TOKENS,
+    META_NO_STREAM_TOOL_CALLS,
+    META_SUPPORTS_REASONING_EFFORT,
+    META_REASONING_EFFORT,
+    META_REASONING_EFFORTS,
+];
+
+const META_SPARK_CONTRIBUTOR_FIELDS: &[PresetField] = &[
+    PresetField::new("model", &[s("muse-spark-1.3-contributor")]),
+    PresetField::new("name", &[s("Muse Spark 1.3 Contributor (Meta)")]),
+    PresetField::new(
+        "description",
+        &[s(
+            "Discounted Muse Spark 1.3. Your content, including inter-session messages, \
+             may be used for product improvement.",
+        )],
+    ),
+    META_MODEL_PROVIDER,
+    META_CONTEXT_WINDOW,
+    META_MAX_COMPLETION_TOKENS,
+    META_NO_STREAM_TOOL_CALLS,
+    META_SUPPORTS_REASONING_EFFORT,
+    META_REASONING_EFFORT,
+    META_REASONING_EFFORTS,
 ];
 
 // -- Fireworks ---------------------------------------------------------------
@@ -893,6 +990,7 @@ pub(crate) const PRESETS: &[ProviderPreset] = &[
         label: "GLM (Z.AI coding plan)",
         install: true,
         rejects_static_key: false,
+        stock_compatible: true,
         note: Some(ALSO_WORKS_ON_STOCK),
         fields: ZAI_PROVIDER_FIELDS,
         models: &[
@@ -911,6 +1009,7 @@ pub(crate) const PRESETS: &[ProviderPreset] = &[
         label: "OpenRouter",
         install: true,
         rejects_static_key: false,
+        stock_compatible: true,
         note: Some(ALSO_WORKS_ON_STOCK),
         fields: OPENROUTER_PROVIDER_FIELDS,
         models: &[
@@ -933,10 +1032,30 @@ pub(crate) const PRESETS: &[ProviderPreset] = &[
         ],
     },
     ProviderPreset {
+        id: "meta",
+        label: "Meta Model API",
+        install: true,
+        rejects_static_key: false,
+        stock_compatible: true,
+        note: Some(ALSO_WORKS_ON_STOCK),
+        fields: META_PROVIDER_FIELDS,
+        models: &[
+            ModelPreset {
+                id: "muse-spark-1.3",
+                fields: META_SPARK_FIELDS,
+            },
+            ModelPreset {
+                id: "muse-spark-1.3-contributor",
+                fields: META_SPARK_CONTRIBUTOR_FIELDS,
+            },
+        ],
+    },
+    ProviderPreset {
         id: "fireworks",
         label: "Fireworks",
         install: true,
         rejects_static_key: false,
+        stock_compatible: false,
         note: None,
         fields: FIREWORKS_PROVIDER_FIELDS,
         models: &[
@@ -967,6 +1086,7 @@ pub(crate) const PRESETS: &[ProviderPreset] = &[
         label: "OpenAI (ChatGPT/Codex plan)",
         install: true,
         rejects_static_key: true,
+        stock_compatible: false,
         note: Some(OPENAI_CODEX_NOTE),
         fields: OPENAI_CODEX_PROVIDER_FIELDS,
         models: &[
@@ -989,6 +1109,7 @@ pub(crate) const PRESETS: &[ProviderPreset] = &[
         label: "OpenAI (API key)",
         install: true,
         rejects_static_key: false,
+        stock_compatible: false,
         note: Some(OPENAI_API_NOTE),
         fields: OPENAI_API_PROVIDER_FIELDS,
         models: &[],
@@ -1158,14 +1279,44 @@ pub(crate) struct InstallReport {
     pub skipped_identical_in_config: Vec<String>,
     /// Entries present in both files whose **full** tables differ.
     pub shadows_config: Vec<ShadowConflict>,
-    /// Whether the rendered document differs from what was on disk.
+    /// Stock-compatible entries relocated out of providers.toml so they cannot
+    /// shadow the config.toml copy gx now installs. Paths only — never values
+    /// (`api_key` may have been copied).
+    pub migrated_from_providers: Vec<String>,
+    /// Whether either file's rendered document differs from what was on disk.
     pub changed: bool,
+    /// Whether config.toml's rendered document differed from what was on disk.
+    pub config_changed: bool,
+    /// Whether providers.toml's rendered document differed from what was on disk.
+    pub providers_changed: bool,
     /// The over-wide mode `install` found on providers.toml and clamped back
     /// to 0600. `Some` is a warning: the keys in it were readable by others.
     pub reclamped_from: Option<u32>,
+    /// Same as [`Self::reclamped_from`], for config.toml.
+    pub config_reclamped_from: Option<u32>,
     /// Rendered size, when it exceeds the runtime cap and the whole layer will
     /// therefore be skipped at startup.
     pub exceeds_runtime_cap: Option<u64>,
+}
+
+impl InstallReport {
+    fn merge_apply(&mut self, other: Self) {
+        self.added_entries.extend(other.added_entries);
+        self.added_fields.extend(other.added_fields);
+        self.upgraded_fields.extend(other.upgraded_fields);
+        self.refreshed_fields.extend(other.refreshed_fields);
+        self.context_notes.extend(other.context_notes);
+        self.kept_fields.extend(other.kept_fields);
+        self.forced_fields.extend(other.forced_fields);
+        self.skipped_identical_in_config
+            .extend(other.skipped_identical_in_config);
+        self.shadows_config.extend(other.shadows_config);
+        self.migrated_from_providers
+            .extend(other.migrated_from_providers);
+        if other.exceeds_runtime_cap.is_some() {
+            self.exceeds_runtime_cap = other.exceeds_runtime_cap;
+        }
+    }
 }
 
 /// Header written once, when `providers.toml` is created.
@@ -1228,6 +1379,7 @@ fn entry_table<'a>(
     doc: &'a mut toml_edit::DocumentMut,
     parent: &str,
     child: &str,
+    file_label: &str,
 ) -> Result<(&'a mut toml_edit::Table, bool)> {
     if doc.get(parent).is_none() {
         let mut table = toml_edit::Table::new();
@@ -1240,7 +1392,7 @@ fn entry_table<'a>(
         .get_mut(parent)
         .and_then(toml_edit::Item::as_table_mut)
         .with_context(|| {
-            format!("`{parent}` in providers.toml is not a table; refusing to modify it")
+            format!("`{parent}` in {file_label} is not a table; refusing to modify it")
         })?;
     let created = !parent_table.contains_key(child);
     if created {
@@ -1251,7 +1403,7 @@ fn entry_table<'a>(
         .and_then(toml_edit::Item::as_table_mut)
         .with_context(|| {
             format!(
-                "`{}` in providers.toml is not a table; refusing to modify it",
+                "`{}` in {file_label} is not a table; refusing to modify it",
                 quoted_path(parent, child)
             )
         })?;
@@ -1353,12 +1505,14 @@ fn shadow_conflict(
 /// Merge one entry (provider or model) into `doc`.
 fn apply_entry(
     doc: &mut toml_edit::DocumentMut,
-    config: Option<&toml::Value>,
+    other: Option<&toml::Value>,
     parent: &str,
     child: &str,
     fields: &[PresetField],
     force: bool,
     ctx: &PresetContext,
+    skip_identical: bool,
+    file_label: &str,
     report: &mut InstallReport,
 ) -> Result<()> {
     let path = quoted_path(parent, child);
@@ -1371,32 +1525,35 @@ fn apply_entry(
     // that reported success.
     if let Some(parent_item) = doc.get(parent) {
         if !parent_item.is_table() {
-            bail!("`{parent}` in providers.toml is not a table; refusing to modify it");
+            bail!("`{parent}` in {file_label} is not a table; refusing to modify it");
         }
         if let Some(existing) = parent_item.get(child)
             && !existing.is_table()
         {
             bail!(
-                "`{path}` in providers.toml is not a table; refusing to modify it \
+                "`{path}` in {file_label} is not a table; refusing to modify it \
                  (an inline table must be rewritten as a `[{path}]` section)"
             );
         }
     }
 
-    let state = config_state(config, parent, child, fields, ctx);
+    let state = config_state(other, parent, child, fields, ctx);
     let present = doc
         .get(parent)
         .and_then(|t| t.get(child))
         .is_some_and(toml_edit::Item::is_table);
 
-    // config.toml already carries exactly this entry: writing a byte-identical
-    // copy into providers.toml would only add a shadow to reason about.
-    if !present && state == ConfigState::Identical {
+    // For gx-only writes into providers.toml: config.toml already carries
+    // exactly this entry, so writing a byte-identical copy would only add a
+    // shadow to reason about. Stock-compatible writes into config.toml must
+    // *not* skip just because providers.toml already has a copy — that overlay
+    // would keep shadowing, and stock grok never sees it.
+    if skip_identical && !present && state == ConfigState::Identical {
         report.skipped_identical_in_config.push(path);
         return Ok(());
     }
 
-    let (table, created) = entry_table(doc, parent, child)?;
+    let (table, created) = entry_table(doc, parent, child, file_label)?;
     apply_fields(table, fields, &path, created, force, ctx, report);
     if created {
         report.added_entries.push(path);
@@ -1406,34 +1563,44 @@ fn apply_entry(
 
 /// Merge `presets` into `doc`. Pure: no I/O, so every merge rule is unit
 /// testable against a synthetic preset table.
+///
+/// `other` is the sibling file (`config.toml` when writing providers.toml, and
+/// vice versa) used for skip-identical and shadow detection. `skip_identical`
+/// is true only for gx-only writes into providers.toml.
 pub(crate) fn apply_presets(
     doc: &mut toml_edit::DocumentMut,
-    config: Option<&toml::Value>,
+    other: Option<&toml::Value>,
     presets: &[ProviderPreset],
     force: bool,
     ctx: &PresetContext,
+    skip_identical: bool,
+    file_label: &str,
 ) -> Result<InstallReport> {
     let mut report = InstallReport::default();
     for preset in presets.iter().filter(|p| p.install) {
         apply_entry(
             doc,
-            config,
+            other,
             "model_providers",
             preset.id,
             preset.fields,
             force,
             ctx,
+            skip_identical,
+            file_label,
             &mut report,
         )?;
         for model in preset.models {
             apply_entry(
                 doc,
-                config,
+                other,
                 "model",
                 model.id,
                 model.fields,
                 force,
                 ctx,
+                skip_identical,
+                file_label,
                 &mut report,
             )?;
         }
@@ -1448,60 +1615,207 @@ pub(crate) fn apply_presets(
         report.context_notes = ctx.notes.clone();
     }
     // Shadow detection runs over the *finished* document so it can compare the
-    // full tables, catching conflicts in fields no preset ships.
+    // full tables, catching conflicts in fields no preset ships. `other` is
+    // whichever file we are *not* writing; the warning text always describes
+    // providers.toml overlaying config.toml, which is the runtime order.
     for preset in presets.iter().filter(|p| p.install) {
         report
             .shadows_config
-            .extend(shadow_conflict(doc, config, "model_providers", preset.id));
+            .extend(shadow_conflict(doc, other, "model_providers", preset.id));
         for model in preset.models {
             report
                 .shadows_config
-                .extend(shadow_conflict(doc, config, "model", model.id));
+                .extend(shadow_conflict(doc, other, "model", model.id));
         }
     }
     Ok(report)
 }
 
+fn overlay_entry_present(doc: &toml_edit::DocumentMut, parent: &str, child: &str) -> bool {
+    doc.get(parent).and_then(|t| t.get(child)).is_some()
+}
+
+fn remove_overlay_entry(doc: &mut toml_edit::DocumentMut, parent: &str, child: &str) {
+    let empty = if let Some(table) = doc.get_mut(parent).and_then(toml_edit::Item::as_table_mut) {
+        table.remove(child);
+        table.is_empty()
+    } else {
+        false
+    };
+    if empty {
+        doc.remove(parent);
+    }
+}
+
+/// `Some` when the overlay table carries a non-empty `api_key`. The value is
+/// cloned so the caller can write it without holding a borrow across the
+/// config.toml mutation; it is never logged.
+fn overlay_api_key(doc: &toml_edit::DocumentMut, provider: &str) -> Option<toml_edit::Value> {
+    let v = doc
+        .get("model_providers")
+        .and_then(|t| t.get(provider))
+        .and_then(|e| e.get("api_key"))
+        .and_then(toml_edit::Item::as_value)?;
+    if v.as_str().is_some_and(|s| s.trim().is_empty()) {
+        return None;
+    }
+    Some(v.clone())
+}
+
+fn config_has_api_key(doc: &toml_edit::DocumentMut, provider: &str) -> bool {
+    doc.get("model_providers")
+        .and_then(|t| t.get(provider))
+        .and_then(|e| e.get("api_key"))
+        .and_then(toml_edit::Item::as_value)
+        .is_some_and(|v| !v.as_str().is_some_and(|s| s.trim().is_empty()))
+}
+
+/// Relocate shipped stock-compatible tables out of providers.toml so they
+/// cannot shadow the config.toml copy. Copies `api_key` first when config.toml
+/// has none. An explicit exception to "install never deletes": this is a
+/// partition move, not a catalog removal.
+fn migrate_stock_overlay(
+    providers_doc: &mut toml_edit::DocumentMut,
+    config_doc: &mut toml_edit::DocumentMut,
+    presets: &[ProviderPreset],
+) -> Result<Vec<String>> {
+    let mut migrated = Vec::new();
+    for preset in presets.iter().filter(|p| p.install && p.stock_compatible) {
+        if overlay_entry_present(providers_doc, "model_providers", preset.id) {
+            if let Some(key) = overlay_api_key(providers_doc, preset.id)
+                && !config_has_api_key(config_doc, preset.id)
+            {
+                let (table, _) =
+                    entry_table(config_doc, "model_providers", preset.id, "config.toml")?;
+                set_value_preserving_decor(table, "api_key", key);
+            }
+            remove_overlay_entry(providers_doc, "model_providers", preset.id);
+            migrated.push(quoted_path("model_providers", preset.id));
+        }
+        for model in preset.models {
+            if overlay_entry_present(providers_doc, "model", model.id) {
+                remove_overlay_entry(providers_doc, "model", model.id);
+                migrated.push(quoted_path("model", model.id));
+            }
+        }
+    }
+    Ok(migrated)
+}
+
 /// Path-injectable core of `gx providers install`.
+///
+/// Stock-compatible presets merge into `config.toml`; gx-only presets merge
+/// into `providers.toml`. Both documents are applied in memory first; only
+/// then is either file written, so a config.toml apply failure leaves
+/// providers.toml unchanged. One lock covers both files so `set-key` cannot
+/// interleave.
 pub(crate) fn install_at(
     home: &Path,
     presets: &[ProviderPreset],
     force: bool,
     ctx: &PresetContext,
 ) -> Result<InstallReport> {
-    let path = providers_path(home);
+    let providers = providers_path(home);
+    let config = config_path(home);
     // Everything below is a read-modify-write; hold the cross-process lock for
     // all of it so a concurrent `set-key` cannot be rendered away.
     let _lock = lock_providers(home)?;
-    let previous = read_existing(&path)?;
-    let mut doc = parse_document(&previous, &path)?;
-    let config = read_config_for_install(home)?;
-    let mut report = apply_presets(&mut doc, config.as_ref(), presets, force, ctx)?;
 
-    let mut rendered = doc.to_string();
-    if previous.trim().is_empty() {
-        rendered = format!("{NEW_FILE_HEADER}{rendered}");
+    let providers_previous = read_file_gated(&providers, MAX_PROVIDERS_BYTES, "providers.toml")?;
+    let mut providers_doc = parse_document(&providers_previous, &providers)?;
+    let config_previous = read_file_gated(&config, MAX_CONFIG_BYTES, "config.toml")?;
+    let mut config_doc = parse_document(&config_previous, &config)?;
+
+    let config_value = toml_value_of(&config_previous);
+    let providers_value = toml_value_of(&providers_previous);
+
+    let gx_only: Vec<ProviderPreset> = presets
+        .iter()
+        .copied()
+        .filter(|p| p.install && !p.stock_compatible)
+        .collect();
+    let stock: Vec<ProviderPreset> = presets
+        .iter()
+        .copied()
+        .filter(|p| p.install && p.stock_compatible)
+        .collect();
+
+    let mut report = InstallReport::default();
+
+    if !gx_only.is_empty() {
+        let applied = apply_presets(
+            &mut providers_doc,
+            config_value.as_ref(),
+            &gx_only,
+            force,
+            ctx,
+            true,
+            "providers.toml",
+        )?;
+        report.merge_apply(applied);
     }
-    if rendered.len() as u64 > MAX_PROVIDERS_BYTES {
-        report.exceeds_runtime_cap = Some(rendered.len() as u64);
+
+    if !stock.is_empty() {
+        let applied = apply_presets(
+            &mut config_doc,
+            providers_value.as_ref(),
+            &stock,
+            force,
+            ctx,
+            false,
+            "config.toml",
+        )?;
+        report.merge_apply(applied);
+        let migrated = migrate_stock_overlay(&mut providers_doc, &mut config_doc, &stock)?;
+        report
+            .shadows_config
+            .retain(|s| !migrated.iter().any(|p| p == &s.path));
+        report.migrated_from_providers.extend(migrated);
     }
-    let outcome = write_providers_toml(&path, &rendered, &previous)?;
-    report.changed = outcome.changed;
-    report.reclamped_from = outcome.reclamped_from;
+
+    // Writes happen only after both applies (and any overlay migration)
+    // succeeded. A non-table `model_providers` in config.toml must not leave
+    // a half-applied providers.toml behind.
+    if !gx_only.is_empty() || !report.migrated_from_providers.is_empty() {
+        let mut rendered = providers_doc.to_string();
+        if providers_previous.trim().is_empty() {
+            rendered = format!("{NEW_FILE_HEADER}{rendered}");
+        }
+        if rendered.len() as u64 > MAX_PROVIDERS_BYTES {
+            report.exceeds_runtime_cap = Some(rendered.len() as u64);
+        }
+        let outcome = write_toml_file(&providers, &rendered, &providers_previous)?;
+        report.providers_changed = outcome.changed;
+        report.reclamped_from = outcome.reclamped_from;
+    }
+
+    if !stock.is_empty() {
+        // Never stamp the providers.toml header onto config.toml: that file is
+        // shared with stock grok and may already carry [cli]/[ui]/[plugins].
+        let rendered = config_doc.to_string();
+        let outcome = write_toml_file(&config, &rendered, &config_previous)?;
+        report.config_changed = outcome.changed;
+        report.config_reclamped_from = outcome.reclamped_from;
+    }
+
+    report.changed = report.providers_changed || report.config_changed;
     Ok(report)
 }
 
 fn run_install(home: &Path, force: bool) -> Result<()> {
     warn_if_not_gx();
-    let path = providers_path(home);
+    let providers = providers_path(home);
+    let config = config_path(home);
     let report = install_at(home, PRESETS, force, &PresetContext::detect())?;
 
-    println!("{}", path.display());
+    println!("config.toml:    {}", config.display());
+    println!("providers.toml: {}", providers.display());
     if report.added_entries.is_empty()
         && report.added_fields.is_empty()
         && report.upgraded_fields.is_empty()
         && report.refreshed_fields.is_empty()
         && report.forced_fields.is_empty()
+        && report.migrated_from_providers.is_empty()
     {
         println!("  up to date — nothing to add or upgrade");
     }
@@ -1526,6 +1840,9 @@ fn run_install(home: &Path, force: bool) -> Result<()> {
     for entry in &report.skipped_identical_in_config {
         println!("  skipped   {entry} — config.toml already has an identical entry");
     }
+    for entry in &report.migrated_from_providers {
+        println!("  migrated  {entry}  (providers.toml → config.toml)");
+    }
     for shadow in &report.shadows_config {
         // Field NAMES only: `api_key` is one of the compared fields.
         eprintln!(
@@ -1539,12 +1856,13 @@ fn run_install(home: &Path, force: bool) -> Result<()> {
     for note in &report.context_notes {
         eprintln!("warning: {note}");
     }
-    warn_if_reclamped(&path, report.reclamped_from);
+    warn_if_reclamped(&providers, report.reclamped_from);
+    warn_if_reclamped(&config, report.config_reclamped_from);
     if let Some(len) = report.exceeds_runtime_cap {
         eprintln!(
             "warning: {} is {len} bytes, over the {MAX_PROVIDERS_BYTES}-byte runtime cap — \
              gx will SKIP the entire providers layer at startup until it is trimmed.",
-            path.display()
+            providers.display()
         );
     }
     for preset in PRESETS.iter().filter(|p| p.install) {
@@ -1555,9 +1873,9 @@ fn run_install(home: &Path, force: bool) -> Result<()> {
     println!();
     println!("Next: `gx providers set-key <provider>` to store a key, or export the");
     println!("provider's env_key. `gx providers status` shows what resolved.");
-    if report.changed {
+    if let Some(notice) = restart_notice(report.config_changed, report.providers_changed) {
         println!();
-        println!("{RESTART_NOTICE}");
+        println!("{notice}");
     }
     Ok(())
 }
@@ -1567,13 +1885,14 @@ fn run_install(home: &Path, force: bool) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 /// Path-injectable core of `gx providers set-key`. `key` is never logged.
-pub(crate) fn set_key_at(home: &Path, provider: &str, key: &str) -> Result<()> {
+/// Returns the file the key was written to (`config.toml` or `providers.toml`).
+pub(crate) fn set_key_at(home: &Path, provider: &str, key: &str) -> Result<PathBuf> {
     let key = key.trim();
     if key.is_empty() {
         bail!("empty key: nothing written");
     }
     // Checked before anything is opened, and regardless of whether the entry is
-    // already in providers.toml: on an OAuth provider a static key is not a
+    // already in the target file: on an OAuth provider a static key is not a
     // "second credential", it is one that *wins* over the auth helper.
     if preset_for(provider).is_some_and(|p| p.rejects_static_key) {
         bail!(
@@ -1583,15 +1902,12 @@ pub(crate) fn set_key_at(home: &Path, provider: &str, key: &str) -> Result<()> {
              $OPENAI_API_KEY for a plain API key."
         );
     }
-    let path = providers_path(home);
     let _lock = lock_providers(home)?;
-    let previous = read_existing(&path)?;
-    let mut doc = parse_document(&previous, &path)?;
+    let target = resolve_key_file(home, provider)?;
+    let previous = read_file_gated(&target.path, target.max_bytes, target.label)?;
+    let mut doc = parse_document(&previous, &target.path)?;
 
-    let known_here = doc
-        .get("model_providers")
-        .and_then(|t| t.get(provider))
-        .is_some_and(toml_edit::Item::is_table);
+    let known_here = provider_table_exists(&doc, provider);
     let preset = preset_for(provider);
     if !known_here {
         match preset {
@@ -1602,62 +1918,92 @@ pub(crate) fn set_key_at(home: &Path, provider: &str, key: &str) -> Result<()> {
                  Run `gx providers status` to see what is configured."
             ),
             // A preset the user has not installed yet: install just that one so
-            // the key lands on a complete, usable entry.
+            // the key lands on a complete, usable entry. Skip-identical is off:
+            // we need the table in *this* file to hold the key.
             Some(preset) => {
                 apply_presets(
                     &mut doc,
-                    read_config_for_install(home)?.as_ref(),
+                    None,
                     std::slice::from_ref(preset),
                     false,
                     &PresetContext::detect(),
+                    false,
+                    target.label,
                 )?;
             }
             None => bail!(
-                "unknown provider `{provider}`: not in providers.toml and not a shipped \
+                "unknown provider `{provider}`: not in {} and not a shipped \
                  preset. Known presets: {}",
+                target.label,
                 PRESETS.iter().map(|p| p.id).collect::<Vec<_>>().join(", ")
             ),
         }
     }
 
-    let (table, _) = entry_table(&mut doc, "model_providers", provider)?;
+    // A leftover stock-compatible overlay in providers.toml would shadow the
+    // api_key we are about to write into config.toml. Relocate (or drop) it
+    // under the same lock, before the config.toml write.
+    if let Some(preset) = preset.filter(|p| p.stock_compatible) {
+        let providers = providers_path(home);
+        let providers_previous =
+            read_file_gated(&providers, MAX_PROVIDERS_BYTES, "providers.toml")?;
+        let mut providers_doc = parse_document(&providers_previous, &providers)?;
+        let migrated =
+            migrate_stock_overlay(&mut providers_doc, &mut doc, std::slice::from_ref(preset))?;
+        if !migrated.is_empty() {
+            let outcome =
+                write_toml_file(&providers, &providers_doc.to_string(), &providers_previous)?;
+            warn_if_reclamped(&providers, outcome.reclamped_from);
+        }
+    }
+
+    let (table, _) = entry_table(&mut doc, "model_providers", provider, target.label)?;
     // Decor-preserving: a hand-written `api_key = "old" # vault-managed` keeps
     // its comment (and any comment lines above it) across a rotation.
     set_value_preserving_decor(table, "api_key", toml_edit::Value::from(key));
 
     let mut rendered = doc.to_string();
-    if previous.trim().is_empty() {
-        rendered = format!("{NEW_FILE_HEADER}{rendered}");
+    if previous.trim().is_empty()
+        && let Some(header) = target.new_file_header
+    {
+        rendered = format!("{header}{rendered}");
     }
-    let outcome = write_providers_toml(&path, &rendered, &previous)?;
-    warn_if_reclamped(&path, outcome.reclamped_from);
-    Ok(())
+    let outcome = write_toml_file(&target.path, &rendered, &previous)?;
+    warn_if_reclamped(&target.path, outcome.reclamped_from);
+    Ok(target.path)
 }
 
-/// Path-injectable core of `gx providers unset-key`. `Ok(false)` means there
-/// was no key to remove.
-pub(crate) fn unset_key_at(home: &Path, provider: &str) -> Result<bool> {
-    let path = providers_path(home);
+/// Path-injectable core of `gx providers unset-key`. `Ok((false, path))` means
+/// there was no key to remove; `path` is the file that was considered.
+pub(crate) fn unset_key_at(home: &Path, provider: &str) -> Result<(bool, PathBuf)> {
     let _lock = lock_providers(home)?;
-    let previous = read_existing(&path)?;
-    if previous.is_empty() && !path.exists() {
-        bail!("no providers.toml at {} — nothing to unset", path.display());
+    let target = resolve_key_file(home, provider)?;
+    let previous = read_file_gated(&target.path, target.max_bytes, target.label)?;
+    if previous.is_empty() && !target.path.exists() {
+        bail!(
+            "no {} at {} — nothing to unset",
+            target.label,
+            target.path.display()
+        );
     }
-    let mut doc = parse_document(&previous, &path)?;
+    let mut doc = parse_document(&previous, &target.path)?;
     let Some(table) = doc
         .get_mut("model_providers")
         .and_then(toml_edit::Item::as_table_mut)
         .and_then(|t| t.get_mut(provider))
         .and_then(toml_edit::Item::as_table_mut)
     else {
-        bail!("provider `{provider}` is not defined in {}", path.display());
+        bail!(
+            "provider `{provider}` is not defined in {}",
+            target.path.display()
+        );
     };
     let removed = table.remove("api_key").is_some();
     if removed {
-        let outcome = write_providers_toml(&path, &doc.to_string(), &previous)?;
-        warn_if_reclamped(&path, outcome.reclamped_from);
+        let outcome = write_toml_file(&target.path, &doc.to_string(), &previous)?;
+        warn_if_reclamped(&target.path, outcome.reclamped_from);
     }
-    Ok(removed)
+    Ok((removed, target.path))
 }
 
 /// A providers.toml found wider than 0600 is a disclosure, not a nit: say so
@@ -1677,26 +2023,34 @@ fn run_set_key(home: &Path, provider: &str) -> Result<()> {
     let key = read_secret(&format!("API key for `{provider}` (input hidden): "))?;
     // Redact before anything else can touch the value.
     let shown = redact_tail(&key, 4);
-    set_key_at(home, provider, &key)?;
+    let path = set_key_at(home, provider, &key)?;
     println!(
         "stored api_key for `{provider}` in {} ({shown})",
-        providers_path(home).display()
+        path.display()
     );
-    println!("{RESTART_NOTICE}");
+    let config_changed = path.file_name().is_some_and(|n| n == "config.toml");
+    if let Some(notice) = restart_notice(config_changed, !config_changed) {
+        println!("{notice}");
+    }
     Ok(())
 }
 
 fn run_unset_key(home: &Path, provider: &str) -> Result<()> {
     warn_if_not_gx();
-    if unset_key_at(home, provider)? {
-        println!(
-            "removed api_key for `{provider}` from {}",
-            providers_path(home).display()
-        );
+    let (removed, path) = unset_key_at(home, provider)?;
+    let label = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("the provider file");
+    if removed {
+        println!("removed api_key for `{provider}` from {}", path.display());
         println!("`{provider}` now resolves through its env_key, if one is set.");
-        println!("{RESTART_NOTICE}");
+        let config_changed = label == "config.toml";
+        if let Some(notice) = restart_notice(config_changed, !config_changed) {
+            println!("{notice}");
+        }
     } else {
-        println!("`{provider}` has no api_key in providers.toml; nothing to remove.");
+        println!("`{provider}` has no api_key in {label}; nothing to remove.");
     }
     Ok(())
 }
@@ -2400,15 +2754,87 @@ fn providers_path(home: &Path) -> PathBuf {
     xai_grok_config::providers_layer_path(home)
 }
 
+fn config_path(home: &Path) -> PathBuf {
+    home.join("config.toml")
+}
+
+fn toml_value_of(content: &str) -> Option<toml::Value> {
+    if content.trim().is_empty() {
+        None
+    } else {
+        toml::from_str(content).ok()
+    }
+}
+
+fn provider_table_exists(doc: &toml_edit::DocumentMut, provider: &str) -> bool {
+    doc.get("model_providers")
+        .and_then(|t| t.get(provider))
+        .is_some_and(toml_edit::Item::is_table)
+}
+
+/// Which file `set-key` / `unset-key` mutates for a provider.
+struct KeyFile {
+    path: PathBuf,
+    label: &'static str,
+    max_bytes: u64,
+    new_file_header: Option<&'static str>,
+}
+
+fn providers_key_file(home: &Path) -> KeyFile {
+    KeyFile {
+        path: providers_path(home),
+        label: "providers.toml",
+        max_bytes: MAX_PROVIDERS_BYTES,
+        new_file_header: Some(NEW_FILE_HEADER),
+    }
+}
+
+fn config_key_file(home: &Path) -> KeyFile {
+    KeyFile {
+        path: config_path(home),
+        label: "config.toml",
+        max_bytes: MAX_CONFIG_BYTES,
+        new_file_header: None,
+    }
+}
+
+/// Stock-compatible presets (and unknown providers that exist only in
+/// config.toml) mutate config.toml; everything else mutates providers.toml.
+fn resolve_key_file(home: &Path, provider: &str) -> Result<KeyFile> {
+    if let Some(preset) = preset_for(provider) {
+        return Ok(if preset.stock_compatible {
+            config_key_file(home)
+        } else {
+            providers_key_file(home)
+        });
+    }
+
+    let providers = providers_key_file(home);
+    let config = config_key_file(home);
+    let in_providers = {
+        let previous = read_file_gated(&providers.path, providers.max_bytes, providers.label)?;
+        provider_table_exists(&parse_document(&previous, &providers.path)?, provider)
+    };
+    let in_config = {
+        let previous = read_file_gated(&config.path, config.max_bytes, config.label)?;
+        provider_table_exists(&parse_document(&previous, &config.path)?, provider)
+    };
+    if in_config && !in_providers {
+        Ok(config)
+    } else {
+        Ok(providers)
+    }
+}
+
 /// Cap on `providers.toml`, mirroring the runtime layer's own
 /// `MAX_PROVIDERS_LAYER_BYTES`. A larger file is skipped wholesale at startup,
 /// so reading (or growing past) one here would be pointless as well as unsafe.
 pub(crate) const MAX_PROVIDERS_BYTES: u64 = 1024 * 1024;
 
-/// Cap on `config.toml`, which this module only ever **reads**. Roomier than
-/// the providers cap — config.toml is stock grok's file and may legitimately be
-/// large — but still bounded, so a runaway file or a device node dropped in its
-/// place can never be read into memory here.
+/// Cap on `config.toml`. Roomier than the providers cap — config.toml is stock
+/// grok's file and may legitimately be large — but still bounded, so a runaway
+/// file or a device node dropped in its place can never be read into memory
+/// here. Stock-compatible presets are written to this file.
 pub(crate) const MAX_CONFIG_BYTES: u64 = 10 * 1024 * 1024;
 
 /// Pre-read gate, the same shape [`xai_grok_config::providers_layer`] applies
@@ -2441,8 +2867,8 @@ pub(crate) fn gate_file(path: &Path, max_bytes: u64, what: &str) -> Result<bool>
     }
 }
 
-fn read_existing(path: &Path) -> Result<String> {
-    if !gate_file(path, MAX_PROVIDERS_BYTES, "providers.toml")? {
+fn read_file_gated(path: &Path, max_bytes: u64, what: &str) -> Result<String> {
+    if !gate_file(path, max_bytes, what)? {
         return Ok(String::new());
     }
     match std::fs::read_to_string(path) {
@@ -2500,25 +2926,6 @@ fn parse_document(content: &str, path: &Path) -> Result<toml_edit::DocumentMut> 
             parse_position(content, e.span())
         )
     })
-}
-
-/// `config.toml` is read, never written.
-///
-/// Gate failures **abort**: config.toml decides what `install` skips and what
-/// it flags as shadowed, so silently treating an unreadable or oversized one as
-/// absent would change what gets written. Parse failures stay tolerated (the
-/// file belongs to stock grok too) and are never rendered.
-fn read_config_for_install(home: &Path) -> Result<Option<toml::Value>> {
-    let path = home.join("config.toml");
-    if !gate_file(&path, MAX_CONFIG_BYTES, "config.toml")? {
-        return Ok(None);
-    }
-    let raw = match std::fs::read_to_string(&path) {
-        Ok(raw) => raw,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e).with_context(|| format!("failed to read {}", path.display())),
-    };
-    Ok(toml::from_str::<toml::Value>(&raw).ok())
 }
 
 /// Read + parse a TOML file for the read-only `status` view. The returned error
@@ -2655,7 +3062,7 @@ pub(crate) fn lock_providers_at(
 /// Mode for `providers.toml`: it can hold API keys, so owner-only.
 const PROVIDERS_MODE: u32 = 0o600;
 
-/// The result of one [`write_providers_toml`] call.
+/// The result of one [`write_toml_file`] call.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct WriteOutcome {
     /// The rendered document differed from what was on disk.
@@ -2669,7 +3076,10 @@ pub(crate) struct WriteOutcome {
 /// the file byte-identical. Permissions are re-asserted either way — including
 /// on the byte-identical early return, which is precisely the path a repeated
 /// `gx providers install` takes over a file someone chmod'ed to 0644.
-fn write_providers_toml(path: &Path, rendered: &str, previous: &str) -> Result<WriteOutcome> {
+///
+/// Used for both `providers.toml` and `config.toml` (stock-compatible presets
+/// put keys in the latter).
+fn write_toml_file(path: &Path, rendered: &str, previous: &str) -> Result<WriteOutcome> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
