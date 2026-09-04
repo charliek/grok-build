@@ -2,8 +2,8 @@
 
 `gx` is a fork of [`xai-org/grok-build`](https://github.com/xai-org/grok-build)'s `grok`
 coding TUI that adds third-party model providers — Fireworks (including Kimi and
-DeepSeek), Z.AI's GLM coding plan, OpenRouter, and OpenAI on a ChatGPT/Codex plan — on
-top of everything stock `grok` already does. It ships as a separate binary, `gx`,
+DeepSeek), Z.AI's GLM coding plan, OpenRouter, Meta Muse Spark, and OpenAI on a
+ChatGPT/Codex plan — on top of everything stock `grok` already does. It ships as a separate binary, `gx`,
 installed side by side with stock `grok` on the same machine. Both binaries share
 `$GROK_HOME` (default `~/.grok`) — config, auth, and sessions are the same files for
 both — so this document is as much about **coexistence** as it is about setup. See
@@ -107,27 +107,30 @@ cross toolchain.
 
 ## Provider setup
 
-All gx-only provider/model configuration lives in `$GROK_HOME/providers.toml`
-(default `~/.grok/providers.toml`) — **stock `grok` never reads this file.** It is
-merged *inside the user tier*, over `config.toml`, so it behaves like any other
-user-authority config for everything that reads the effective config (including
-`grok inspect`, with one cosmetic caveat noted below).
+gx-only provider/model configuration (Fireworks, openai-codex, openai-api) lives in
+`$GROK_HOME/providers.toml` (default `~/.grok/providers.toml`) — **stock `grok` never
+reads this file.** It is merged *inside the user tier*, over `config.toml`, so it
+behaves like any other user-authority config for everything that reads the effective
+config (including `grok inspect`, with one cosmetic caveat noted below).
+
+Stock-compatible presets (GLM, OpenRouter, Meta) are written to the shared
+`$GROK_HOME/config.toml` so stock `grok` can use them too. They are **not** also
+copied into `providers.toml` (that overlay would shadow for gx).
 
 ```
 gx providers install
 ```
 
-Writes the shipped provider/model presets into `providers.toml` (created if absent,
-mode `0600`). It's idempotent and merge-aware:
+Writes the shipped provider/model presets into the matching file (created if absent,
+mode `0600`): stock-compatible shapes into `config.toml`, gx-only shapes into
+`providers.toml`. It's idempotent and merge-aware:
 
 - adds anything missing,
 - upgrades a field only while its current value still equals a value gx has *ever*
   shipped as a default (i.e. you never touched it),
 - leaves anything you've hand-edited alone unless you pass `--force`,
-- reports what it added / upgraded / kept / forced.
-
-`gx providers install` does **not** touch `config.toml` — not one code path in it
-writes there.
+- reports what it added / upgraded / kept / forced,
+- preserves unrelated `config.toml` tables (`[cli]`, `[ui]`, `[plugins]`, …).
 
 ```
 gx providers set-key fireworks
@@ -139,19 +142,19 @@ command-line argument, so it never lands in shell history or a process listing.
 `gx providers unset-key <provider>` removes a stored key and falls back to that
 provider's `env_key`.
 
-There is **no hot reload** — a gx session reads `providers.toml` once at startup.
-**Restart any running gx sessions** after `install`, `set-key`, or `unset-key` for the
-change to take effect; every mutating command prints a reminder of this.
+There is **no hot reload** — a session reads `config.toml` / `providers.toml` once at
+startup. **Restart any running gx (and, for stock-compatible entries, grok) sessions**
+after `install`, `set-key`, or `unset-key` for the change to take effect; every
+mutating command prints a reminder of this.
 
-GLM (Z.AI coding plan) and OpenRouter also work today via plain `config.toml` entries
-(same shape works on stock `grok`) or via environment variables:
+Keys can also come from environment variables (`gx providers install` writes the
+`env_key` for each so an already-exported variable is picked up with no key ever
+touching disk):
 
 - GLM: `ZHIPU_API_KEY` or `ZAI_API_KEY`
 - OpenRouter: `OPENROUTER_API_KEY`
+- Meta: `META_API_KEY` or `MODEL_API_KEY` (Muse CLI name first)
 - Fireworks: `FIREWORKS_API_KEY`
-
-`gx providers install` writes the `env_key` for each of these so an already-exported
-variable is picked up with no key ever touching disk.
 
 ### OpenAI (ChatGPT plan)
 
@@ -197,18 +200,25 @@ entry point for both the providers layer and the codex credential.
 | OpenRouter | `openrouter/gpt-5.6-sol` | low / medium / high / xhigh | medium |
 | OpenRouter | `openrouter/gpt-5.6-terra` | low / medium / high / xhigh | medium |
 | OpenRouter | `openrouter/gpt-5.6-luna` | low / medium / high / xhigh | medium |
+| Meta | `muse-spark-1.3` | minimal / low / medium / high / xhigh | high |
+| Meta | `muse-spark-1.3-contributor` | minimal / low / medium / high / xhigh | high |
 | OpenAI (ChatGPT plan) | `gpt-5.6-sol` / `gpt-5.6-terra` / `gpt-5.6-luna` | low / medium / high / xhigh | medium |
+
+`muse-spark-1.3` is the Standard tier: prompts are not used for training.
+`muse-spark-1.3-contributor` is the discounted Contributor tier: your content,
+including inter-session messages, may be used for product improvement.
 
 `glm-5.3-highspeed` also exists on Z.AI's coding-plan API but is tier-gated (the API
 returns "current subscription plan does not yet include access"); add it by hand to
-`providers.toml` if your plan is upgraded to include it.
+`config.toml` if your plan is upgraded to include it.
 
 `openrouter/glm-5.3-flash` was retired (2026-08-27): the Z.AI coding-plan `glm-5.3-flash`
 above now covers the same model directly, so a metered OpenRouter duplicate was redundant.
 `gx providers install` never deletes an entry that falls out of the shipped catalog, so an
 existing `[model."openrouter/glm-5.3-flash"]` (and, further back, `[model."openrouter/ox-alpha"]`)
-from an earlier install is left in place; remove it by hand from `providers.toml` if you no
-longer want it.
+from an earlier install is left in place; remove it by hand from the file `install` wrote
+it to (`config.toml` for current stock-compatible installs, or `providers.toml` if it
+was written by an older gx) if you no longer want it.
 
 In its place, OpenRouter now ships `openrouter/minimax-m3` (a cheap 1M-context generalist,
 $0.30/$1.20 per M tokens) and OpenRouter twins of the three ChatGPT-plan GPT-5.6 models —
@@ -219,8 +229,8 @@ verified on OpenRouter with tools support, pricing verified 2026-08-27. One pric
 OpenRouter's `:batch` variants of these models are half-price again but async-only, so they
 are not substitutes for this preset's interactive, synchronous use.
 
-Fireworks, GLM, and OpenRouter entries carry `stream_tool_calls = false` and an explicit
-`context_window` gx sets itself, since grok's model catalog has no entry for a
+Fireworks, GLM, OpenRouter, and Meta entries carry `stream_tool_calls = false` and an
+explicit `context_window` gx sets itself, since grok's model catalog has no entry for a
 third-party id. Run `gx providers status` to see exactly what's configured and where
 each value came from (`providers.toml` vs `config.toml` vs environment).
 
@@ -255,9 +265,10 @@ To test gx on Linux (e.g. in an ephemeral `shed`):
 
 1. Build the `linux-x86_64` artifact (from source or a release download) and copy it in.
 2. Provide keys either as environment variables (`FIREWORKS_API_KEY`,
-   `ZHIPU_API_KEY`/`ZAI_API_KEY`, `OPENROUTER_API_KEY`) or by writing
-   `providers.toml` directly — whichever mechanism your shed/VM's env-injection
-   actually surfaces to the process (verify empirically; don't assume).
+   `ZHIPU_API_KEY`/`ZAI_API_KEY`, `OPENROUTER_API_KEY`, `META_API_KEY`/`MODEL_API_KEY`)
+   or by writing `providers.toml` / `config.toml` directly — whichever mechanism your
+   shed/VM's env-injection actually surfaces to the process (verify empirically; don't
+   assume).
 3. **Do not enable shed `--egress`** — its network policy hard-denies the Tailscale
    CGNAT range, which is an unrelated, unnecessary trap for a task that only needs
    outbound HTTPS to the provider APIs.
@@ -271,10 +282,13 @@ gx installs nothing outside of:
 - `~/.codex/.gx-auth.lock`, if present (gx's OpenAI refresh lock; safe to delete any
   time gx isn't actively refreshing).
 
-Everything else under `$GROK_HOME` — `config.toml`, auth, sessions — is shared state
-stock `grok` also owns, and gx never modifies it differently than stock grok would.
-Removing the three items above returns the machine to a stock-grok-only state with zero
-residue.
+Stock-compatible presets (GLM, OpenRouter, Meta) are written into the shared
+`config.toml`. Leave those entries if you still want stock `grok` to use them; delete
+the `[model_providers.<id>]` / `[model.<id>]` tables by hand if you want them gone.
+Everything else under `$GROK_HOME` — the rest of `config.toml`, auth, sessions — is
+shared state stock `grok` also owns. Removing the gx-only items above plus any
+stock-compatible tables you no longer want returns the machine to a stock-grok-only
+state.
 
 ## Known limitations
 
@@ -286,13 +300,13 @@ Being upfront about the rough edges:
   those two may lossily compact (upstream family-switch). Independently,
   gx drops foreign sealed reasoning on the Codex wire and, on a Grok
   `encrypted_content` 400, strips sealed blobs from that request and
-  retries once. Chat Completions hops (GLM, Kimi, OpenRouter) keep
+  retries once. Chat Completions hops (GLM, Kimi, OpenRouter, Meta) keep
   history: they ignore item ids and sealed blobs. Resume/load does not
   compact. Empty-id reasoning from GLM/Fireworks no longer 400s Codex
   (`1.0.12+gx.6` and this change). A `1.0.10+gx.4` binary does not have
   these fixes — upgrade.
 - **Third-party retry/429 tuning is stock-xAI-tuned.** gx does not have bespoke
-  backoff/retry curves for Fireworks, Z.AI, OpenRouter, or OpenAI — it inherits
+  backoff/retry curves for Fireworks, Z.AI, OpenRouter, Meta, or OpenAI — it inherits
   whatever grok's sampler does for xAI's own API, which may not be ideal for a
   different provider's rate-limit behavior.
 - **Session resume degrades across binaries.** A session started against a gx-only
