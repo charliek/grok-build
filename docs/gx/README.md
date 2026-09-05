@@ -197,12 +197,12 @@ entry point for both the providers layer and the codex credential.
 | Z.AI | `glm-5.3` | low / high / max | max |
 | Z.AI | `glm-5.3-flash` | low / high / max | high |
 | OpenRouter | `openrouter/minimax-m3` | none | n/a |
-| OpenRouter | `openrouter/gpt-5.6-sol` | low / medium / high / xhigh | medium |
-| OpenRouter | `openrouter/gpt-5.6-terra` | low / medium / high / xhigh | medium |
-| OpenRouter | `openrouter/gpt-5.6-luna` | low / medium / high / xhigh | medium |
+| OpenRouter | `openrouter/gemini-3.8-flash` | low / medium / high | medium |
 | Meta | `muse-spark-1.3` | minimal / low / medium / high / xhigh | high |
 | Meta | `muse-spark-1.3-contributor` | minimal / low / medium / high / xhigh | high |
-| OpenAI (ChatGPT plan) | `gpt-5.6-sol` / `gpt-5.6-terra` / `gpt-5.6-luna` | low / medium / high / xhigh | medium |
+| OpenAI (ChatGPT plan) | `gpt-6-astra` | low / medium / high / xhigh / max | low |
+| OpenAI (ChatGPT plan) | `gpt-5.6-sol` | low / medium / high / xhigh / max | low |
+| OpenAI (ChatGPT plan) | `gpt-5.6-terra` / `gpt-5.6-luna` | low / medium / high / xhigh / max | medium |
 
 `muse-spark-1.3` is the Standard tier: prompts are not used for training.
 `muse-spark-1.3-contributor` is the discounted Contributor tier: your content,
@@ -220,14 +220,22 @@ from an earlier install is left in place; remove it by hand from the file `insta
 it to (`config.toml` for current stock-compatible installs, or `providers.toml` if it
 was written by an older gx) if you no longer want it.
 
-In its place, OpenRouter now ships `openrouter/minimax-m3` (a cheap 1M-context generalist,
-$0.30/$1.20 per M tokens) and OpenRouter twins of the three ChatGPT-plan GPT-5.6 models —
-`openrouter/gpt-5.6-sol` / `-terra` / `-luna` — as a metered overflow route for when the
-`openai-codex` plan-metered preset is rate-limited or unavailable; sol is currently half of
-OpenAI-direct pricing ($2/$10 vs $4/$20 per M) while terra and luna match it. All four were
-verified on OpenRouter with tools support, pricing verified 2026-08-27. One pricing nuance:
-OpenRouter's `:batch` variants of these models are half-price again but async-only, so they
-are not substitutes for this preset's interactive, synchronous use.
+OpenRouter ships `openrouter/minimax-m3` (a cheap 1M-context generalist,
+$0.30/$1.20 per M tokens, verified 2026-08-27) and
+`openrouter/gemini-3.8-flash`. OpenRouter's public catalog reports Gemini 3.8 Flash with a
+1,048,576-token context window, 65,536 maximum output tokens, tool calling, and mandatory
+low / medium / high reasoning (medium by default), verified 2026-09-05.
+
+The metered OpenRouter copies of `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna` were
+removed from the shipped catalog on 2026-09-05; the direct ChatGPT-plan entries remain under
+`openai-codex`, alongside the new `gpt-6-astra`. Existing
+`[model."openrouter/gpt-5.6-..."]` tables remain in `config.toml` because
+`gx providers install` preserves entries that leave the catalog; delete those three tables
+by hand if an earlier gx installed them and you no longer want them in `/model`.
+
+`gpt-6-astra` uses Codex's current 272,000-token active context window and supports
+low / medium / high / xhigh / max reasoning. Its default is low, matching the Codex
+catalog. Availability depends on OpenAI's rollout, your ChatGPT plan, and workspace policy.
 
 Fireworks, GLM, OpenRouter, and Meta entries carry `stream_tool_calls = false` and an
 explicit `context_window` gx sets itself, since grok's model catalog has no entry for a

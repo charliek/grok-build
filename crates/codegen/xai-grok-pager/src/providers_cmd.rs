@@ -582,21 +582,6 @@ const OPENROUTER_MODEL_PROVIDER: PresetField =
 const OPENROUTER_NO_STREAM_TOOL_CALLS: PresetField =
     PresetField::new("stream_tool_calls", &[b(false)]);
 
-// The three OpenRouter GPT-5.6 twins mirror the `openai-codex` preset's
-// effort shape exactly: OpenRouter passes `reasoning_effort` straight through
-// to OpenAI, so the same accepted menu applies (none/low/medium/high/xhigh,
-// `minimal` rejected — see `OPENAI_CODEX_EFFORTS` above). `context_window`
-// mirrors codex-rs's own value for the gpt-5.6 family.
-const OPENROUTER_GPT_CONTEXT_WINDOW: PresetField =
-    PresetField::new("context_window", &[i(272_000)]);
-const OPENROUTER_GPT_SUPPORTS_EFFORT: PresetField =
-    PresetField::new("supports_reasoning_effort", &[b(true)]);
-const OPENROUTER_GPT_EFFORT: PresetField = PresetField::new("reasoning_effort", &[s("medium")]);
-const OPENROUTER_GPT_EFFORTS: PresetField = PresetField::new(
-    "reasoning_efforts",
-    &[l(&["low", "medium", "high", "xhigh"])],
-);
-
 // Verified on OpenRouter with tools support; pricing verified 2026-08-27.
 // OpenRouter reports no `reasoning_effort` support for this model, so it
 // carries none of the effort fields (unlike every other model in this file).
@@ -615,66 +600,29 @@ const OPENROUTER_MINIMAX_M3_FIELDS: &[PresetField] = &[
     OPENROUTER_NO_STREAM_TOOL_CALLS,
 ];
 
-// The OpenRouter GPT-5.6 twins are a ChatGPT-plan overflow route: when the
-// `openai-codex` plan-metered preset above is rate-limited or unavailable,
-// these route the same models through OpenRouter's metered billing instead.
-// Verified on OpenRouter with tools support; pricing verified 2026-08-27.
-// Note the batch-vs-interactive pricing nuance: OpenRouter's `:batch` variants
-// of these models are half-price again but async-only, so they are not
-// substitutes for this preset's interactive, synchronous use.
-const OPENROUTER_GPT_SOL_FIELDS: &[PresetField] = &[
-    PresetField::new("model", &[s("openai/gpt-5.6-sol")]),
-    PresetField::new("name", &[s("GPT-5.6 Sol (OpenRouter, metered)")]),
+// The OpenRouter copies of GPT-5.6 Sol/Terra/Luna were retired from PRESETS
+// on 2026-09-05 so GPT models use the direct ChatGPT-plan route only. As with
+// the retired GLM entries above, install leaves an existing user table intact.
+//
+// OpenRouter's public model catalog reports a mandatory reasoning model with
+// low/medium/high effort, medium by default, a 1,048,576-token context window,
+// and 65,536 maximum completion tokens (verified 2026-09-05).
+const OPENROUTER_GEMINI_38_FLASH_FIELDS: &[PresetField] = &[
+    PresetField::new("model", &[s("google/gemini-3.8-flash")]),
+    PresetField::new("name", &[s("Gemini 3.8 Flash (OpenRouter)")]),
     PresetField::new(
         "description",
         &[s(
-            "ChatGPT-plan overflow route for GPT-5.6 Sol via OpenRouter, metered per \
-             token; currently half of OpenAI-direct pricing ($2/$10 vs $4/$20 per M, \
-             verified 2026-08-27).",
+            "Google's fast 1M-context coding and agentic model via OpenRouter.",
         )],
     ),
     OPENROUTER_MODEL_PROVIDER,
-    OPENROUTER_GPT_CONTEXT_WINDOW,
+    PresetField::new("context_window", &[i(1_048_576)]),
+    PresetField::new("max_completion_tokens", &[i(65_536)]),
     OPENROUTER_NO_STREAM_TOOL_CALLS,
-    OPENROUTER_GPT_SUPPORTS_EFFORT,
-    OPENROUTER_GPT_EFFORT,
-    OPENROUTER_GPT_EFFORTS,
-];
-
-const OPENROUTER_GPT_TERRA_FIELDS: &[PresetField] = &[
-    PresetField::new("model", &[s("openai/gpt-5.6-terra")]),
-    PresetField::new("name", &[s("GPT-5.6 Terra (OpenRouter, metered)")]),
-    PresetField::new(
-        "description",
-        &[s(
-            "ChatGPT-plan overflow route for GPT-5.6 Terra via OpenRouter, metered per \
-             token; matches OpenAI-direct pricing ($2/$12 per M, verified 2026-08-27).",
-        )],
-    ),
-    OPENROUTER_MODEL_PROVIDER,
-    OPENROUTER_GPT_CONTEXT_WINDOW,
-    OPENROUTER_NO_STREAM_TOOL_CALLS,
-    OPENROUTER_GPT_SUPPORTS_EFFORT,
-    OPENROUTER_GPT_EFFORT,
-    OPENROUTER_GPT_EFFORTS,
-];
-
-const OPENROUTER_GPT_LUNA_FIELDS: &[PresetField] = &[
-    PresetField::new("model", &[s("openai/gpt-5.6-luna")]),
-    PresetField::new("name", &[s("GPT-5.6 Luna (OpenRouter, metered)")]),
-    PresetField::new(
-        "description",
-        &[s(
-            "ChatGPT-plan overflow route for GPT-5.6 Luna via OpenRouter, metered per \
-             token; the cheapest 5.6 model ($0.20/$1.20 per M, verified 2026-08-27).",
-        )],
-    ),
-    OPENROUTER_MODEL_PROVIDER,
-    OPENROUTER_GPT_CONTEXT_WINDOW,
-    OPENROUTER_NO_STREAM_TOOL_CALLS,
-    OPENROUTER_GPT_SUPPORTS_EFFORT,
-    OPENROUTER_GPT_EFFORT,
-    OPENROUTER_GPT_EFFORTS,
+    PresetField::new("supports_reasoning_effort", &[b(true)]),
+    PresetField::new("reasoning_effort", &[s("medium")]),
+    PresetField::new("reasoning_efforts", &[l(&["low", "medium", "high"])]),
 ];
 
 // -- Meta (Muse Spark) -------------------------------------------------------
@@ -896,10 +844,8 @@ const OPENAI_CODEX_PROVIDER_FIELDS: &[PresetField] = &[
 
 /// Shared by every ChatGPT-plan model.
 ///
-/// `context_window`: 272000, codex-rs's own value for the gpt-5.6 family
-/// (`codex-rs/models-manager/models.json`). Efforts: the endpoint accepts
-/// none/low/medium/high/xhigh/max and rejects `minimal`; the menu below is
-/// codex's own `supported_reasoning_levels` for these models.
+/// `context_window`: 272000, codex-rs's current active-window value for both
+/// GPT-5.6 and GPT-6 Astra (`codex-rs/models-manager/models.json`).
 const OPENAI_CODEX_MODEL_PROVIDER: PresetField =
     PresetField::new("model_provider", &[s("openai-codex")]);
 const OPENAI_CODEX_CONTEXT_WINDOW: PresetField = PresetField::new("context_window", &[i(272_000)]);
@@ -909,11 +855,47 @@ const OPENAI_CODEX_FAMILY: PresetField = PresetField::new("model_family", &[s("o
 const OPENAI_CODEX_COMPAT: PresetField = PresetField::new("codex_compat", &[b(true)]);
 const OPENAI_CODEX_SUPPORTS_EFFORT: PresetField =
     PresetField::new("supports_reasoning_effort", &[b(true)]);
-const OPENAI_CODEX_EFFORT: PresetField = PresetField::new("reasoning_effort", &[s("medium")]);
-const OPENAI_CODEX_EFFORTS: PresetField = PresetField::new(
+
+// Codex's current GPT-5.6 catalog exposes max for all three direct models.
+// `ultra`, where offered, is orchestration rather than a wire reasoning effort
+// and is not a gx enum value. The older defaults keep untouched installations
+// upgradeable without replacing hand edits.
+const OPENAI_SOL_EFFORT: PresetField =
+    PresetField::new("reasoning_effort", &[s("low"), s("medium")]);
+const OPENAI_MEDIUM_EFFORT: PresetField = PresetField::new("reasoning_effort", &[s("medium")]);
+const OPENAI_GPT56_EFFORTS: PresetField = PresetField::new(
     "reasoning_efforts",
-    &[l(&["low", "medium", "high", "xhigh"])],
+    &[
+        l(&["low", "medium", "high", "xhigh", "max"]),
+        l(&["low", "medium", "high", "xhigh"]),
+    ],
 );
+
+// Codex 0.153.3's bundled and account catalogs both expose Astra through
+// ChatGPT sign-in with low/medium/high/xhigh/max and low by default. `ultra`
+// is orchestration rather than a wire reasoning effort and is not a gx enum
+// value, so it is deliberately omitted.
+const OPENAI_ASTRA_FIELDS: &[PresetField] = &[
+    PresetField::new("model", &[s("gpt-6-astra")]),
+    PresetField::new("name", &[s("GPT-6 Astra (ChatGPT)")]),
+    PresetField::new(
+        "description",
+        &[s(
+            "OpenAI's most capable model for complex coding and agentic work, via your \
+             ChatGPT plan.",
+        )],
+    ),
+    OPENAI_CODEX_MODEL_PROVIDER,
+    OPENAI_CODEX_CONTEXT_WINDOW,
+    OPENAI_CODEX_FAMILY,
+    OPENAI_CODEX_COMPAT,
+    OPENAI_CODEX_SUPPORTS_EFFORT,
+    PresetField::new("reasoning_effort", &[s("low")]),
+    PresetField::new(
+        "reasoning_efforts",
+        &[l(&["low", "medium", "high", "xhigh", "max"])],
+    ),
+];
 
 const OPENAI_SOL_FIELDS: &[PresetField] = &[
     PresetField::new("model", &[s("gpt-5.6-sol")]),
@@ -929,8 +911,8 @@ const OPENAI_SOL_FIELDS: &[PresetField] = &[
     OPENAI_CODEX_FAMILY,
     OPENAI_CODEX_COMPAT,
     OPENAI_CODEX_SUPPORTS_EFFORT,
-    OPENAI_CODEX_EFFORT,
-    OPENAI_CODEX_EFFORTS,
+    OPENAI_SOL_EFFORT,
+    OPENAI_GPT56_EFFORTS,
 ];
 
 const OPENAI_TERRA_FIELDS: &[PresetField] = &[
@@ -942,8 +924,8 @@ const OPENAI_TERRA_FIELDS: &[PresetField] = &[
     OPENAI_CODEX_FAMILY,
     OPENAI_CODEX_COMPAT,
     OPENAI_CODEX_SUPPORTS_EFFORT,
-    OPENAI_CODEX_EFFORT,
-    OPENAI_CODEX_EFFORTS,
+    OPENAI_MEDIUM_EFFORT,
+    OPENAI_GPT56_EFFORTS,
 ];
 
 const OPENAI_LUNA_FIELDS: &[PresetField] = &[
@@ -958,8 +940,8 @@ const OPENAI_LUNA_FIELDS: &[PresetField] = &[
     OPENAI_CODEX_FAMILY,
     OPENAI_CODEX_COMPAT,
     OPENAI_CODEX_SUPPORTS_EFFORT,
-    OPENAI_CODEX_EFFORT,
-    OPENAI_CODEX_EFFORTS,
+    OPENAI_MEDIUM_EFFORT,
+    OPENAI_GPT56_EFFORTS,
 ];
 
 // -- OpenAI (plain API key) --------------------------------------------------
@@ -1018,16 +1000,8 @@ pub(crate) const PRESETS: &[ProviderPreset] = &[
                 fields: OPENROUTER_MINIMAX_M3_FIELDS,
             },
             ModelPreset {
-                id: "openrouter/gpt-5.6-sol",
-                fields: OPENROUTER_GPT_SOL_FIELDS,
-            },
-            ModelPreset {
-                id: "openrouter/gpt-5.6-terra",
-                fields: OPENROUTER_GPT_TERRA_FIELDS,
-            },
-            ModelPreset {
-                id: "openrouter/gpt-5.6-luna",
-                fields: OPENROUTER_GPT_LUNA_FIELDS,
+                id: "openrouter/gemini-3.8-flash",
+                fields: OPENROUTER_GEMINI_38_FLASH_FIELDS,
             },
         ],
     },
@@ -1090,6 +1064,10 @@ pub(crate) const PRESETS: &[ProviderPreset] = &[
         note: Some(OPENAI_CODEX_NOTE),
         fields: OPENAI_CODEX_PROVIDER_FIELDS,
         models: &[
+            ModelPreset {
+                id: "gpt-6-astra",
+                fields: OPENAI_ASTRA_FIELDS,
+            },
             ModelPreset {
                 id: "gpt-5.6-sol",
                 fields: OPENAI_SOL_FIELDS,
