@@ -17,6 +17,7 @@ pub mod config;
 pub mod doom_loop;
 mod doom_loop_recovery;
 pub mod events;
+mod gx_responses_sse; // gx: Codex/ChatGPT Responses SSE frame policy
 pub mod handle;
 pub mod metrics;
 mod prewarm;
