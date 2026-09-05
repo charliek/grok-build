@@ -330,6 +330,9 @@ Being upfront about the rough edges:
   contract. It can drift without notice, and using a ChatGPT-plan credential this way
   sits in a gray area relative to OpenAI's account policies. Accepted risk, not a
   guarantee.
+- **ChatGPT/Codex may emit SSE `keepalive` frames.** gx ignores those frames
+  (`crates/codegen/xai-grok-sampler/src/gx_responses_sse.rs`). Idle timeout is still
+  on typed events (300s default); skipped keepalives do not reset it.
 - **`--leader-socket` / `$GROK_LEADER_SOCKET` bypass gx/stock socket separation.**
   These are general-purpose overrides (e.g. for running two branch builds
   side by side) that ignore the gx-vs-stock distinction entirely — if you set one
