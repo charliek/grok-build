@@ -1459,6 +1459,9 @@ impl SamplingClient {
         let event_stream = byte_stream.eventsource();
 
         let doom_loop_for_stream = doom_loop.clone();
+        // gx: per-model Codex vs strict Responses SSE policy (ClientDefaults, not a new key).
+        let codex_compat = self.defaults.codex_compat;
+        let sse_handler = crate::gx_responses_sse::handler(codex_compat);
 
         // The scan item is an `Option`: `Some(None)` skips an absorbed doom-loop event without terminating the stream (`filter_map` below)
         // An outer `None` still ends the stream
@@ -1493,7 +1496,9 @@ impl SamplingClient {
                         } else if let Some(stream_error) = try_parse_stream_error(data) {
                             Some(Some(Err(stream_error)))
                         } else {
-                            Some(Some(deserialize_response_event(data)))
+                            // gx: Codex/ChatGPT Responses liveness + unknown top-level type policy.
+                            // Outer Some(...) is mandatory: handle_frame's None is skip, not stream end.
+                            Some(sse_handler.handle_frame(&event.event, data))
                         }
                     }
                     Err(e) => {
