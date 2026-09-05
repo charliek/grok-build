@@ -73,10 +73,8 @@ fn ctx() -> PresetContext {
 const GX_BIN: &str = "/opt/gx/bin/gx";
 const FIXTURE_ACCOUNT: &str = "acct-fixture-abc123";
 
-/// A synthetic two-generation preset table: `install` semantics are about
-/// *shipped default history*, which the real presets do not have yet (they are
-/// all first generation). Testing against this table exercises the upgrade rule
-/// without waiting for the first real preset revision.
+/// A synthetic two-generation preset table that exercises the generic shipped
+/// default upgrade rule independently of any real provider's catalog history.
 const OLDER_CTX: i64 = 100_000;
 const CURRENT_CTX: i64 = 200_000;
 
@@ -297,30 +295,32 @@ fn install_mirrors_the_live_glm_openrouter_and_fireworks_shapes() {
     assert!(minimax.get("reasoning_effort").is_none());
     assert!(minimax.get("reasoning_efforts").is_none());
 
-    for (id, wire) in [
-        ("openrouter/gpt-5.6-sol", "openai/gpt-5.6-sol"),
-        ("openrouter/gpt-5.6-terra", "openai/gpt-5.6-terra"),
-        ("openrouter/gpt-5.6-luna", "openai/gpt-5.6-luna"),
+    let gemini = &parsed["model"]["openrouter/gemini-3.8-flash"];
+    assert_eq!(gemini["model"].as_str(), Some("google/gemini-3.8-flash"));
+    assert_eq!(gemini["model_provider"].as_str(), Some("openrouter"));
+    assert_eq!(gemini["context_window"].as_integer(), Some(1_048_576));
+    assert_eq!(gemini["max_completion_tokens"].as_integer(), Some(65_536));
+    assert_eq!(gemini["stream_tool_calls"].as_bool(), Some(false));
+    assert_eq!(gemini["supports_reasoning_effort"].as_bool(), Some(true));
+    assert_eq!(gemini["reasoning_effort"].as_str(), Some("medium"));
+    assert_eq!(
+        gemini["reasoning_efforts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(toml::Value::as_str)
+            .collect::<Vec<_>>(),
+        vec!["low", "medium", "high"]
+    );
+
+    for id in [
+        "openrouter/gpt-5.6-sol",
+        "openrouter/gpt-5.6-terra",
+        "openrouter/gpt-5.6-luna",
     ] {
-        let entry = &parsed["model"][id];
-        assert_eq!(entry["model"].as_str(), Some(wire), "{id}");
-        assert_eq!(entry["context_window"].as_integer(), Some(272_000), "{id}");
-        assert_eq!(entry["stream_tool_calls"].as_bool(), Some(false), "{id}");
-        assert_eq!(
-            entry["supports_reasoning_effort"].as_bool(),
-            Some(true),
-            "{id}"
-        );
-        assert_eq!(entry["reasoning_effort"].as_str(), Some("medium"), "{id}");
-        assert_eq!(
-            entry["reasoning_efforts"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter_map(toml::Value::as_str)
-                .collect::<Vec<_>>(),
-            vec!["low", "medium", "high", "xhigh"],
-            "{id}"
+        assert!(
+            parsed["model"].get(id).is_none(),
+            "{id} must not be installed through OpenRouter"
         );
     }
 
@@ -432,6 +432,52 @@ fn install_mirrors_the_live_glm_openrouter_and_fireworks_shapes() {
         fireworks_doc["model"]["fireworks/kimi-k3"]["context_window"].as_integer(),
         Some(1_048_576)
     );
+}
+
+#[test]
+fn install_preserves_retired_openrouter_gpt_entries() {
+    let dir = home();
+    fs::write(
+        config_toml(dir.path()),
+        r#"[model."openrouter/gpt-5.6-sol"]
+model = "hand-picked-sol"
+model_provider = "openrouter"
+my_extra = "keep sol"
+
+[model."openrouter/gpt-5.6-terra"]
+model = "hand-picked-terra"
+model_provider = "openrouter"
+my_extra = "keep terra"
+
+[model."openrouter/gpt-5.6-luna"]
+model = "hand-picked-luna"
+model_provider = "openrouter"
+my_extra = "keep luna"
+"#,
+    )
+    .unwrap();
+
+    install_at(dir.path(), PRESETS, false, &ctx()).expect("install");
+    let parsed = parse_config(dir.path());
+
+    for suffix in ["sol", "terra", "luna"] {
+        let id = format!("openrouter/gpt-5.6-{suffix}");
+        let retired = parsed["model"][&id]
+            .as_table()
+            .unwrap_or_else(|| panic!("retired model table {id}"));
+        assert_eq!(retired.len(), 3, "{id} must not be rewritten");
+        assert_eq!(
+            retired["model"].as_str(),
+            Some(format!("hand-picked-{suffix}").as_str()),
+            "{id}"
+        );
+        assert_eq!(retired["model_provider"].as_str(), Some("openrouter"));
+        assert_eq!(
+            retired["my_extra"].as_str(),
+            Some(format!("keep {suffix}").as_str()),
+            "{id}"
+        );
+    }
 }
 
 #[test]
@@ -804,6 +850,63 @@ model = "hand-picked-wire-id"
     assert!(report
         .added_fields
         .contains(&"model_providers.synth.env_key".to_owned()));
+}
+
+#[test]
+fn install_upgrades_previous_gpt56_effort_defaults() {
+    let dir = home();
+    fs::write(
+        providers_path(dir.path()),
+        r#"[model."gpt-5.6-sol"]
+reasoning_effort = "medium"
+reasoning_efforts = ["low", "medium", "high", "xhigh"]
+
+[model."gpt-5.6-terra"]
+reasoning_effort = "medium"
+reasoning_efforts = ["low", "medium", "high", "xhigh"]
+
+[model."gpt-5.6-luna"]
+reasoning_effort = "medium"
+reasoning_efforts = ["low", "medium", "high", "xhigh"]
+"#,
+    )
+    .unwrap();
+
+    let report = install_at(dir.path(), PRESETS, false, &ctx()).expect("install");
+    let parsed = parse_providers(dir.path());
+    let current_efforts = vec!["low", "medium", "high", "xhigh", "max"];
+
+    for (id, expected_default) in [
+        ("gpt-5.6-sol", "low"),
+        ("gpt-5.6-terra", "medium"),
+        ("gpt-5.6-luna", "medium"),
+    ] {
+        let model = &parsed["model"][id];
+        assert_eq!(
+            model["reasoning_effort"].as_str(),
+            Some(expected_default),
+            "{id}"
+        );
+        assert_eq!(
+            model["reasoning_efforts"]
+                .as_array()
+                .expect("efforts")
+                .iter()
+                .filter_map(toml::Value::as_str)
+                .collect::<Vec<_>>(),
+            current_efforts,
+            "{id}"
+        );
+    }
+    assert_eq!(
+        report.upgraded_fields,
+        vec![
+            r#"model."gpt-5.6-sol".reasoning_effort"#.to_owned(),
+            r#"model."gpt-5.6-sol".reasoning_efforts"#.to_owned(),
+            r#"model."gpt-5.6-terra".reasoning_efforts"#.to_owned(),
+            r#"model."gpt-5.6-luna".reasoning_efforts"#.to_owned(),
+        ]
+    );
 }
 
 /// Upgrade path for the 2026-08-25 Fireworks reasoning-effort probe: a
@@ -1616,6 +1719,13 @@ fn status_covers_configured_unconfigured_and_env_key_cases() {
             redacted: "…wxyz".to_owned(),
         }
     );
+    assert_eq!(
+        openrouter.models,
+        vec![
+            "openrouter/gemini-3.8-flash".to_owned(),
+            "openrouter/minimax-m3".to_owned(),
+        ]
+    );
 
     let fireworks = report
         .providers
@@ -1636,7 +1746,16 @@ fn status_covers_configured_unconfigured_and_env_key_cases() {
         .find(|p| p.id == "openai-codex")
         .expect("openai-codex listed");
     assert!(codex.in_providers && !codex.in_config);
-    assert_eq!(codex.models.len(), 3, "the three ChatGPT-plan models");
+    assert_eq!(
+        codex.models,
+        vec![
+            "gpt-5.6-luna".to_owned(),
+            "gpt-5.6-sol".to_owned(),
+            "gpt-5.6-terra".to_owned(),
+            "gpt-6-astra".to_owned(),
+        ],
+        "the four direct ChatGPT-plan models"
+    );
     assert!(
         codex.env_keys.is_empty(),
         "an env_key would shadow the auth helper"
@@ -2608,7 +2727,38 @@ fn the_openai_codex_preset_matches_the_shape_the_spike_proved() {
     );
     assert_eq!(headers["originator"].as_str(), Some(GX_ORIGINATOR));
 
-    for id in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+    let astra = model_entry(&parsed, "gpt-6-astra");
+    assert_eq!(astra["model"].as_str(), Some("gpt-6-astra"));
+    assert_eq!(astra["name"].as_str(), Some("GPT-6 Astra (ChatGPT)"));
+    assert_eq!(astra["model_provider"].as_str(), Some("openai-codex"));
+    // Codex's active-window value for the ChatGPT backend; its separate
+    // max_context_window is not a gx model-catalog field.
+    assert_eq!(astra["context_window"].as_integer(), Some(272_000));
+    assert_eq!(astra["codex_compat"].as_bool(), Some(true));
+    assert_eq!(astra["model_family"].as_str(), Some("openai-codex"));
+    assert_eq!(astra["supports_reasoning_effort"].as_bool(), Some(true));
+    assert_eq!(astra["reasoning_effort"].as_str(), Some("low"));
+    assert_eq!(
+        astra["reasoning_efforts"]
+            .as_array()
+            .expect("Astra efforts")
+            .iter()
+            .filter_map(toml::Value::as_str)
+            .collect::<Vec<_>>(),
+        vec!["low", "medium", "high", "xhigh", "max"]
+    );
+    for rejected in ["temperature", "top_p", "max_completion_tokens"] {
+        assert!(
+            astra.get(rejected).is_none(),
+            "gpt-6-astra must not ship {rejected}"
+        );
+    }
+
+    for (id, default_effort) in [
+        ("gpt-5.6-sol", "low"),
+        ("gpt-5.6-terra", "medium"),
+        ("gpt-5.6-luna", "medium"),
+    ] {
         let entry = model_entry(&parsed, id);
         assert_eq!(entry["model"].as_str(), Some(id), "wire id == catalog id");
         assert_eq!(entry["model_provider"].as_str(), Some("openai-codex"));
@@ -2617,7 +2767,11 @@ fn the_openai_codex_preset_matches_the_shape_the_spike_proved() {
         assert_eq!(entry["codex_compat"].as_bool(), Some(true), "{id}");
         assert_eq!(entry["model_family"].as_str(), Some("openai-codex"), "{id}");
         assert_eq!(entry["supports_reasoning_effort"].as_bool(), Some(true));
-        assert_eq!(entry["reasoning_effort"].as_str(), Some("medium"));
+        assert_eq!(
+            entry["reasoning_effort"].as_str(),
+            Some(default_effort),
+            "{id}"
+        );
         assert_eq!(
             entry["reasoning_efforts"]
                 .as_array()
@@ -2625,8 +2779,8 @@ fn the_openai_codex_preset_matches_the_shape_the_spike_proved() {
                 .iter()
                 .filter_map(toml::Value::as_str)
                 .collect::<Vec<_>>(),
-            vec!["low", "medium", "high", "xhigh"],
-            "{id}: the endpoint rejects `minimal`"
+            vec!["low", "medium", "high", "xhigh", "max"],
+            "{id}: `ultra` is orchestration, not a wire effort gx can express"
         );
         // Never a temperature/top_p/max_completion_tokens: the endpoint 400s on
         // each of them, and codex_compat drops them, but shipping one would
