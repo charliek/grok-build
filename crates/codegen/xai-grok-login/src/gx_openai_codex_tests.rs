@@ -585,7 +585,7 @@ fn a_store_refreshed_while_we_waited_for_the_lock_is_not_refreshed_again() {
     });
 
     // Hold the lock, as a sibling gx process mid-refresh would.
-    let held = crate::providers_cmd::lock_providers_at(&store.paths.lock, Duration::from_secs(5))
+    let held = super::lock_auth_at(&store.paths.lock, Duration::from_secs(5))
         .expect("lock");
 
     let paths = store.paths.clone();
@@ -903,7 +903,7 @@ fn a_forced_refresh_yields_to_a_token_this_process_never_saw() {
     let store = Store::new(&fixture_json(&jwt(NOW + 3600, None), "rt-old", None));
     let endpoint = MockEndpoint::ok(refreshed(NOW + 7200));
 
-    let held = crate::providers_cmd::lock_providers_at(&store.paths.lock, Duration::from_secs(5))
+    let held = super::lock_auth_at(&store.paths.lock, Duration::from_secs(5))
         .expect("lock");
     let paths = store.paths.clone();
     let ep = Arc::clone(&endpoint);
@@ -1221,7 +1221,7 @@ fn a_forced_refresh_compares_the_whole_credential_not_just_the_access_token() {
     let store = Store::new(&fixture_json(&access, "rt-old", None));
     let endpoint = MockEndpoint::ok(refreshed(NOW + 7200));
 
-    let held = crate::providers_cmd::lock_providers_at(&store.paths.lock, Duration::from_secs(5))
+    let held = super::lock_auth_at(&store.paths.lock, Duration::from_secs(5))
         .expect("lock");
     let paths = store.paths.clone();
     let ep = Arc::clone(&endpoint);

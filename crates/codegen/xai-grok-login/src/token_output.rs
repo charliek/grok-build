@@ -24,6 +24,17 @@ fn reject_control_chars(token: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Trim, reject empty, reject control characters. Shared by `parse_token_output`
+/// and the gx in-process openai-codex mint so both fail closed the same way.
+pub(crate) fn normalize_access_token(token: &str) -> anyhow::Result<String> {
+    let token = token.trim();
+    if token.is_empty() {
+        anyhow::bail!("empty access_token");
+    }
+    reject_control_chars(token)?;
+    Ok(token.to_owned())
+}
+
 /// `now + secs`, or `None` on overflow.
 pub fn expiry_after_seconds(secs: u64) -> Option<chrono::DateTime<chrono::Utc>> {
     let secs = i64::try_from(secs).ok()?;
@@ -57,11 +68,7 @@ pub fn parse_token_output(output: &std::process::Output) -> anyhow::Result<Parse
     if stdout.starts_with('{') {
         let parsed: ExternalAuthOutput = serde_json::from_str(stdout)
             .map_err(|e| anyhow::anyhow!("produced JSON that is not a token payload: {e}"))?;
-        let access_token = parsed.access_token.trim().to_owned();
-        if access_token.is_empty() {
-            anyhow::bail!("produced JSON with an empty access_token");
-        }
-        reject_control_chars(&access_token)?;
+        let access_token = normalize_access_token(&parsed.access_token)?;
         tracing::debug!(
             has_refresh_token = parsed.refresh_token.is_some(),
             expires_in = ?parsed.expires_in,
@@ -79,13 +86,13 @@ pub fn parse_token_output(output: &std::process::Output) -> anyhow::Result<Parse
         });
     }
 
-    reject_control_chars(stdout)?;
+    let access_token = normalize_access_token(stdout)?;
     tracing::debug!(
-        stdout_len = stdout.len(),
+        stdout_len = access_token.len(),
         "auth: treating output as bare token"
     );
     Ok(ParsedTokenOutput {
-        access_token: stdout.to_owned(),
+        access_token,
         refresh_token: None,
         expires_at: None,
         issuer: None,
