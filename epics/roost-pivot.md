@@ -6,6 +6,8 @@
 
 **Why this exists — read first:**
 https://claude.ai/code/artifact/add27f67-3d15-4541-bd3f-eda3f34fcc48
+(Private — opens with the owner's claude.ai login. A 404 from anywhere
+else is expected, not a broken link.)
 Sections that matter here: §02 (the handoff matrix — the one red cell is
 gx's), §04 Q9 (where gx fits, and the leader trap), §06 Track A.
 
