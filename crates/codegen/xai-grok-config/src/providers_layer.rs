@@ -191,6 +191,31 @@ pub(crate) fn filter_providers_layer(value: toml::Value, source: &Path) -> Optio
 /// `gx providers install` so the runtime fallback recognizes the same helper.
 pub const GX_TOKEN_HELPER_ARGS: &[&str] = &["providers", "token", "openai"];
 
+/// gx: bare `gx`, or an absolute path whose file name is `gx`. Relative paths
+/// (including `bin/gx`) are the user's and must not be rewritten.
+pub fn is_gx_helper_command(command: &str) -> bool {
+    if command == "gx" {
+        return true;
+    }
+    let path = Path::new(command);
+    path.is_absolute() && path.file_name().is_some_and(|n| n == "gx")
+}
+
+/// gx: `auth.args` is exactly the shipped openai-codex helper argv.
+pub fn args_are_gx_token_helper(args: Option<&[String]>) -> bool {
+    args.is_some_and(|a| {
+        a.len() == GX_TOKEN_HELPER_ARGS.len()
+            && a.iter()
+                .map(String::as_str)
+                .eq(GX_TOKEN_HELPER_ARGS.iter().copied())
+    })
+}
+
+/// gx: shipped openai-codex helper: gx-shaped command (after trim) + exact helper args.
+pub fn is_shipped_gx_token_helper(command: &str, args: Option<&[String]>) -> bool {
+    args_are_gx_token_helper(args) && is_gx_helper_command(command.trim())
+}
+
 /// gx: command to spawn when a baked helper path is gone: this binary when it
 /// is named `gx`, otherwise the bare `gx` on PATH.
 pub fn gx_helper_replacement() -> String {
@@ -216,13 +241,7 @@ pub fn stale_gx_helper_fallback(
     if !path.is_absolute() || !path.file_name().is_some_and(|n| n == "gx") {
         return None;
     }
-    let args_match = args.is_some_and(|a| {
-        a.len() == GX_TOKEN_HELPER_ARGS.len()
-            && a.iter()
-                .map(String::as_str)
-                .eq(GX_TOKEN_HELPER_ARGS.iter().copied())
-    });
-    if !args_match || path.is_file() {
+    if !args_are_gx_token_helper(args) || path.is_file() {
         return None;
     }
     Some(replacement.to_owned())
