@@ -1,6 +1,9 @@
 pub(crate) mod api_key_probe;
 pub(crate) mod attribution;
 mod auth_provider;
+// gx: openai-codex mint/lock live here so the auth-provider seam can call them
+// in-process. Pager keeps a thin façade plus `run_login`.
+pub mod gx_openai_codex;
 pub(crate) mod backend;
 mod config;
 pub mod credential_provider;

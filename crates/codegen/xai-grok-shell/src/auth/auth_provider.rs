@@ -9,7 +9,7 @@
 //!
 //! This is distinct from the `AuthCredentialProvider` HTTP consumers in [`crate::auth::credential_provider`].
 
-use super::token_output::{expiry_after_seconds, parse_token_output};
+use super::token_output::{expiry_after_seconds, normalize_access_token, parse_token_output};
 
 /// One named `[auth_provider.<name>]` table, honored only from the trusted config layers (`parse_auth_providers`).
 /// A new field here needs a `parse_auth_providers` warning decision.
@@ -325,10 +325,10 @@ fn resolve_program(command: &str, cwd: Option<&std::path::Path>) -> std::path::P
 }
 
 /// gx: mise/cargo reinstalls leave a dangling absolute helper path in
-/// `providers.toml`. Fall back to this binary (or PATH `gx`) so ChatGPT
-/// turns don't 401 after an upgrade; `gx providers install` persists the
-/// new path. The predicate runs on the raw trimmed command *before* any
-/// cwd join, so a relative `bin/gx` is never rewritten.
+/// `providers.toml`. Last-resort spawn fallback when the baked path is gone
+/// and the in-process intercept did not run (stock build, non-empty cwd, or
+/// a helper that is not gx-shaped). The predicate runs on the raw trimmed
+/// command *before* any cwd join, so a relative `bin/gx` is never rewritten.
 fn resolve_auth_program(
     command: &str,
     args: Option<&[String]>,
@@ -347,7 +347,7 @@ fn resolve_auth_program(
                 missing = %command,
                 fallback = %fallback,
                 "gx: openai-codex helper path is gone; falling back so ChatGPT auth still mints. \
-                 Re-run `gx providers install` to persist the new path"
+                 Re-run `gx providers install` to write the sentinel command"
             );
             fallback
         }
@@ -361,10 +361,75 @@ async fn mint_provider_token(
     mark_expired: bool,
     previous: Option<&MintedProviderToken>,
 ) -> anyhow::Result<MintedProviderToken> {
+    mint_provider_token_for(
+        provider,
+        mark_expired,
+        previous,
+        xai_grok_version::is_gx_build(),
+    )
+    .await
+}
+
+async fn mint_provider_token_for(
+    provider: &AuthProviderRef,
+    mark_expired: bool,
+    previous: Option<&MintedProviderToken>,
+    is_gx: bool,
+) -> anyhow::Result<MintedProviderToken> {
+    mint_provider_token_with(provider, mark_expired, previous, is_gx, None).await
+}
+
+/// gx: optional injected store/endpoint so unit tests never touch `~/.codex`
+/// or `auth.openai.com`. Production passes `None` (reads `$CODEX_HOME` / `~/.codex`).
+enum InProcessCodexMint {
+    At {
+        paths: super::gx_openai_codex::CodexPaths,
+        token_endpoint_url: Option<String>,
+    },
+}
+
+async fn mint_provider_token_with(
+    provider: &AuthProviderRef,
+    mark_expired: bool,
+    previous: Option<&MintedProviderToken>,
+    is_gx: bool,
+    in_process: Option<InProcessCodexMint>,
+) -> anyhow::Result<MintedProviderToken> {
     use std::process::Stdio;
 
     let name = &provider.name;
     let config = &provider.config;
+    // gx: shipped openai-codex helper mints in this process (sentinel or legacy absolute path).
+    // `cwd` must be unset (`None`); a present field, even whitespace, still spawns.
+    // `timeout_secs` / `token_ttl_secs` do not block intercept.
+    // Worst-case bound: lock 90s + up to three 30s POSTs (refresh, invalid_grant
+    // retry, journal). Dropping this future does not cancel `spawn_blocking`.
+    if is_gx
+        && config.cwd.is_none()
+        && xai_grok_config::is_shipped_gx_token_helper(
+            config.command.trim(),
+            config.args.as_deref(),
+        )
+    {
+        tracing::info!(provider = %name, mark_expired, "gx: openai-codex in-process mint");
+        return match in_process {
+            Some(InProcessCodexMint::At {
+                paths,
+                token_endpoint_url,
+            }) => {
+                mint_openai_codex_in_process_at(
+                    paths,
+                    name,
+                    config,
+                    mark_expired,
+                    token_endpoint_url,
+                )
+                .await
+            }
+            None => mint_openai_codex_in_process(name, config, mark_expired).await,
+        };
+    }
+
     // Clamp to [1, ceiling]: the slot lock is held across the run
     // An unbounded timeout would let one hung helper stall every turn sharing this provider name
     // The ceiling is a hard bound, not just a parse warning
@@ -453,6 +518,93 @@ async fn mint_provider_token(
         expires_at,
         minted_with: config.clone(),
     })
+}
+
+/// gx: production in-process mint. Reads `$CODEX_HOME` / `~/.codex` via
+/// [`super::gx_openai_codex::CodexPaths::from_env`].
+async fn mint_openai_codex_in_process(
+    name: &str,
+    config: &AuthProviderConfig,
+    mark_expired: bool,
+) -> anyhow::Result<MintedProviderToken> {
+    let Some(paths) = super::gx_openai_codex::CodexPaths::from_env() else {
+        anyhow::bail!("cannot locate a home directory to find ~/.codex/auth.json");
+    };
+    mint_openai_codex_in_process_at(paths, name, config, mark_expired, None).await
+}
+
+/// gx: in-process openai-codex mint with injectable store and optional local
+/// token endpoint. Never wraps `spawn_blocking` in `tokio::time::timeout`.
+/// On mint error, return that error — never fall back to spawn.
+async fn mint_openai_codex_in_process_at(
+    paths: super::gx_openai_codex::CodexPaths,
+    name: &str,
+    config: &AuthProviderConfig,
+    mark_expired: bool,
+    token_endpoint_url: Option<String>,
+) -> anyhow::Result<MintedProviderToken> {
+    let minted = tokio::task::spawn_blocking(move || {
+        let clock = super::gx_openai_codex::SystemClock;
+        let endpoint = match token_endpoint_url {
+            Some(url) => super::gx_openai_codex::HttpTokenEndpoint {
+                url,
+                ..super::gx_openai_codex::HttpTokenEndpoint::default()
+            },
+            None => super::gx_openai_codex::HttpTokenEndpoint::default(),
+        };
+        let mut opts = super::gx_openai_codex::MintOptions::new(&paths, &clock, &endpoint);
+        opts.force_refresh = mark_expired;
+        super::gx_openai_codex::mint_token(&opts)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("gx openai-codex in-process mint task failed: {e}"))??;
+    map_in_process_minted_token(name, config, minted)
+}
+
+fn map_in_process_minted_token(
+    name: &str,
+    config: &AuthProviderConfig,
+    minted: super::gx_openai_codex::MintedToken,
+) -> anyhow::Result<MintedProviderToken> {
+    let token = normalize_access_token(&minted.access_token)?;
+    let expires_at = u64::try_from(minted.expires_in)
+        .ok()
+        .and_then(expiry_after_seconds)
+        .or_else(|| crate::auth::parse_jwt_expiration(&token));
+    tracing::info!(
+        provider = %name,
+        expires_at = ?expires_at,
+        "auth provider minted token"
+    );
+    Ok(MintedProviderToken {
+        token,
+        refresh_token: None,
+        minted_at: std::time::Instant::now(),
+        expires_at,
+        minted_with: config.clone(),
+    })
+}
+
+#[cfg(test)]
+async fn mint_provider_token_for_at(
+    provider: &AuthProviderRef,
+    mark_expired: bool,
+    previous: Option<&MintedProviderToken>,
+    is_gx: bool,
+    paths: super::gx_openai_codex::CodexPaths,
+    token_endpoint_url: Option<String>,
+) -> anyhow::Result<MintedProviderToken> {
+    mint_provider_token_with(
+        provider,
+        mark_expired,
+        previous,
+        is_gx,
+        Some(InProcessCodexMint::At {
+            paths,
+            token_endpoint_url,
+        }),
+    )
+    .await
 }
 
 #[derive(Debug, PartialEq, Eq)]
