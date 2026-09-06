@@ -34,9 +34,12 @@ with a `// gx:` comment where it has to live inside a file upstream also owns (`
   `providers_cmd_tests.rs`) — the `gx providers install|set-key|unset-key|status|login|token`
   subcommand tree. Wired into `crates/codegen/xai-grok-pager/src/app/cli.rs` (`Command`
   enum) and dispatched in `crates/codegen/xai-grok-pager-bin/src/main.rs`.
-- **OpenAI/Codex credentials:** `crates/codegen/xai-grok-pager/src/openai_codex_auth.rs`
-  — reads/refreshes `~/.codex/auth.json`, mints tokens for the `openai-codex`
-  auth-provider seam, owns the `.gx-auth.lock` cross-process lock next to `auth.json`.
+- **OpenAI/Codex credentials:** mint/lock live in
+  `crates/codegen/xai-grok-login/src/gx_openai_codex.rs` (in-process seam
+  in `auth_provider.rs`; upstream extracted auth into `xai-grok-login`).
+  Pager `openai_codex_auth.rs` is a thin façade plus `run_login`
+  (`codex` PATH lookup is pager diagnostics). The shell still re-exports
+  this crate as `xai_grok_shell::auth`.
 - **Providers layer (config):** `crates/codegen/xai-grok-config/src/providers_layer.rs`
   (+ `providers_layer_tests.rs`) — loads `$GROK_HOME/providers.toml` and merges it into
   the user config tier, over `config.toml`. Also touches
@@ -114,7 +117,8 @@ cargo test -p xai-grok-update --locked -- \
   --skip install_scripts_allow_custom_https_proxy_url \
   --skip install_scripts_refuse_bad_proxy_url_for_deployment_key
 cargo test -p xai-grok-version --locked
-cargo test -p xai-grok-shell --lib --locked -- leader:: agent::model_providers::tests:: agent::reasoning_family session_compact auth::auth_provider::tests::resolve_auth_program
+cargo test -p xai-grok-shell --lib --locked -- leader:: agent::model_providers::tests:: agent::reasoning_family session_compact
+cargo test -p xai-grok-login --lib --locked -- auth_provider::tests::resolve_auth_program gx_openai_codex auth_provider::tests::shipped_gx_helper
 cargo test -p xai-grok-shell --locked --bin chat-history-downgrade
 ```
 
@@ -187,7 +191,7 @@ keep them from stepping on each other:
   set-key` reads from a no-echo TTY prompt or piped stdin only — argv is visible in
   shell history and process listings. Any new credential-entry command must follow the
   same rule.
-- Same rule for the OpenAI/codex path: `openai_codex_auth.rs` reads and refreshes
-  `~/.codex/auth.json` and writes its own `.gx-auth.lock` beside it (mode `0600`,
-  never a byte inside `auth.json` itself) — never log a token, refresh token, or
-  Authorization header, even at debug level.
+- Same rule for the OpenAI/codex path: `xai-grok-login/src/gx_openai_codex.rs`
+  reads and refreshes `~/.codex/auth.json` and writes its own `.gx-auth.lock`
+  beside it (mode `0600`, never a byte inside `auth.json` itself) — never log a
+  token, refresh token, or Authorization header, even at debug level.

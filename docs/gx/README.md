@@ -60,15 +60,16 @@ mise upgrade github:charliek/grok-build --minimum-release-age 0
 
 After 24 hours a plain `mise upgrade github:charliek/grok-build` picks it up normally.
 
-`gx providers install` bakes this binary's absolute path into
-`openai-codex.auth.command`. A mise upgrade that removes the old versioned
-directory leaves that path dangling. gx **falls back to this binary at mint
-time** when the baked path is gone, so a *new* session after the upgrade still
-gets a ChatGPT token without re-running install. `gx providers status` may
-still warn `HELPER MISSING` until you re-run `gx providers install` (no
-`--force` needed: the shipped helper shape is refreshed in place) to persist
-the new path. Restart any gx session that was already running — there is no
-hot reload.
+`gx providers install` writes `openai-codex.auth.command = "gx"`. That sentinel
+means the running gx binary mints ChatGPT tokens **in-process** — it never
+PATH-execs `gx`, and a leftover absolute path from an older install with the
+same helper args is also intercepted. A mise upgrade and `target/release/gx`
+therefore do **not** need `gx providers install` for ChatGPT turns to keep
+working. Restart the session after switching binaries; there is no hot reload.
+
+Re-run `gx providers install` after `codex login` to a **different** ChatGPT
+account, so the baked `chatgpt-account-id` header matches. `gx providers token
+openai` still exists for debugging (same JSON stdout the helper used to print).
 
 ### Build from source
 
