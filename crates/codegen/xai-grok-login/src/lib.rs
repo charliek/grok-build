@@ -22,6 +22,9 @@ pub mod error;
 pub mod external_auth;
 pub mod flow;
 pub mod grok_auth_credentials;
+// gx: openai-codex mint/lock live here so the auth-provider seam can call them
+// in-process. Pager keeps a thin façade plus `run_login`.
+pub mod gx_openai_codex;
 pub mod jwt;
 pub mod manager;
 pub mod model;

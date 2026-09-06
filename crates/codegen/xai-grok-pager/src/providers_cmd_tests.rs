@@ -67,9 +67,11 @@ fn no_env(_: &str) -> Option<String> {
 /// binary path or read the real `~/.codex/auth.json`, so every `install_at`
 /// call takes this instead of `PresetContext::detect()`.
 fn ctx() -> PresetContext {
-    PresetContext::fixed(GX_BIN, Some(FIXTURE_ACCOUNT))
+    PresetContext::fixed("gx", Some(FIXTURE_ACCOUNT))
 }
 
+/// A leftover absolute helper path from a pre-sentinel install. Not written
+/// by `ctx()` anymore; used to plant/recognize the old shape.
 const GX_BIN: &str = "/opt/gx/bin/gx";
 const FIXTURE_ACCOUNT: &str = "acct-fixture-abc123";
 
@@ -2701,10 +2703,10 @@ fn the_openai_codex_preset_matches_the_shape_the_spike_proved() {
     assert!(provider.get("env_key").is_none(), "{provider}");
     assert!(provider.get("api_key").is_none(), "{provider}");
 
-    // The auth-helper seam: gx's own binary, by absolute path, with `args`
-    // present so it execs directly instead of going through a shell.
+    // The auth-helper seam: sentinel `gx`, with `args` present so a spawn
+    // (stock grok, or a hand-added cwd) execs directly instead of a shell.
     let auth = &provider["auth"];
-    assert_eq!(auth["command"].as_str(), Some(GX_BIN));
+    assert_eq!(auth["command"].as_str(), Some("gx"));
     assert_eq!(
         auth["args"]
             .as_array()
@@ -2824,7 +2826,7 @@ fn the_openai_api_preset_is_a_plain_key_provider_with_no_catalog() {
 #[test]
 fn install_omits_the_account_header_and_says_so_when_codex_has_no_account() {
     let dir = home();
-    let ctx = PresetContext::fixed(GX_BIN, None);
+    let ctx = PresetContext::fixed("gx", None);
     let report = install_at(dir.path(), PRESETS, false, &ctx).expect("install");
 
     let headers = &parse_providers(dir.path())["model_providers"]["openai-codex"]["extra_headers"];
@@ -2848,19 +2850,17 @@ fn install_omits_the_account_header_and_says_so_when_codex_has_no_account() {
 #[test]
 fn install_refreshes_a_moved_binary_and_a_switched_account_without_force() {
     let dir = home();
-    install_at(dir.path(), PRESETS, false, &ctx()).expect("first install");
+    // Simulate a leftover absolute helper from a pre-sentinel install.
+    let old = PresetContext::fixed(GX_BIN, Some(FIXTURE_ACCOUNT));
+    install_at(dir.path(), PRESETS, false, &old).expect("first install");
 
-    // gx was reinstalled elsewhere and the user signed into another ChatGPT
-    // account: both values are machine-derived, so re-running `install` must
-    // fix them rather than treat them as hand edits.
-    let moved = PresetContext::fixed("/usr/local/bin/gx", Some("acct-second-999"));
+    // Re-running `install` rewrites the baked path to the sentinel and
+    // refreshes a switched ChatGPT account, without `--force`.
+    let moved = PresetContext::fixed("gx", Some("acct-second-999"));
     let report = install_at(dir.path(), PRESETS, false, &moved).expect("second install");
 
     let provider = &parse_providers(dir.path())["model_providers"]["openai-codex"];
-    assert_eq!(
-        provider["auth"]["command"].as_str(),
-        Some("/usr/local/bin/gx")
-    );
+    assert_eq!(provider["auth"]["command"].as_str(), Some("gx"));
     assert_eq!(
         provider["extra_headers"][CHATGPT_ACCOUNT_HEADER].as_str(),
         Some("acct-second-999")
@@ -3024,28 +3024,36 @@ fn status_reports_the_same_refresh_verdict_the_token_command_acts_on() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn status_warns_when_the_installed_helper_path_no_longer_exists() {
-    // The preset bakes gx's own absolute path into `auth.command` so the helper
-    // works without gx on PATH — which means moving or rebuilding the binary
-    // leaves a dangling reference. grok's symptom is a helper that will not
-    // spawn, several layers from here; this line is what names the cause.
+fn status_does_not_warn_when_a_shipped_helper_path_is_gone() {
+    // A leftover absolute `gx` helper is still the shipped shape and mints
+    // in-process, so a missing file is unused — not HELPER MISSING.
     let dir = home();
-    install_at(dir.path(), PRESETS, false, &ctx()).expect("install");
+    let old = PresetContext::fixed(GX_BIN, Some(FIXTURE_ACCOUNT));
+    install_at(dir.path(), PRESETS, false, &old).expect("install");
+    let auth = write_codex_fixture(dir.path(), 1_800_000_000);
+
+    let rendered = render_status(&status_report(dir.path(), Some(&auth), &no_env), 0);
+
+    assert!(!rendered.contains("HELPER MISSING"), "{rendered}");
+}
+
+#[test]
+fn status_warns_when_a_dangling_non_gx_helper_path_is_gone() {
+    let dir = home();
+    fs::write(
+        providers_path(dir.path()),
+        r#"
+[model_providers.openai-codex]
+auth = { command = "/opt/vault/mint-openai", args = ["--scope", "codex"] }
+"#,
+    )
+    .unwrap();
     let auth = write_codex_fixture(dir.path(), 1_800_000_000);
 
     let rendered = render_status(&status_report(dir.path(), Some(&auth), &no_env), 0);
 
     assert!(rendered.contains("HELPER MISSING"), "{rendered}");
-    assert!(rendered.contains(GX_BIN), "{rendered}");
-    assert!(
-        rendered.contains("helper path missing (binary moved?)"),
-        "{rendered}"
-    );
-    assert!(
-        rendered.contains("falls back to this binary at runtime"),
-        "{rendered}"
-    );
-    assert!(rendered.contains("gx providers install"), "{rendered}");
+    assert!(rendered.contains("/opt/vault/mint-openai"), "{rendered}");
 }
 
 #[test]
@@ -3099,8 +3107,8 @@ fn only_a_machine_derived_gx_helper_counts_as_gx_shipped() {
     let shipped =
         |inline: &str| is_shipped_dynamic_shape(DynamicValue::GxTokenHelper, &auth_value(inline));
 
-    // The two shapes gx itself can write: an absolute path, and the bare `gx`
-    // fallback for when `current_exe` fails.
+    // The two shapes gx itself can write: the sentinel, and a leftover
+    // absolute path from a pre-sentinel install (still refreshable).
     assert!(shipped(
         r#"{ command = "/opt/gx/bin/gx", args = ["providers", "token", "openai"], timeout_secs = 120 }"#
     ));

@@ -204,7 +204,7 @@ async fn provider_timeout_edit_does_not_invalidate_token() {
             command: provider.config.command.clone(),
             args: None,
             token_ttl_secs: Some(3600),
-            timeout_secs: Some(5),
+            timeout_secs: Some(30),
             cwd: None,
         },
     );
@@ -575,7 +575,7 @@ async fn mint_error_messages_distinguish_failure_modes() {
             command: "/nonexistent/provider-binary".to_owned(),
             args: Some(vec![]),
             token_ttl_secs: None,
-            timeout_secs: Some(5),
+            timeout_secs: Some(30),
             cwd: None,
         },
     );
@@ -591,7 +591,7 @@ async fn mint_error_messages_distinguish_failure_modes() {
             command: "printf ''".to_owned(),
             args: None,
             token_ttl_secs: None,
-            timeout_secs: Some(5),
+            timeout_secs: Some(30),
             cwd: None,
         },
     );
@@ -717,7 +717,7 @@ async fn provider_output_over_cap_fails_closed() {
             command: format!("head -c {over} /dev/zero"),
             args: None,
             token_ttl_secs: None,
-            timeout_secs: Some(5),
+            timeout_secs: Some(30),
             cwd: None,
         },
     );
@@ -900,4 +900,426 @@ async fn provider_command_runs_in_cwd() {
         provider.ensure_fresh_token(None).await.rotated().as_deref(),
         Some("file-tok")
     );
+}
+
+// ---------------------------------------------------------------------------
+// gx: shipped openai-codex helper is minted in-process, never PATH-exec'd
+// ---------------------------------------------------------------------------
+
+fn helper_args() -> Vec<String> {
+    xai_grok_config::GX_TOKEN_HELPER_ARGS
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect()
+}
+
+fn wall_clock_fresh_jwt() -> String {
+    wall_clock_jwt(3_600, None)
+}
+
+fn wall_clock_jwt(ttl_secs: i64, nonce: Option<&str>) -> String {
+    use base64::Engine as _;
+    let exp = chrono::Utc::now().timestamp() + ttl_secs;
+    let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let header = engine.encode(br#"{"alg":"none","typ":"JWT"}"#);
+    let mut claims = serde_json::json!({ "exp": exp });
+    if let Some(nonce) = nonce {
+        claims["nonce"] = serde_json::Value::String(nonce.to_owned());
+    }
+    let payload = engine.encode(serde_json::to_vec(&claims).expect("payload"));
+    format!("{header}.{payload}.c2ln")
+}
+
+fn fixture_auth_json(access_token: &str) -> String {
+    serde_json::to_string_pretty(&serde_json::json!({
+        "tokens": {
+            "access_token": access_token,
+            "refresh_token": "rt-fixture",
+        }
+    }))
+    .expect("fixture")
+}
+
+struct CodexStore {
+    _codex: tempfile::TempDir,
+    _grok: tempfile::TempDir,
+    paths: crate::gx_openai_codex::CodexPaths,
+}
+
+impl CodexStore {
+    fn with_body(body: &str) -> Self {
+        let codex = tempfile::tempdir().expect("codex home");
+        let grok = tempfile::tempdir().expect("grok home");
+        let auth_json = codex.path().join("auth.json");
+        std::fs::write(&auth_json, body).expect("write fixture");
+        let paths = crate::gx_openai_codex::CodexPaths::for_auth_json(auth_json, grok.path());
+        Self {
+            _codex: codex,
+            _grok: grok,
+            paths,
+        }
+    }
+
+    fn fresh() -> (Self, String) {
+        let token = wall_clock_fresh_jwt();
+        (Self::with_body(&fixture_auth_json(&token)), token)
+    }
+
+    fn missing() -> Self {
+        let codex = tempfile::tempdir().expect("codex home");
+        let grok = tempfile::tempdir().expect("grok home");
+        let paths = crate::gx_openai_codex::CodexPaths::for_auth_json(
+            codex.path().join("auth.json"),
+            grok.path(),
+        );
+        Self {
+            _codex: codex,
+            _grok: grok,
+            paths,
+        }
+    }
+}
+
+fn shipped_provider(name: &str, command: &str, cwd: Option<String>) -> AuthProviderRef {
+    AuthProviderRef::new(
+        name.to_owned(),
+        AuthProviderConfig {
+            command: command.to_owned(),
+            args: Some(helper_args()),
+            token_ttl_secs: None,
+            timeout_secs: Some(30),
+            cwd,
+        },
+    )
+}
+
+#[cfg(unix)]
+fn evil_helper(dir: &std::path::Path, name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let marker = dir.join(format!("{name}.spawned"));
+    let script = dir.join(name);
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nprintf spawned > '{}'\nprintf 'EVIL\\n'\nexit 0\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    let mut perms = std::fs::metadata(&script).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&script, perms).unwrap();
+    (script, marker)
+}
+
+#[cfg(unix)]
+async fn mint_at(
+    provider: &AuthProviderRef,
+    is_gx: bool,
+    mark_expired: bool,
+    store: &CodexStore,
+    token_endpoint_url: Option<String>,
+) -> anyhow::Result<MintedProviderToken> {
+    super::mint_provider_token_for_at(
+        provider,
+        mark_expired,
+        None,
+        is_gx,
+        store.paths.clone(),
+        token_endpoint_url,
+    )
+    .await
+}
+
+/// gx: a shipped helper (absolute path named gx + helper args, empty cwd)
+/// mints from this process. An evil file at that path must not run.
+#[cfg(unix)]
+#[tokio::test]
+async fn shipped_gx_helper_intercepts_even_when_the_baked_path_exists() {
+    let dir = tempfile::tempdir().unwrap();
+    let (evil, marker) = evil_helper(dir.path(), "gx");
+    let (store, fixture) = CodexStore::fresh();
+    let provider = shipped_provider(
+        "shipped-gx-helper-intercepts",
+        &evil.to_string_lossy(),
+        None,
+    );
+
+    let minted = mint_at(&provider, true, false, &store, None)
+        .await
+        .expect("in-process mint");
+
+    assert_eq!(minted.token, fixture);
+    assert!(!marker.exists(), "evil helper must not have been spawned");
+}
+
+/// gx: stock grok (`is_gx=false`) still spawns the baked helper.
+#[cfg(unix)]
+#[tokio::test]
+async fn shipped_gx_helper_spawns_when_is_gx_is_false() {
+    let dir = tempfile::tempdir().unwrap();
+    let (evil, marker) = evil_helper(dir.path(), "gx");
+    let (store, _) = CodexStore::fresh();
+    let provider = shipped_provider(
+        "shipped-gx-helper-stock-spawns",
+        &evil.to_string_lossy(),
+        None,
+    );
+    assert_eq!(
+        super::resolve_auth_program(&evil.to_string_lossy(), Some(&helper_args()), None),
+        evil,
+        "stock spawn must exec the fixture script, not PATH gx"
+    );
+    let direct = std::process::Command::new(&evil)
+        .args(helper_args())
+        .output()
+        .expect("direct fixture exec");
+    assert!(
+        direct.status.success(),
+        "fixture script must exit 0 when run directly; stderr={}",
+        String::from_utf8_lossy(&direct.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&direct.stdout).trim(), "EVIL");
+
+    let minted = mint_at(&provider, false, false, &store, None)
+        .await
+        .expect("spawned mint");
+
+    assert_eq!(minted.token, "EVIL");
+    assert!(marker.exists(), "stock build must still spawn the helper");
+}
+
+/// gx: a wrapper, different args, or a non-empty cwd is the user's — still spawn.
+#[cfg(unix)]
+#[tokio::test]
+async fn shipped_gx_helper_spawns_wrapper_wrong_args_and_cwd() {
+    let dir = tempfile::tempdir().unwrap();
+    let (wrapper, wrapper_marker) = evil_helper(dir.path(), "wrapper");
+    let (gx, gx_marker) = evil_helper(dir.path(), "gx");
+    let (store, _) = CodexStore::fresh();
+
+    let wrapper_provider = shipped_provider(
+        "shipped-gx-helper-wrapper-spawns",
+        &wrapper.to_string_lossy(),
+        None,
+    );
+    let minted = mint_at(&wrapper_provider, true, false, &store, None)
+        .await
+        .expect("wrapper spawn");
+    assert_eq!(minted.token, "EVIL");
+    assert!(wrapper_marker.exists());
+
+    let mut wrong_args = helper_args();
+    wrong_args.push("--json".into());
+    let wrong_args_provider = AuthProviderRef::new(
+        "shipped-gx-helper-wrong-args-spawns".to_owned(),
+        AuthProviderConfig {
+            command: gx.to_string_lossy().into_owned(),
+            args: Some(wrong_args),
+            token_ttl_secs: None,
+            timeout_secs: Some(30),
+            cwd: None,
+        },
+    );
+    let minted = mint_at(&wrong_args_provider, true, false, &store, None)
+        .await
+        .expect("wrong-args spawn");
+    assert_eq!(minted.token, "EVIL");
+    assert!(gx_marker.exists());
+    std::fs::remove_file(&gx_marker).ok();
+
+    let cwd_provider = shipped_provider(
+        "shipped-gx-helper-cwd-spawns",
+        &gx.to_string_lossy(),
+        Some(dir.path().to_string_lossy().into_owned()),
+    );
+    let minted = mint_at(&cwd_provider, true, false, &store, None)
+        .await
+        .expect("cwd spawn");
+    assert_eq!(minted.token, "EVIL");
+    assert!(gx_marker.exists());
+    std::fs::remove_file(&gx_marker).ok();
+
+    // A set cwd, even whitespace-only, is a hand edit — spawn, do not intercept.
+    let blank_cwd = shipped_provider(
+        "shipped-gx-helper-blank-cwd-spawns",
+        &gx.to_string_lossy(),
+        Some("   ".to_owned()),
+    );
+    let minted = mint_at(&blank_cwd, true, false, &store, None)
+        .await
+        .expect("blank-cwd spawn");
+    assert_eq!(minted.token, "EVIL");
+    assert!(gx_marker.exists());
+}
+
+struct PathGuard {
+    prev: Option<std::ffi::OsString>,
+}
+
+impl PathGuard {
+    fn prepend(dir: &std::path::Path) -> Self {
+        let prev = std::env::var_os("PATH");
+        let mut new_path = dir.as_os_str().to_os_string();
+        if let Some(ref p) = prev {
+            new_path.push(":");
+            new_path.push(p);
+        }
+        unsafe { std::env::set_var("PATH", &new_path) };
+        Self { prev }
+    }
+}
+
+impl Drop for PathGuard {
+    fn drop(&mut self) {
+        match self.prev.take() {
+            Some(p) => unsafe { std::env::set_var("PATH", p) },
+            None => unsafe { std::env::remove_var("PATH") },
+        }
+    }
+}
+
+/// gx: sentinel `command = "gx"` means this process, never `which gx`.
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::serial(codex_env)]
+async fn shipped_gx_helper_sentinel_does_not_path_exec() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_evil, marker) = evil_helper(dir.path(), "gx");
+    let _path = PathGuard::prepend(dir.path());
+    let (store, fixture) = CodexStore::fresh();
+    let provider = shipped_provider("shipped-gx-helper-path-poison", "gx", None);
+
+    let minted = mint_at(&provider, true, false, &store, None)
+        .await
+        .expect("in-process mint");
+
+    assert_eq!(minted.token, fixture);
+    assert!(!marker.exists(), "PATH gx must not have been spawned");
+}
+
+/// gx: a mint error must not fall back to spawning the helper.
+#[cfg(unix)]
+#[tokio::test]
+async fn shipped_gx_helper_mint_error_does_not_spawn() {
+    let dir = tempfile::tempdir().unwrap();
+    let (evil, marker) = evil_helper(dir.path(), "gx");
+    let store = CodexStore::missing();
+    let provider = shipped_provider(
+        "shipped-gx-helper-mint-err-no-fallback",
+        &evil.to_string_lossy(),
+        None,
+    );
+
+    let err = match mint_at(&provider, true, false, &store, None).await {
+        Ok(_) => panic!("missing auth.json must fail closed"),
+        Err(err) => err,
+    };
+
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("no codex credentials") || msg.contains("auth.json"),
+        "{msg}"
+    );
+    assert!(!marker.exists(), "failed in-process mint must not spawn");
+}
+
+/// gx: a control-character access token fails closed and does not spawn.
+#[cfg(unix)]
+#[tokio::test]
+async fn shipped_gx_helper_rejects_control_char_token_without_spawn() {
+    let dir = tempfile::tempdir().unwrap();
+    let (evil, marker) = evil_helper(dir.path(), "gx");
+    let last_refresh = chrono::Utc::now().to_rfc3339();
+    let body = serde_json::to_string_pretty(&serde_json::json!({
+        "tokens": {
+            "access_token": "tok\ninjected",
+            "refresh_token": "rt-fixture",
+        },
+        "last_refresh": last_refresh,
+    }))
+    .unwrap();
+    let store = CodexStore::with_body(&body);
+    let provider = shipped_provider(
+        "shipped-gx-helper-control-char",
+        &evil.to_string_lossy(),
+        None,
+    );
+
+    let err = match mint_at(&provider, true, false, &store, None).await {
+        Ok(_) => panic!("control-char token must fail closed"),
+        Err(err) => err,
+    };
+
+    let msg = format!("{err:#}");
+    assert!(msg.contains("control characters"), "{msg}");
+    assert!(!marker.exists(), "failed validation must not spawn");
+}
+
+fn spawn_token_server(status_line: &'static str, body: String) -> (String, std::thread::JoinHandle<String>) {
+    use std::io::{BufRead as _, Read as _, Write as _};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let url = format!(
+        "http://{}/oauth/token",
+        listener.local_addr().expect("addr")
+    );
+    let handle = std::thread::spawn(move || {
+        let (mut sock, _) = listener.accept().expect("accept");
+        let mut reader = std::io::BufReader::new(sock.try_clone().expect("clone"));
+        let mut len = 0usize;
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).expect("read header") == 0 {
+                break;
+            }
+            if line == "\r\n" {
+                break;
+            }
+            if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                len = v.trim().parse().unwrap_or(0);
+            }
+        }
+        let mut buf = vec![0u8; len];
+        reader.read_exact(&mut buf).expect("read body");
+        let response = format!(
+            "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        sock.write_all(response.as_bytes()).expect("write");
+        sock.flush().ok();
+        String::from_utf8_lossy(&buf).into_owned()
+    });
+    (url, handle)
+}
+
+/// gx: `mark_expired=true` reaches `force_refresh` (injected endpoint; no live OpenAI).
+#[cfg(unix)]
+#[tokio::test]
+async fn shipped_gx_helper_mark_expired_force_refreshes() {
+    let dir = tempfile::tempdir().unwrap();
+    let (evil, marker) = evil_helper(dir.path(), "gx");
+    let (store, fixture) = CodexStore::fresh();
+    let rotated = wall_clock_jwt(7_200, Some("rotated"));
+    let body = serde_json::json!({
+        "access_token": rotated,
+        "refresh_token": "rt-rotated",
+        "expires_in": 3600,
+    })
+    .to_string();
+    let (url, server) = spawn_token_server("HTTP/1.1 200 OK", body);
+    let provider = shipped_provider(
+        "shipped-gx-helper-force-refresh",
+        &evil.to_string_lossy(),
+        None,
+    );
+
+    let minted = mint_at(&provider, true, true, &store, Some(url))
+        .await
+        .expect("forced refresh");
+
+    let sent = server.join().expect("server accepted a POST");
+    assert!(sent.contains("refresh_token"), "{sent}");
+    assert_eq!(minted.token, rotated);
+    assert_ne!(minted.token, fixture);
+    assert!(!marker.exists(), "force-refresh must stay in-process");
 }

@@ -100,8 +100,16 @@ jobs:
             leader:: \
             agent::model_providers::tests:: \
             agent::reasoning_family \
-            session_compact \
-            auth::auth_provider::tests::resolve_auth_program
+            session_compact
+
+      # gx: auth extracted to xai-grok-login in upstream 1.0.24; the in-process
+      # openai-codex mint and its tests moved with it.
+      - name: Test xai-grok-login (gx openai-codex subset)
+        run: |
+          cargo test -p xai-grok-login --lib --locked -- \
+            auth_provider::tests::resolve_auth_program \
+            gx_openai_codex \
+            auth_provider::tests::shipped_gx_helper
 
       - name: Test xai-grok-shell (chat-history-downgrade bin)
         run: cargo test -p xai-grok-shell --locked --bin chat-history-downgrade

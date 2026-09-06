@@ -38,7 +38,7 @@ pub mod models;
 pub mod notifications;
 #[allow(unused_imports, unused_macros)]
 pub mod obf;
-// gx: OpenAI (ChatGPT/Codex-plan) credentials for `gx providers token openai`.
+// gx: façade + `run_login`; mint/lock live in xai-grok-shell `auth::gx_openai_codex`.
 pub(crate) mod openai_codex_auth;
 pub mod plugin_cmd;
 // gx: `gx providers` — the CLI for $GROK_HOME/providers.toml.

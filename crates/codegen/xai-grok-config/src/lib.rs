@@ -85,8 +85,9 @@ pub use paths::{
 };
 // gx: the providers layer's public surface (the `gx providers` CLI writes this file).
 pub use providers_layer::{
-    GX_TOKEN_HELPER_ARGS, PROVIDERS_FILENAME, PROVIDERS_LAYER_TABLES, gx_helper_replacement,
-    providers_layer_path, stale_gx_helper_fallback,
+    GX_TOKEN_HELPER_ARGS, PROVIDERS_FILENAME, PROVIDERS_LAYER_TABLES, args_are_gx_token_helper,
+    gx_helper_replacement, is_gx_helper_command, is_shipped_gx_token_helper, providers_layer_path,
+    stale_gx_helper_fallback,
 };
 pub use validation::{
     RequirementsError, RequirementsLayer, RequirementsSource, load_merged_requirements,

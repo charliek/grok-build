@@ -246,9 +246,9 @@ impl PresetField {
 /// reads from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PresetContext {
-    /// How to invoke gx from a config file. The **current executable's**
-    /// absolute path when it can be resolved, so the preset keeps working when
-    /// `gx` is not on `PATH`; bare `gx` otherwise.
+    /// How to invoke gx from a config file. Always the sentinel `"gx"`: the
+    /// auth-provider seam mints in-process in the running binary and never
+    /// PATH-execs this value.
     pub gx_command: String,
     /// `tokens.account_id` from `~/.codex/auth.json` at install time.
     pub codex_account_id: Option<String>,
@@ -257,19 +257,10 @@ pub(crate) struct PresetContext {
 }
 
 impl PresetContext {
-    /// Resolve from this machine: the running binary and the codex store.
+    /// Resolve from this machine: sentinel helper command and the codex store.
     pub(crate) fn detect() -> Self {
-        let mut notes = Vec::new();
-        let gx_command = match std::env::current_exe() {
-            Ok(path) => path.to_string_lossy().into_owned(),
-            Err(e) => {
-                notes.push(format!(
-                    "could not resolve this binary's own path ({e}); the openai-codex \
-                     auth helper was written as plain `gx`, which must be on PATH."
-                ));
-                "gx".to_owned()
-            }
-        };
+        let notes = Vec::new();
+        let gx_command = "gx".to_owned();
         let codex_account_id = crate::openai_codex_auth::codex_auth_json_path()
             .and_then(|p| crate::openai_codex_auth::read_auth_document(&p).ok())
             .and_then(|doc| doc.account_id());
@@ -397,11 +388,6 @@ fn is_shipped_dynamic_shape(kind: DynamicValue, existing: &toml::Value) -> bool 
     };
     match kind {
         DynamicValue::GxTokenHelper => {
-            let args: Vec<&str> = table
-                .get("args")
-                .and_then(toml::Value::as_array)
-                .map(|a| a.iter().filter_map(toml::Value::as_str).collect())
-                .unwrap_or_default();
             // All three, because each alone is too weak. The args say what is
             // being invoked; the command says it is *gx* invoking it — a
             // wrapper script that happens to call `gx providers token openai`
@@ -410,14 +396,24 @@ fn is_shipped_dynamic_shape(kind: DynamicValue, existing: &toml::Value) -> bool 
             // an `env`, a `cwd`, a longer `timeout_secs` under a key gx never
             // ships is a hand edit, and replacing the whole inline table would
             // drop it.
-            let command_is_gx = table
+            let command = table
                 .get("command")
                 .and_then(toml::Value::as_str)
-                .is_some_and(is_gx_command);
+                .unwrap_or("");
+            let args: Option<Vec<String>> = table.get("args").and_then(toml::Value::as_array).map(
+                |a| {
+                    a.iter()
+                        .filter_map(toml::Value::as_str)
+                        .map(str::to_owned)
+                        .collect()
+                },
+            );
+            let command_and_args =
+                xai_grok_config::is_shipped_gx_token_helper(command, args.as_deref());
             let only_shipped_keys = table
                 .keys()
                 .all(|k| k == "command" || k == "args" || k == "timeout_secs");
-            args == TOKEN_HELPER_ARGS && command_is_gx && only_shipped_keys
+            command_and_args && only_shipped_keys
         }
         DynamicValue::CodexHeaders => {
             let originator_is_gx =
@@ -428,18 +424,6 @@ fn is_shipped_dynamic_shape(kind: DynamicValue, existing: &toml::Value) -> bool 
             originator_is_gx && only_shipped_keys
         }
     }
-}
-
-/// Whether `command` is one gx itself could have written: bare `gx` (the
-/// fallback when `current_exe` fails) or an absolute path whose file name is
-/// `gx` (a gx binary, wherever it was installed). A relative path, or an
-/// absolute one pointing at anything else, belongs to the user.
-fn is_gx_command(command: &str) -> bool {
-    if command == "gx" {
-        return true;
-    }
-    let path = Path::new(command);
-    path.is_absolute() && path.file_name().is_some_and(|n| n == "gx")
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -824,10 +808,11 @@ const FIREWORKS_DEEPSEEK_FLASH_FIELDS: &[PresetField] = &[
 // - NO `env_key`, and `set-key` refuses this provider: a static key or env key
 //   beats the auth-provider token in credential resolution, which would shadow
 //   the codex credentials this preset exists to use.
-// - `auth` is the inline auth-helper seam: gx's own binary, minting from
-//   `~/.codex/auth.json` (see `crate::openai_codex_auth`). Resolved to the
-//   running executable's absolute path at install time so the entry keeps
-//   working when `gx` is not on PATH.
+// - `auth` is the inline auth-helper seam: sentinel `command = "gx"` with
+//   `args = ["providers", "token", "openai"]`. A gx build mints in-process
+//   from `~/.codex/auth.json` (see `crate::openai_codex_auth`); the sentinel
+//   is never PATH-exec'd. Legacy absolute paths with the same args also mint
+//   in-process.
 // - `chatgpt-account-id` and `originator` are optional today (the spike passed
 //   without each) but are sent anyway as drift insurance; both codex and
 //   CLIProxyAPI send them.
@@ -2319,24 +2304,27 @@ fn installed_openai_codex_entry(
     )
 }
 
-/// Flag an installed `auth.command` that is an absolute path to nothing.
-///
-/// The preset writes gx's own absolute path so the helper keeps working when
-/// `gx` is not on `PATH` — which means moving, reinstalling or `cargo clean`ing
-/// the binary turns the entry into a dangling reference. grok's failure there
-/// is a helper that will not spawn, several layers away from this file; saying
-/// so here is the difference between "re-run install" and a debugging session.
-/// Only absolute paths are checked: a bare `gx` (or any other relative command)
-/// is resolved against `PATH` at spawn time, which is not this function's to
-/// second-guess.
+/// Flag an installed `auth.command` that is an absolute path to nothing,
+/// unless it is gx's own shipped helper (sentinel or a leftover absolute `gx`
+/// path). The shipped helper mints in-process, so a missing file is unused.
+/// A dangling path that is **not** the shipped helper is the user's and still
+/// warns — grok will try to spawn it.
 fn annotate_token_helper(status: &mut CodexAuthStatus, installed: Option<&toml::Value>) {
-    let Some(command) = installed
-        .and_then(|entry| entry.get("auth"))
-        .and_then(|auth| auth.get("command"))
-        .and_then(toml::Value::as_str)
-    else {
+    let Some(auth) = installed.and_then(|entry| entry.get("auth")) else {
         return;
     };
+    let Some(command) = auth.get("command").and_then(toml::Value::as_str) else {
+        return;
+    };
+    let args: Option<Vec<String>> = auth.get("args").and_then(toml::Value::as_array).map(|a| {
+        a.iter()
+            .filter_map(toml::Value::as_str)
+            .map(str::to_owned)
+            .collect()
+    });
+    if xai_grok_config::is_shipped_gx_token_helper(command, args.as_deref()) {
+        return;
+    }
     let path = Path::new(command);
     if path.is_absolute() && !path.exists() {
         status.helper_path_missing = Some(command.to_owned());
@@ -2585,8 +2573,8 @@ pub(crate) struct CodexAuthStatus {
     /// redacted. `Some` only when it no longer matches `auth.json`.
     pub installed_header_mismatch: Option<String>,
     /// The installed `auth.command`, when it is an absolute path that no longer
-    /// exists — a moved or removed gx binary. Not a secret: it is a path the
-    /// user wrote (indirectly) and has to fix.
+    /// exists **and** is not gx's shipped helper. Not a secret: it is a path
+    /// the user wrote and has to fix.
     pub helper_path_missing: Option<String>,
 }
 
@@ -2719,8 +2707,9 @@ fn render_codex_status(codex: &CodexAuthStatus, now_unix: i64) -> String {
     }
     if let Some(command) = &codex.helper_path_missing {
         out.push_str(&format!(
-            "  HELPER MISSING   {command}: helper path missing (binary moved?) — gx falls \
-             back to this binary at runtime; rerun `gx providers install` to persist\n"
+            "  HELPER MISSING   {command}: helper path missing — the installed \
+             auth helper is gone; point auth.command at a real binary, or re-run \
+             `gx providers install` for gx's shipped helper\n"
         ));
     }
     if codex.has_api_key {

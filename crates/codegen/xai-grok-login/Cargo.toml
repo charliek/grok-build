@@ -53,8 +53,10 @@ uuid = { workspace = true, features = ["v4", "v7"] }
 webbrowser = { workspace = true }
 xai-file-utils = { path = "../xai-file-utils" }
 xai-grok-auth = { workspace = true, features = ["middleware"] }
+xai-dirs = { workspace = true }
 xai-grok-config = { workspace = true }
 xai-grok-config-types = { workspace = true }
+xai-grok-extra-ca = { workspace = true }
 xai-grok-env = { workspace = true }
 xai-grok-http = { workspace = true }
 xai-grok-memory = { workspace = true }

@@ -625,6 +625,46 @@ fn helper_args() -> Vec<String> {
 }
 
 #[test]
+fn is_shipped_gx_token_helper_accepts_sentinel_and_absolute_gx() {
+    let args = helper_args();
+    assert!(is_shipped_gx_token_helper("gx", Some(&args)));
+    assert!(is_shipped_gx_token_helper(" gx ", Some(&args)), "command is trimmed");
+    assert!(is_shipped_gx_token_helper("/opt/gx/bin/gx", Some(&args)));
+
+    let dir = tempfile::tempdir().unwrap();
+    let present = dir.path().join("gx");
+    std::fs::write(&present, "#!/bin/sh\n").unwrap();
+    assert!(
+        is_shipped_gx_token_helper(&present.to_string_lossy(), Some(&args)),
+        "an existing absolute gx is still the shipped helper (in-process mint, not spawn)"
+    );
+}
+
+#[test]
+fn is_shipped_gx_token_helper_rejects_wrappers_relative_paths_and_wrong_args() {
+    let args = helper_args();
+    assert!(
+        !is_shipped_gx_token_helper("bin/gx", Some(&args)),
+        "relative paths are the user's"
+    );
+    assert!(!is_shipped_gx_token_helper("./gx", Some(&args)));
+    assert!(
+        !is_shipped_gx_token_helper("wrapper", Some(&args)),
+        "filename is not gx"
+    );
+    assert!(!is_shipped_gx_token_helper(
+        "/usr/local/bin/gx-with-vault",
+        Some(&args)
+    ));
+    assert!(!is_shipped_gx_token_helper(
+        "gx",
+        Some(&["providers".into(), "token".into(), "openai".into(), "--json".into()])
+    ));
+    assert!(!is_shipped_gx_token_helper("gx", None));
+    assert!(!is_shipped_gx_token_helper("gx", Some(&[])));
+}
+
+#[test]
 fn stale_gx_helper_fallback_replaces_a_missing_absolute_gx() {
     let missing = "/no/such/gx-install/gx";
     assert!(
