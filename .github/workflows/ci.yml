@@ -101,7 +101,9 @@ jobs:
             agent::model_providers::tests:: \
             agent::reasoning_family \
             session_compact \
-            auth::auth_provider::tests::resolve_auth_program
+            auth::auth_provider::tests::resolve_auth_program \
+            auth::gx_openai_codex \
+            auth::auth_provider::tests::shipped_gx_helper
 
       - name: Test xai-grok-shell (chat-history-downgrade bin)
         run: cargo test -p xai-grok-shell --locked --bin chat-history-downgrade
