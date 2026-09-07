@@ -42,6 +42,8 @@ pub mod dispatcher;
 mod env_expand;
 pub mod error;
 pub mod event;
+// gx: process-global remote-lane URL, stamped into `to_hook_json` as `gxRemote`.
+pub mod gx_remote;
 pub mod matcher;
 pub mod result;
 pub mod runner;

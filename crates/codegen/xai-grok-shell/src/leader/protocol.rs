@@ -163,6 +163,14 @@ pub struct ClientCapabilities {
     /// The flag it sets is per session, so other subscribers of a shared session receive the payload too.
     #[serde(default)]
     pub status_line: bool,
+
+    /// gx: an observer never becomes a session driver or the leader's last-active client, is
+    /// ignored by exit-on-disconnect, and gets identity-only meta injection; it is still a full
+    /// subscriber (fan-out, interaction broadcast/replay, residency). Used by gx-remote-api.
+    /// Kept last so `..Default::default()` literals keep compiling; `#[serde(default)]` keeps
+    /// older clients (which never send the key) deserializing as `observer: false`.
+    #[serde(default)]
+    pub observer: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -180,6 +188,13 @@ pub struct LeaderCapabilities {
     /// Old leaders default to `false`, so a new client falls back to advising a manual restart.
     #[serde(default)]
     pub relaunch_v1: bool,
+
+    /// gx: this leader honours `ClientCapabilities::observer` (never promotes an observer to driver
+    /// or last-active, ignores it for exit-on-disconnect, identity-only meta injection). Old leaders
+    /// default to `false`, so an out-of-process lane can refuse to attach rather than silently
+    /// becoming a driver.
+    #[serde(default)]
+    pub observer_v1: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -578,6 +593,8 @@ mod tests {
                 profile_formats: vec![ProfileArtifactFormat::Svg],
                 workspace_exposure: true,
                 relaunch_v1: true,
+                // gx: `observer_v1` is a gx field on an upstream struct; the round-trip must cover it.
+                observer_v1: true,
             }),
         };
 
@@ -596,6 +613,8 @@ mod tests {
                     profile_formats,
                     workspace_exposure: true,
                     relaunch_v1: true,
+                    // gx: see the literal above.
+                    observer_v1: true,
                 }),
             } if profile_formats == vec![ProfileArtifactFormat::Svg]
         ));

@@ -90,14 +90,24 @@ impl OperationSet {
     pub const QUEUE: Self = Self(1 << 0);
     pub const QUEUE_AND_STEER: Self = Self((1 << 0) | (1 << 1));
 
-    pub fn contains(self, operation: Operation) -> bool {
-        let flag = match operation {
+    /// gx: the single bit mapping, shared by `contains` and `with` so the two cannot drift.
+    const fn bit(operation: Operation) -> u8 {
+        match operation {
             Operation::Queue => 1 << 0,
             Operation::Steer => 1 << 1,
             Operation::Interject => 1 << 2,
             Operation::InterruptAndSend => 1 << 3,
-        };
-        self.0 & flag != 0
+        }
+    }
+
+    pub fn contains(self, operation: Operation) -> bool {
+        self.0 & Self::bit(operation) != 0
+    }
+
+    /// gx: build a set incrementally; callers (the remote lane) compose Queue/Interject/InterruptAndSend from session state.
+    #[must_use]
+    pub const fn with(self, operation: Operation) -> Self {
+        Self(self.0 | Self::bit(operation))
     }
 }
 
@@ -121,3 +131,7 @@ pub fn authorize_operation(
 #[cfg(test)]
 #[path = "envelope_tests.rs"]
 mod tests;
+// gx: `OperationSet::with` tests live in a gx-owned file so upstream's test file never conflicts.
+#[cfg(test)]
+#[path = "envelope_gx_tests.rs"]
+mod gx_tests;

@@ -201,6 +201,10 @@ impl LeaderServerControlState {
             profile_formats: manager.profile_formats().to_vec(),
             workspace_exposure: true,
             relaunch_v1: true,
+            // gx: advertise the observer contract so a future out-of-process lane can tell whether
+            // the leader it adopted honours `ClientCapabilities::observer` (an older leader ignores
+            // the unknown field and would let the lane claim the driver slot).
+            observer_v1: true,
         }
     }
 }
@@ -654,6 +658,12 @@ fn backfill_child_routes(
         }
     }
 }
+/// gx: true when `id` is registered and is NOT an observer (an unregistered id counts as
+/// non-observer too, matching how each call site already treats a missing client). Shared by the
+/// two driver-claim call sites in `run_leader_server` so the observer check can't drift between them.
+fn is_registered_non_observer(clients: &HashMap<ClientId, ClientState>, id: ClientId) -> bool {
+    clients.get(&id).is_none_or(|c| !c.capabilities.observer)
+}
 /// Inject the requesting client's context into a `session/new`, `session/load`, or `session/resume` request, **in place**.
 /// The agent's own state names whichever client initialized last, which in leader mode is the wrong client.
 ///
@@ -699,6 +709,26 @@ fn inject_session_request_context(
             .or_insert_with(|| serde_json::json!({}));
         if let Some(meta_obj) = meta.as_object_mut() {
             mutated = true;
+            // gx: identity-only injection for an observer. The two identity keys route the load
+            // response and its replay back to the observer, but the capability overwrites below are
+            // skipped: the agent re-applies that meta to the SHARED resident session actor, so an
+            // observer's first attach would otherwise switch off the TUI's status line and its
+            // terminal/fs routing. Yolo/auto/model are skipped for the same reason.
+            if capabilities.observer {
+                if !client_type.is_empty() && !meta_obj.contains_key("clientIdentifier") {
+                    meta_obj.insert(
+                        "clientIdentifier".to_string(),
+                        serde_json::json!(client_type),
+                    );
+                }
+                if !meta_obj.contains_key("x.ai/leaderClientId") {
+                    meta_obj.insert(
+                        "x.ai/leaderClientId".to_string(),
+                        serde_json::json!(client_id.0),
+                    );
+                }
+                return mutated;
+            }
             if is_session_new && capabilities.yolo_mode && !meta_obj.contains_key("yoloMode") {
                 meta_obj.insert("yoloMode".to_string(), serde_json::json!(true));
                 debug!("Injected yoloMode=true into session/new request");
@@ -1718,9 +1748,14 @@ pub async fn run_leader_server(
                             session_driver.remove(&sid);
                             detached_sessions.push(sid);
                         } else if session_driver.get(&sid) == Some(&id) {
-                            if let Some(&next) =
-                                session_subscribers.get(&sid).and_then(|s| s.iter().next())
-                            {
+                            // gx: promote the first remaining NON-observer subscriber; if only observers
+                            // are left the session goes driverless (driver-only messages drop) rather than
+                            // handing the TUI's reverse-request stream to the remote lane.
+                            if let Some(next) = session_subscribers.get(&sid).and_then(|s| {
+                                s.iter()
+                                    .copied()
+                                    .find(|&cid| is_registered_non_observer(&clients, cid))
+                            }) {
                                 session_driver.insert(sid.clone(), next);
                                 debug!(
                                     session_id = %sid,
@@ -1748,7 +1783,15 @@ pub async fn run_leader_server(
                         );
                     }
                     debug!(client_id = id.0, "Client removed");
-                    if clients.is_empty() && had_clients && !no_exit_on_disconnect {
+                    // gx: observers (the in-process remote lane) never keep the leader alive, so the
+                    // leader is "client-less" once every remaining registered connection is an observer.
+                    // `all()` on an empty map is `true`, and an accepted-but-unregistered connection
+                    // still carries `ClientCapabilities::default()` (`observer: false`), so this is
+                    // exactly upstream's `is_empty()` whenever no observer is connected.
+                    if clients.values().all(|c| c.capabilities.observer)
+                        && had_clients
+                        && !no_exit_on_disconnect
+                    {
                         info!("Leader server shutting down (all clients disconnected)");
                         break;
                     }
@@ -1848,6 +1891,9 @@ pub async fn run_leader_server(
                     }
                     if let Some(client) = clients.get(&id)
                         && client.mode == ClientMode::Stdio
+                        // gx: an observer must never become the machine-wide fallback target, or a
+                        // sessionless notification meant for the TUI would go to the remote lane instead.
+                        && !client.capabilities.observer
                     {
                         last_active_client = Some(id);
                     }
@@ -1856,7 +1902,11 @@ pub async fn run_leader_server(
                             .entry(session_id.clone())
                             .or_default()
                             .insert(id);
-                        session_driver.entry(session_id.clone()).or_insert(id);
+                        // gx: an observer subscribes but never claims the driver slot, so driver-only
+                        // reverse-requests keep going to the TUI (or nowhere) rather than the remote lane.
+                        if is_registered_non_observer(&clients, id) {
+                            session_driver.entry(session_id.clone()).or_insert(id);
+                        }
                         backfill_child_routes(
                             &session_id,
                             id,
@@ -1976,9 +2026,13 @@ pub async fn run_leader_server(
                             .entry(session_id.clone())
                             .or_default()
                             .insert(client_id);
-                        session_driver
-                            .entry(session_id.clone())
-                            .or_insert(client_id);
+                        // gx: same rule as the request path — an observer subscribes to the session
+                        // named by a load/new response but never claims the driver slot.
+                        if !client.capabilities.observer {
+                            session_driver
+                                .entry(session_id.clone())
+                                .or_insert(client_id);
+                        }
                         backfill_child_routes(
                             &session_id,
                             client_id,
@@ -2699,3 +2753,7 @@ pub async fn spawn_leader_server(socket_path: PathBuf) -> Result<ServerHandle, S
 #[cfg(test)]
 #[path = "server_tests.rs"]
 mod tests;
+// gx: observer-capability tests live in a gx-owned file so upstream's test file never conflicts.
+#[cfg(test)]
+#[path = "server_gx_tests.rs"]
+mod gx_tests;
