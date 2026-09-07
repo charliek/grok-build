@@ -162,6 +162,27 @@ fn resolve_agent_profile_path(path: &std::path::Path) -> std::path::PathBuf {
         }
     }
 }
+// gx: `--leader` is honoured before eligibility in `resolve_leader_mode`, so
+// `gx agent --leader serve` (or `--leader leader`) would otherwise resolve `use_leader
+// = true` and fall into the stdio-bridge branch, never reaching the `Serve`/`Leader`
+// dispatch arms below. `--leader` is meaningless for those two subcommands (they *are*
+// leader-adjacent processes), so refuse the combination explicitly instead of silently
+// misrouting. Kept pure/unit-testable rather than inlined at the call site.
+fn gx_leader_flag_conflict(mode: &Option<AgentCmd>, leader_flag: bool) -> Option<&'static str> {
+    if !leader_flag {
+        return None;
+    }
+    match mode {
+        Some(AgentCmd::Serve(_)) => Some(
+            "error: --leader does not apply to 'agent serve'; the leader-backed HTTP lane \
+             is served by the leader itself (see 'gx remote status')",
+        ),
+        Some(AgentCmd::Leader(_)) => {
+            Some("error: --leader does not apply to 'agent leader'; remove it")
+        }
+        _ => None,
+    }
+}
 /// Print startup information for the serve command.
 fn print_serve_startup_info(bind_addr: SocketAddr, secret: &str) {
     eprintln!();
@@ -1260,6 +1281,13 @@ async fn run_agent_command(
         &agent_args.mode,
         None | Some(AgentCmd::Stdio) | Some(AgentCmd::Headless(_))
     );
+    // gx: refuse `--leader` on `agent serve`/`agent leader` before it can be honoured by
+    // `resolve_leader_mode` (which checks `--leader` ahead of eligibility) and silently
+    // misroute into the stdio-bridge branch instead of the intended subcommand.
+    if let Some(message) = gx_leader_flag_conflict(&agent_args.mode, agent_args.leader) {
+        eprintln!("{message}");
+        std::process::exit(2);
+    }
     let requested_confinement = xai_grok_sandbox::requested_confinement_profile();
     let LeaderMode {
         use_leader,
@@ -2685,6 +2713,65 @@ async fn signal_leaders_to_relaunch(installed_version: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use xai_grok_pager::app::{LeaderArgs, ServeArgs};
+    // gx: `gx_leader_flag_conflict` — `--leader` must be refused on `agent serve`/`agent
+    // leader` rather than silently misrouted into the stdio-bridge branch.
+    #[test]
+    fn leader_flag_conflicts_with_agent_serve() {
+        let mode = Some(AgentCmd::Serve(ServeArgs {
+            bind: "127.0.0.1:2419".parse().unwrap(),
+            secret: None,
+            remote: None,
+            headless: HeadlessArgs::default(),
+        }));
+        assert_eq!(
+            gx_leader_flag_conflict(&mode, true),
+            Some(
+                "error: --leader does not apply to 'agent serve'; the leader-backed HTTP lane \
+                 is served by the leader itself (see 'gx remote status')"
+            )
+        );
+    }
+    #[test]
+    fn leader_flag_conflicts_with_agent_leader() {
+        let mode = Some(AgentCmd::Leader(LeaderArgs {
+            no_exit_on_disconnect: false,
+            relay_on_demand: false,
+            no_auto_update: false,
+            headless: HeadlessArgs::default(),
+        }));
+        assert_eq!(
+            gx_leader_flag_conflict(&mode, true),
+            Some("error: --leader does not apply to 'agent leader'; remove it")
+        );
+    }
+    #[test]
+    fn leader_flag_has_no_conflict_with_stdio_headless_or_none() {
+        for mode in [
+            Some(AgentCmd::Stdio),
+            Some(AgentCmd::Headless(HeadlessArgs::default())),
+            None,
+        ] {
+            assert_eq!(gx_leader_flag_conflict(&mode, true), None, "{mode:?}");
+        }
+    }
+    #[test]
+    fn no_conflict_without_the_leader_flag() {
+        let serve_mode = Some(AgentCmd::Serve(ServeArgs {
+            bind: "127.0.0.1:2419".parse().unwrap(),
+            secret: None,
+            remote: None,
+            headless: HeadlessArgs::default(),
+        }));
+        let leader_mode = Some(AgentCmd::Leader(LeaderArgs {
+            no_exit_on_disconnect: false,
+            relay_on_demand: false,
+            no_auto_update: false,
+            headless: HeadlessArgs::default(),
+        }));
+        assert_eq!(gx_leader_flag_conflict(&serve_mode, false), None);
+        assert_eq!(gx_leader_flag_conflict(&leader_mode, false), None);
+    }
     #[test]
     fn embedded_agent_commands_heal_managed_policy_before_sandboxing() {
         for args in [
