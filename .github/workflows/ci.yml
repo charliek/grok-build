@@ -108,6 +108,17 @@ jobs:
       - name: Test xai-grok-shell (chat-history-downgrade bin)
         run: cargo test -p xai-grok-shell --locked --bin chat-history-downgrade
 
+      # gx-owned crate (crates/gx/): the loopback remote lane. Its whole suite
+      # runs -- it is fork code, so there is no upstream breakage to skip past.
+      - name: Test gx-remote-api
+        run: cargo test -p gx-remote-api --locked
+
+      # Upstream crate, but gx adds `OperationSet::with` to it (the vocabulary
+      # the remote lane's authorization matrix is built from), so its suite is
+      # part of the gate.
+      - name: Test xai-message-delivery-core
+        run: cargo test -p xai-message-delivery-core --locked
+
   secret-scan:
     name: secret-scan
     runs-on: ubuntu-latest

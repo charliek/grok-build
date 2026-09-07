@@ -62,6 +62,8 @@ fn process_identity(command: Option<&Command>, is_interactive: bool) -> Option<P
             | Command::Plugin(_)
             // gx: `gx providers` is a plain unattended CLI command.
             | Command::Providers(_)
+            // gx: so is `gx remote` (status is a probe; up spawns a leader and exits).
+            | Command::Remote(_)
             | Command::Memory(_)
             | Command::Models
             | Command::Sessions(_)
@@ -105,6 +107,9 @@ fn command_needs_pre_sandbox_policy_heal(command: Option<&Command>) -> bool {
             | Command::Plugin(_)
             // gx: `gx providers` never boots an agent; no pre-sandbox policy heal.
             | Command::Providers(_)
+            // gx: `gx remote` boots no agent either — `up` spawns a leader subprocess, which
+            // heals its own policy.
+            | Command::Remote(_)
             | Command::Memory(_)
             | Command::Sessions(_)
             | Command::Usage(_)
@@ -1607,6 +1612,14 @@ async fn run_agent_command(
                     }),
                 })
             };
+            // gx: host the loopback remote lane in this leader (docs/gx/REMOTE_API.md). Started
+            // *before* `run_leader` is awaited because lock acquisition, `write_pid` and the
+            // socket bind all happen inside it, with no post-bind hook; the task waits for the
+            // leader lock's pid to be ours and then connects with its own bounded retry. Inert on
+            // a stock build or with GX_REMOTE_DISABLE set, and never fatal. Dropping the handle
+            // when this arm returns cancels the lane.
+            let _gx_lane =
+                xai_grok_pager::gx_remote_lane::spawn(&agent_config.grok_com_config.grok_ws_url);
             run_leader(
                 &agent_config,
                 a.no_exit_on_disconnect,
@@ -2201,6 +2214,12 @@ async fn async_main(args: PagerArgs) -> Result<()> {
             Command::Providers(providers_args) => {
                 init_tracing_simple("cli");
                 return xai_grok_pager::providers_cmd::run(providers_args);
+            }
+            // gx: the remote lane's operator CLI. Reads discovery records under $GROK_HOME and
+            // probes the token-free /v1/healthz; `up` spawns a leader (which hosts the lane).
+            Command::Remote(remote_args) => {
+                init_tracing_simple("cli");
+                return xai_grok_pager::remote_cmd::run(remote_args).await;
             }
             Command::Models => {
                 init_tracing_simple("cli");

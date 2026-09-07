@@ -52,6 +52,27 @@ with a `// gx:` comment where it has to live inside a file upstream also owns (`
   snapshot) and a `// gx:` gate in
   `crates/codegen/xai-grok-pager/src/views/welcome/logo.rs` (`is_gx_build()` picks the
   owl; same 5/7-row budget as upstream). Never overwrite `assets/logo/`.
+- **Remote lane (`gx-remote-api`):** `crates/gx/gx-remote-api/` — the fork's first
+  gx-owned *crate* (`crates/gx/` is the home for future ones): a loopback HTTP/SSE façade
+  over the leader, attached to it as an **observer** ACP client. Wired up in:
+  - `crates/codegen/xai-grok-pager/src/gx_remote_lane.rs` — hosts it inside the leader
+    process; called from one `// gx:`-marked hunk in `xai-grok-pager-bin/src/main.rs`'s
+    `AgentCmd::Leader` arm.
+  - `crates/codegen/xai-grok-pager/src/remote_cmd.rs` (+ `remote_cmd_tests.rs`) — the
+    `gx remote status|up` CLI, wired into `app/cli.rs`'s `Command` enum and dispatched in
+    `main.rs` beside `Command::Providers`.
+  - `crates/codegen/xai-grok-pager/src/doctor_cmd/gx_leader.rs` (+ `gx_leader_tests.rs`)
+    — the `gx doctor` leader + lane section; one marked hunk each in `doctor_cmd/mod.rs`,
+    `human.rs` and `json.rs`. The section is absent entirely on a stock build, which is
+    what keeps upstream's exact-output doctor fixtures passing.
+  - `crates/codegen/xai-grok-hooks/src/gx_remote.rs` (+ `gx_remote_tests.rs`) — the
+    process-global lane URL, stamped into `to_hook_json()` as `gxRemote` by one marked
+    hunk in `event.rs` (roost reads it as `gx.remote`).
+  - `crates/codegen/xai-grok-shell/src/leader/` — the `observer` capability
+    (`protocol.rs`, five marked hunks in `server.rs`, `server_gx_tests.rs`).
+  - Root `Cargo.toml` `members` (one `# gx:`-marked line).
+
+  End-user/API docs: `docs/gx/REMOTE_API.md`.
 - **Coexistence:** `crates/codegen/xai-grok-shell/src/leader/lock.rs` (leader socket
   naming), `crates/codegen/xai-grok-update/src/auto_update.rs` (updater neutered),
   `crates/codegen/xai-grok-version/src/lib.rs` (`is_gx_build`, the single build-flavor
@@ -117,6 +138,8 @@ cargo test -p xai-grok-update --locked -- \
 cargo test -p xai-grok-version --locked
 cargo test -p xai-grok-shell --lib --locked -- leader:: agent::model_providers::tests:: agent::reasoning_family session_compact auth::auth_provider::tests::resolve_auth_program auth::gx_openai_codex auth::auth_provider::tests::shipped_gx_helper
 cargo test -p xai-grok-shell --locked --bin chat-history-downgrade
+cargo test -p gx-remote-api --locked
+cargo test -p xai-message-delivery-core --locked
 ```
 
 This is the gate for every commit that touches gx code, every sync, and every PR into
