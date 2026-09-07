@@ -1,0 +1,33 @@
+[package]
+license = "Apache-2.0"
+name = "gx-remote-api"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+description = "gx-only loopback HTTP facade over the grok leader, attached as an observer ACP client."
+
+[dependencies]
+anyhow = { workspace = true }
+axum = { workspace = true }
+chrono = { workspace = true }
+# `O_NOFOLLOW`/`O_NONBLOCK` on the token open, and `geteuid` for its ownership check (`src/auth.rs`).
+libc = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+xai-dirs = { workspace = true }
+xai-grok-shell = { workspace = true }
+xai-grok-version = { workspace = true }
+# Vocabulary for the C5 authorization matrix (`Operation` / `OperationSet`).
+xai-message-delivery-core = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tower = { workspace = true, features = ["util"] }
+
+[lints]
+workspace = true
