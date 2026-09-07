@@ -400,6 +400,13 @@ impl HookEventEnvelope {
                 "hook_event_name".to_string(),
                 self.hook_event_name.pascal_case().into(),
             );
+            // gx: stamp the loopback remote-lane URL when this process hosts one, so a hook
+            // consumer (roost forwards it as `gx.remote`, roost#425) can reach the lane without
+            // re-discovering it. Absent — key and all — in any process that never called
+            // `gx_remote::announce`, so no existing payload changes. See `crate::gx_remote`.
+            if let Some(url) = crate::gx_remote::url() {
+                map.insert("gxRemote".to_string(), url.into());
+            }
         }
         value
     }
