@@ -175,6 +175,65 @@ async fn heuristic_images_stripped_does_not_rewrite_history() {
         .await;
 }
 
+/// gx: run one turn's `ModelTextOnly` strip + completion, as issued by
+/// `model_text_only_strip_notice_fires_once_per_session` for both its first
+/// and second turn.
+async fn run_text_only_strip_turn(actor: &Arc<SessionActor>, request_id: &RequestId) {
+    own_request(actor, request_id);
+    actor
+        .handle_sampling_event(images_stripped(
+            request_id,
+            &[PERSIST_GATE_IMAGE_URI],
+            StripReason::ModelTextOnly,
+        ))
+        .await;
+    actor
+        .handle_sampling_event(completed_event(request_id))
+        .await;
+    settle().await;
+}
+
+/// gx: `ModelTextOnly` never defers (request-local, like `PayloadHeuristic`)
+/// and its notice fires at most once per session -- a text-only model strips
+/// on every turn that carries an image, so a per-turn note would spam the
+/// transcript.
+#[tokio::test(flavor = "current_thread")]
+async fn model_text_only_strip_notice_fires_once_per_session() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, mut gateway_rx) =
+                tokio::sync::mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+            let (persistence_tx, _) = tokio::sync::mpsc::unbounded_channel::<PersistenceMsg>();
+            let actor =
+                Arc::new(create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await);
+            seed_image(&actor, PERSIST_GATE_IMAGE_URI).await;
+
+            run_text_only_strip_turn(&actor, &RequestId::from("req-text-only-1")).await;
+
+            let conv = actor.chat_state_handle.get_conversation().await;
+            assert!(
+                conversation_has_image(&conv, PERSIST_GATE_IMAGE_URI),
+                "ModelTextOnly must stay request-local: the transcript keeps the image, {conv:?}"
+            );
+            let sent = drain_gateway_debug(&mut gateway_rx);
+            assert!(
+                sent.contains("this model is configured text-only"),
+                "first strip must send the once-per-session notice, sent: {sent}"
+            );
+
+            // A second turn's strip must not repeat the notice.
+            run_text_only_strip_turn(&actor, &RequestId::from("req-text-only-2")).await;
+
+            let sent = drain_gateway_debug(&mut gateway_rx);
+            assert!(
+                sent.is_empty(),
+                "a second turn's text-only strip must not repeat the notice, sent: {sent}"
+            );
+        })
+        .await;
+}
+
 /// The durable path: a server-confirmed single-image strip is buffered on `ImagesStripped` (history untouched).
 /// It is persisted when the stripped retry's `Completed` proves it helped, and the user is told only then.
 #[tokio::test(flavor = "current_thread")]

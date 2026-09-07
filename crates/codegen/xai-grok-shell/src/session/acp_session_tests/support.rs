@@ -349,6 +349,8 @@ async fn create_test_actor_inner(
         )),
         telemetry_enabled: false,
         supports_backend_search: std::cell::Cell::new(false),
+        // gx: see `SessionActor::supports_vision`.
+        supports_vision: std::cell::Cell::new(true),
         tool_overrides: std::cell::RefCell::new(None),
         resolved_tool_overrides: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
         compactions_remaining: std::cell::Cell::new(None),
@@ -504,6 +506,8 @@ async fn create_test_actor_inner(
         turn_stream_drained: parking_lot::Mutex::new(std::collections::HashMap::new()),
         pending_image_strip: parking_lot::Mutex::new(HashMap::new()),
         image_strip_rewrite_barrier: ImageStripRewriteBarrier::new(),
+        // gx: see `SessionActor::told_model_text_only_image_notice`.
+        told_model_text_only_image_notice: std::sync::atomic::AtomicBool::new(false),
         sampler_handle: xai_grok_sampler::SamplerHandle::noop(),
         sampling_gate: None,
         rebuild_spec: crate::session::agent_rebuild::test_rebuild_spec_default(),

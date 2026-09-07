@@ -43,6 +43,8 @@ pub(crate) fn ctx_with_toggle(toggle: HashMap<String, bool>) -> SubagentSpawnCon
             codex_compat: false,
             // gx: see `SamplerConfig::hoist_tool_images`.
             hoist_tool_images: false,
+            // gx: see `SamplerConfig::supports_vision`.
+            supports_vision: true,
             idle_timeout_secs: None,
             client_identifier: None,
             reasoning_effort: None,

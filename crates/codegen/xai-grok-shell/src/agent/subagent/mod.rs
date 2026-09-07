@@ -688,6 +688,11 @@ async fn read_parent_sampling_config(
             let supports_backend_search = ctx
                 .models_manager
                 .model_supports_backend_search(catalog_model_id.0.as_ref());
+            // gx: this stored `cfg` predates `supports_vision`, so look the
+            // catalog entry up directly rather than trusting an absent field.
+            let supports_vision = ctx
+                .models_manager
+                .model_supports_vision(catalog_model_id.0.as_ref());
             let extra_response_includes = crate::agent::config::response_include_extensions(
                 supports_backend_search,
                 &cfg.api_backend,
@@ -716,6 +721,8 @@ async fn read_parent_sampling_config(
                 // must inherit its body shaping too.
                 codex_compat: cfg.codex_compat.unwrap_or(false),
                 hoist_tool_images: cfg.hoist_tool_images.unwrap_or(false),
+                // gx: see `ModelEntryConfig::supports_vision`.
+                supports_vision,
                 idle_timeout_secs: None,
                 client_identifier: ctx.sampling_config.client_identifier.clone(),
                 deployment_id: ctx.sampling_config.deployment_id.clone(),

@@ -187,14 +187,35 @@ impl SessionActor {
             })),
         );
         if !persist_deferred {
-            // Request-local only: tell the user now, on the same channel as load-time image drops, rendered as a system scrollback note
-            self.send_xai_notification(XaiSessionUpdate::ImageDropped {
-                notes: vec![format!(
-                    "This request failed over its images (or was too large); \
-                     {stripped} image(s) were left out of the retry."
-                )],
-            })
-            .await;
+            // gx: a text-only model's strip is not a failure -- it happens on
+            // every turn that carries an image, so a per-turn note would spam
+            // the transcript. Say it once per session instead, and say it
+            // accurately: the request dropped the image, not that anything
+            // failed.
+            if reason == StripReason::ModelTextOnly {
+                if !self
+                    .told_model_text_only_image_notice
+                    .swap(true, std::sync::atomic::Ordering::Relaxed)
+                {
+                    self.send_xai_notification(XaiSessionUpdate::ImageDropped {
+                        notes: vec![
+                            "Images omitted: this model is configured text-only \
+                             (supports_vision = false); they stay in the transcript."
+                                .to_string(),
+                        ],
+                    })
+                    .await;
+                }
+            } else {
+                // Request-local only: tell the user now, on the same channel as load-time image drops, rendered as a system scrollback note
+                self.send_xai_notification(XaiSessionUpdate::ImageDropped {
+                    notes: vec![format!(
+                        "This request failed over its images (or was too large); \
+                         {stripped} image(s) were left out of the retry."
+                    )],
+                })
+                .await;
+            }
         }
     }
 

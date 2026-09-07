@@ -77,6 +77,16 @@ pub struct SamplerConfig {
     // `false` everywhere else, which is the pre-gx behavior.
     #[serde(default)]
     pub hoist_tool_images: bool,
+    // gx: whether this model's endpoint accepts image content at all. Set
+    // from `[model.<id>].supports_vision` (absent means `true`); when
+    // `false`, `run_request_task` strips every image from the request before
+    // the first attempt instead of paying a guaranteed 400 to find out (see
+    // `StripReason::ModelTextOnly`).
+    //
+    // `Default` is `true` — every model is assumed to accept images unless
+    // explicitly opted out.
+    #[serde(default = "default_supports_vision")]
+    pub supports_vision: bool,
     pub idle_timeout_secs: Option<u64>,
 
     // Reasoning effort
@@ -148,6 +158,8 @@ impl Default for SamplerConfig {
             codex_compat: false,
             // gx: see `SamplerConfig::hoist_tool_images`.
             hoist_tool_images: false,
+            // gx: see `SamplerConfig::supports_vision`.
+            supports_vision: true,
             idle_timeout_secs: None,
             reasoning_effort: None,
             origin_client: None,
@@ -164,6 +176,12 @@ impl Default for SamplerConfig {
             header_injector: None,
         }
     }
+}
+
+// gx: serde default for `SamplerConfig::supports_vision` — a model accepts
+// images unless a config explicitly says otherwise.
+fn default_supports_vision() -> bool {
+    true
 }
 
 /// Cheap sync read of the current bearer for [`SamplerConfig::bearer_resolver`].

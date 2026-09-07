@@ -259,6 +259,20 @@ A loopback base URL is treated as xAI's cli-chat-proxy, so a local OpenAI-compat
 (Ollama, LM Studio) keeps the inline shape by default. That is the behaviour it already had;
 set `tool_result_images = "hoist"` on it if its server rejects images in a tool message.
 
+### `supports_vision`
+
+Some third-party endpoints reject an image outright, in any role, regardless of how its
+tool-result images are shaped. Set `supports_vision = false` on a `[model."<id>"]` table to
+say so; gx then strips every image from the request before the first attempt instead of
+paying a guaranteed failed request to find out. `glm-5.3` ships with this set, since Z.AI's
+coding-plan endpoint 400s on an image anywhere in the request
+(`messages.content.type is invalid, allowed values: ['text']`, verified live);
+`glm-5.3-flash` is vision-capable and does not carry it. The image itself is never deleted —
+it stays in the conversation transcript, and only the outgoing request drops it, so it comes
+back if you later switch to a vision-capable model. The key is absent by default (meaning
+`true`); stock grok does not understand it and logs a harmless unknown-field warning since
+the GLM preset lives in the shared `config.toml`.
+
 ## Remote lane
 
 A gx build starts a **leader** by default (stock grok does not), and that leader hosts a

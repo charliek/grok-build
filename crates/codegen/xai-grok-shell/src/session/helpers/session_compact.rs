@@ -478,6 +478,24 @@ pub(crate) async fn generate_session_compact(
     }
     let chat_history = prepared_history.items;
     let num_messages = chat_history.len();
+    // gx: every arm below builds its own `ConversationRequest` and calls the
+    // client directly, so none of them goes through the sampler's own
+    // pre-flight strip (`run_request_task`) -- a `supports_vision = false`
+    // model has to be stripped here too, once, or the compaction call 400s
+    // on the same image the sampler would have dropped.
+    let chat_history = if sampling_config.supports_vision {
+        chat_history
+    } else {
+        let mut request = ConversationRequest::from_items(chat_history);
+        let stripped = request.strip_images();
+        if !stripped.is_empty() {
+            tracing::info!(
+                stripped = stripped.len(),
+                "compaction: stripped image(s) before summarizing: model is configured text-only (supports_vision = false)"
+            );
+        }
+        request.items
+    };
     let wire_tool_choice = match tool_choice {
         crate::util::config::CompactionToolChoice::Auto => ToolChoice::auto(),
         crate::util::config::CompactionToolChoice::None => ToolChoice::none(),

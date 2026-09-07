@@ -1686,6 +1686,8 @@ pub(crate) async fn spawn_session_actor(
         pending_interactions: pending_interactions.clone(),
         telemetry_enabled,
         supports_backend_search: std::cell::Cell::new(sampling_config.supports_backend_search),
+        // gx: see `SessionActor::supports_vision`.
+        supports_vision: std::cell::Cell::new(sampling_config.supports_vision),
         tool_overrides: std::cell::RefCell::new(None),
         resolved_tool_overrides: resolved_tool_overrides.clone(),
         compactions_remaining: std::cell::Cell::new(sampling_config.compactions_remaining),
@@ -1884,6 +1886,8 @@ pub(crate) async fn spawn_session_actor(
         turn_stream_drained: parking_lot::Mutex::new(std::collections::HashMap::new()),
         pending_image_strip: parking_lot::Mutex::new(std::collections::HashMap::new()),
         image_strip_rewrite_barrier: ImageStripRewriteBarrier::new(),
+        // gx: see `SessionActor::told_model_text_only_image_notice`.
+        told_model_text_only_image_notice: std::sync::atomic::AtomicBool::new(false),
         sampler_handle,
         sampling_gate,
         rebuild_spec: rebuild_spec.clone(),

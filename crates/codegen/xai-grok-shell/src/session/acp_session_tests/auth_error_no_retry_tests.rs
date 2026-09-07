@@ -1155,6 +1155,8 @@ async fn set_session_model_invalidates_byok_memo_for_same_model_id() {
                 codex_compat: false,
                 // gx: see `SamplingConfig::hoist_tool_images`.
                 hoist_tool_images: false,
+                // gx: see `SamplerConfig::supports_vision`.
+                supports_vision: true,
                 idle_timeout_secs: None,
                 client_identifier: None,
                 reasoning_effort: None,
@@ -1250,6 +1252,8 @@ async fn switch_to_first_party_model_drops_minted_provider_token() {
                 codex_compat: false,
                 // gx: see `SamplingConfig::hoist_tool_images`.
                 hoist_tool_images: false,
+                // gx: see `SamplerConfig::supports_vision`.
+                supports_vision: true,
                 idle_timeout_secs: None,
                 client_identifier: None,
                 reasoning_effort: None,

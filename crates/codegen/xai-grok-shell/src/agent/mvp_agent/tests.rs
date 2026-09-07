@@ -2689,6 +2689,8 @@ fn find_model_by_id_prefers_key_then_falls_back_to_slug() {
             codex_compat: None,
             // gx: see `ModelEntryConfig::tool_result_images`.
             tool_result_images: None,
+            // gx: see `ModelEntryConfig::supports_vision`.
+            supports_vision: None,
             laziness_detector: crate::agent::config::LazinessDetectorPerModelConfig::default(),
         },
         api_key: None,

@@ -120,6 +120,27 @@ pub(crate) async fn run_request_task(
     }
 
     let mut request = request;
+    // gx: a model configured `supports_vision = false` 400s on an image in
+    // any role — strip before the first attempt instead of paying a
+    // guaranteed failed request to learn that. Expected, not an error: `info`
+    // rather than `warn`. Request-local, like every other strip here; chat
+    // history keeps the images.
+    if !config.supports_vision {
+        let stripped_urls = request.strip_images();
+        if !stripped_urls.is_empty() {
+            tracing::info!(
+                stripped = stripped_urls.len(),
+                "stripped {} image(s) before the first attempt: model is configured text-only (supports_vision = false)",
+                stripped_urls.len()
+            );
+            emit_images_stripped(
+                &event_tx,
+                &request_id,
+                stripped_urls,
+                StripReason::ModelTextOnly,
+            );
+        }
+    }
     let mut retry_count: u32 = 0;
     // Doom-loop recovery keeps its own resample budget, independent of the transport/empty budget above
     let doom_policy = config.doom_loop_recovery;

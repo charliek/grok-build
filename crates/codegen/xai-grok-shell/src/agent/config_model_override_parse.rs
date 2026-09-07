@@ -716,6 +716,9 @@ mod tests {
             // gx: set, not `None`, so the lossless-round-trip guard covers the
             // `"hoist"` spelling too.
             tool_result_images: Some(ToolResultImages::Hoist),
+            // gx: set, not `None`, so the lossless-round-trip guard covers
+            // `supports_vision` too.
+            supports_vision: Some(false),
         }
     }
 
@@ -742,6 +745,41 @@ mod tests {
             assert_eq!(model.tool_result_images, Some(expected));
             assert!(cfg.config_warnings.is_empty(), "{spelling}");
         }
+    }
+
+    /// gx: `[model.<id>] supports_vision = false` must round-trip and leave
+    /// the field unset (meaning "true") when absent -- `glm-5.3`'s preset
+    /// (and any future text-only model) depends on a missing key never being
+    /// silently coerced to `false`.
+    #[test]
+    fn supports_vision_round_trips_and_defaults_to_unset() {
+        for expected in [false, true] {
+            let cfg = parse_cfg(&format!(
+                r#"
+                [model."muse"]
+                model = "muse"
+                supports_vision = {expected}
+                "#
+            ));
+            let model = cfg
+                .config_models
+                .get("muse")
+                .expect("muse must remain in catalog");
+            assert_eq!(model.supports_vision, Some(expected));
+            assert!(cfg.config_warnings.is_empty());
+        }
+
+        let cfg = parse_cfg(
+            r#"
+            [model."muse"]
+            model = "muse"
+            "#,
+        );
+        let model = cfg.config_models.get("muse").expect("muse in catalog");
+        assert_eq!(
+            model.supports_vision, None,
+            "an absent key must not default to false"
+        );
     }
 
     /// gx: an unparseable value is pruned like every other bad field -- the

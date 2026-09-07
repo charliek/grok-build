@@ -613,6 +613,15 @@ impl ModelsManager {
             .unwrap_or(false)
     }
 
+    /// gx: see `ModelEntryConfig::supports_vision`. Unknown model or unset
+    /// override both mean "accepts images" — the same fallback as
+    /// `sampling_config_for_model`.
+    pub(crate) fn model_supports_vision(&self, model_id: &str) -> bool {
+        self.with_catalog_entry(model_id, |e| e.info().supports_vision)
+            .flatten()
+            .unwrap_or(true)
+    }
+
     pub(crate) fn model_compactions_remaining(
         &self,
         model_id: &str,

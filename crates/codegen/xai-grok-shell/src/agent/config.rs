@@ -3767,6 +3767,8 @@ fn default_models(endpoints: &EndpointsConfig) -> IndexMap<String, ModelEntryCon
                 codex_compat: None,
                 // gx: see `ModelEntryConfig::tool_result_images`.
                 tool_result_images: None,
+                // gx: see `ModelEntryConfig::supports_vision`.
+                supports_vision: None,
                 laziness_detector: LazinessDetectorPerModelConfig::default(),
             };
             (key, config)
@@ -3905,6 +3907,16 @@ pub struct ModelEntryConfig {
     /// Unset derives per provider; see `agent::gx_tool_images`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_result_images: Option<crate::agent::gx_tool_images::ToolResultImages>,
+    /// gx: whether this model's endpoint accepts image content at all.
+    /// `None` (the default) means `true`. Some third-party endpoints 400 on
+    /// an image in any role regardless of provider-facing feature flags
+    /// (Z.AI's `glm-5.3` coding-plan endpoint is text-only); setting this to
+    /// `false` makes the sampler strip images from the request before the
+    /// first attempt instead of paying a guaranteed failed request per turn.
+    /// The image stays in the stored conversation; only the wire request
+    /// drops it. See `StripReason::ModelTextOnly`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_vision: Option<bool>,
     /// Per-model Layer-3 LazinessDetector configuration.
     /// Defaults to the all-disabled state via `#[serde(default)]`.
 
@@ -3975,6 +3987,8 @@ pub struct ConfigModelOverride {
     pub codex_compat: Option<bool>,
     // gx: see `ModelEntryConfig::tool_result_images`.
     pub tool_result_images: Option<crate::agent::gx_tool_images::ToolResultImages>,
+    // gx: see `ModelEntryConfig::supports_vision`.
+    pub supports_vision: Option<bool>,
 }
 impl ConfigModelOverride {
     pub(crate) fn apply(
@@ -4083,6 +4097,10 @@ impl ConfigModelOverride {
         if self.tool_result_images.is_some() {
             entry.info.tool_result_images = self.tool_result_images;
         }
+        // gx: per-model opt-out for endpoints that reject images outright.
+        if self.supports_vision.is_some() {
+            entry.info.supports_vision = self.supports_vision;
+        }
         if self.api_key.is_some() {
             entry.api_key.clone_from(&self.api_key);
         }
@@ -4179,6 +4197,9 @@ pub struct ModelInfo {
     /// gx: see `ModelEntryConfig::tool_result_images`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_result_images: Option<crate::agent::gx_tool_images::ToolResultImages>,
+    /// gx: see `ModelEntryConfig::supports_vision`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_vision: Option<bool>,
     /// Per-model Layer-3 LazinessDetector configuration. Defaults to the all-disabled state.
     /// The feature is per-model opt-in, with a second-step `max_nudges_per_session > 0` opt-in for actually injecting nudges.
     /// See [`LazinessDetectorPerModelConfig`].
@@ -4228,6 +4249,8 @@ impl ModelInfo {
             codex_compat: None,
             // gx: see `ModelEntryConfig::tool_result_images`.
             tool_result_images: None,
+            // gx: see `ModelEntryConfig::supports_vision`.
+            supports_vision: None,
             laziness_detector: LazinessDetectorPerModelConfig::default(),
         }
     }
@@ -4270,6 +4293,8 @@ impl ModelInfo {
             codex_compat: entry.codex_compat,
             // gx: see `ModelEntryConfig::tool_result_images`.
             tool_result_images: entry.tool_result_images,
+            // gx: see `ModelEntryConfig::supports_vision`.
+            supports_vision: entry.supports_vision,
             laziness_detector: entry.laziness_detector.clone(),
         }
     }
@@ -5030,6 +5055,8 @@ pub(crate) fn resolve_aux_model_sampling_config(
                 codex_compat: None,
                 // gx: see `ModelEntryConfig::tool_result_images`.
                 tool_result_images: None,
+                // gx: see `ModelEntryConfig::supports_vision`.
+                supports_vision: None,
                 laziness_detector: LazinessDetectorPerModelConfig::default(),
             },
             api_key: Some(bearer),
@@ -5178,6 +5205,8 @@ pub(crate) fn sampling_config_for_model(
         codex_compat: info.codex_compat.unwrap_or(false),
         // gx: per-model placement of tool-result images.
         hoist_tool_images: crate::agent::gx_tool_images::hoist_tool_images(info),
+        // gx: per-model opt-out for endpoints that reject images outright.
+        supports_vision: info.supports_vision.unwrap_or(true),
         idle_timeout_secs: None,
         client_identifier: None,
         deployment_id,
@@ -5267,6 +5296,8 @@ fn resolve_hidden_default_web_search_sampling_config(
             codex_compat: None,
             // gx: see `ModelEntryConfig::tool_result_images`.
             tool_result_images: None,
+            // gx: see `ModelEntryConfig::supports_vision`.
+            supports_vision: None,
             laziness_detector: LazinessDetectorPerModelConfig::default(),
         },
         api_key: None,

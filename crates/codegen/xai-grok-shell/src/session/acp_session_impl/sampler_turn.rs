@@ -727,6 +727,8 @@ impl SessionActor {
             // chat-state actor's copy on every turn.
             codex_compat: cfg.codex_compat.unwrap_or(false),
             hoist_tool_images: cfg.hoist_tool_images.unwrap_or(false),
+            // gx: see `SessionActor::supports_vision`.
+            supports_vision: self.supports_vision.get(),
             idle_timeout_secs: None,
             client_identifier: self.client_identifier.clone(),
             deployment_id: crate::managed_config::resolve_deployment_id(
