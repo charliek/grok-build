@@ -218,12 +218,21 @@ class TuiSession:
     def start(self) -> None:
         pid, fd = pty.fork()
         if pid == 0:
-            os.chdir(self.cwd)
+            # Forked child. Nothing may escape this block: an exception here would print a
+            # Python traceback into the PTY (which the parent then scrapes as if it were TUI
+            # output) and leave a second copy of the harness running. Every path either execs
+            # or `os._exit`s.
+            try:
+                os.chdir(self.cwd)
+            except BaseException as e:  # noqa: BLE001
+                os.write(2, f"chdir to {self.cwd} failed: {e!r}\n".encode())
+                os._exit(126)
             try:
                 os.execvpe(self.cmd[0], self.cmd, self.env)
-            except Exception as e:  # noqa: BLE001
-                os.write(2, f"execvpe failed: {e}\n".encode())
-                os._exit(127)
+            except BaseException as e:  # noqa: BLE001
+                os.write(2, f"execvpe failed: {e!r}\n".encode())
+            # Only reachable if execvpe failed; a successful exec never returns.
+            os._exit(127)
         self.pid = pid
         self.fd = fd
         self._grid = TerminalGrid(cols=self.cols)
@@ -234,6 +243,10 @@ class TuiSession:
         """Read whatever the PTY produces for up to `duration` seconds."""
         import select
 
+        # `terminate()` closes the master and parks `fd` at -1; whatever the grid already holds
+        # is still readable, but there is nothing left to pump.
+        if self.fd < 0:
+            return
         end = time.time() + duration
         while time.time() < end:
             remaining = max(0.0, end - time.time())
@@ -299,17 +312,22 @@ class TuiSession:
         end = min(len(text), idx + len(needle) + after)
         return text[start:end]
 
-    def send_text(self, text: str) -> None:
-        os.write(self.fd, text.encode())
-
-    def send_line(self, text: str) -> None:
-        os.write(self.fd, text.encode() + b"\r")
-
-    def send_keys(self, raw: bytes) -> None:
+    def _write(self, raw: bytes) -> None:
+        if self.fd < 0:
+            raise RuntimeError("this TUI session has been terminated; its PTY master is closed")
         os.write(self.fd, raw)
 
+    def send_text(self, text: str) -> None:
+        self._write(text.encode())
+
+    def send_line(self, text: str) -> None:
+        self._write(text.encode() + b"\r")
+
+    def send_keys(self, raw: bytes) -> None:
+        self._write(raw)
+
     def send_ctrl_c(self) -> None:
-        os.write(self.fd, b"\x03")
+        self._write(b"\x03")
 
     def send_slash_exit(self) -> None:
         """Type /exit and press enter -- the documented slash command
@@ -325,31 +343,44 @@ class TuiSession:
             return False
         return wpid == 0
 
-    def terminate(self, grace: float = 3.0) -> None:
-        if self.pid <= 0:
+    def close_fd(self) -> None:
+        """Close the PTY master exactly once. Idempotent, and leaves `fd` at -1 so the read/write
+        helpers can tell the session is finished rather than hitting EBADF on a recycled fd."""
+        if self.fd < 0:
             return
-        if not self.is_alive():
-            return
+        fd, self.fd = self.fd, -1
         try:
-            os.kill(self.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            return
-        deadline = time.time() + grace
-        while time.time() < deadline and self.is_alive():
-            time.sleep(0.1)
-        if self.is_alive():
-            try:
-                os.kill(self.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            try:
-                os.waitpid(self.pid, 0)
-            except ChildProcessError:
-                pass
-        try:
-            os.close(self.fd)
+            os.close(fd)
         except OSError:
             pass
+
+    def terminate(self, grace: float = 3.0) -> None:
+        """Stop the child and release the PTY master.
+
+        The master fd is closed on *every* path -- including "already exited" and "the pid is
+        gone" -- or the matrix leaks one descriptor per TUI it starts for the life of the run.
+        Safe to call more than once."""
+        try:
+            if self.pid > 0 and self.is_alive():
+                try:
+                    os.kill(self.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                else:
+                    deadline = time.time() + grace
+                    while time.time() < deadline and self.is_alive():
+                        time.sleep(0.1)
+                if self.is_alive():
+                    try:
+                        os.kill(self.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        os.waitpid(self.pid, 0)
+                    except ChildProcessError:
+                        pass
+        finally:
+            self.close_fd()
 
 
 def start_tui(

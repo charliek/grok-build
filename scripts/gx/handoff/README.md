@@ -18,9 +18,18 @@ harness, not a bugfix PR.
   inside the `acp` payload. Usable as a library (`run_matrix.py` imports it) or
   standalone: `python3 acp_client.py --socket <sock> session-list`.
 - `tui_pty.py` — spawns the `gx` TUI in a real PTY (`pty.fork`, 120x40) and gives you
-  `send_line`, `wait_until_contains`, `screen_text` (ANSI-stripped). No VT100
-  emulation — it just accumulates raw output and strips escape codes, which is
-  sufficient for "does this token ever appear in the rendered stream" assertions.
+  `send_line`, `wait_until_contains`, `screen_text`. Not a full VT100 emulator (no `pyte`,
+  no pip deps allowed), but not a flat ANSI strip either: everything the PTY produces is fed
+  to a small hand-rolled `TerminalGrid` that interprets `\r`, `\n`, backspace, `CSI K`
+  (erase-in-line) and `CSI A/B/C/D` (cursor movement) as an actual 2D character grid, and
+  `screen_text()` reads that grid. Colors, alt-screen, absolute cursor positioning and OSC
+  titles are parsed and discarded. The grid is what makes "does this token appear on the
+  rendered screen" a reliable assertion: the TUI redraws its pinned status region in place,
+  and concatenating raw bytes (or blindly deleting `\r`) smears a spinner redraw together
+  with the text underneath it — `ROGER` came back as `RGER` interleaved with braille spinner
+  glyphs on the first run of the `prompt` cell (see `docs/gx/HANDOFF_MATRIX.md`, "Harness
+  notes"). `strip_ansi()` / `raw_screen_text()` keep the old flat strip, for debugging a
+  `screen_text()` mismatch only — do not assert on them.
 - `run_matrix.py` — runs all 7 cells end to end, writes `results.json` and one
   sanitized transcript per cell to `docs/gx/handoff/<cell>.md`.
 

@@ -98,7 +98,7 @@ Remote-created session id: `01a07a18-3fb3-7bb2-8eab-23c62547bd90`
 ```
 
 ## TUI screen tail after --resume
-```
+```text
 
   <scratch>/a1-… 1.6K / 272K
 

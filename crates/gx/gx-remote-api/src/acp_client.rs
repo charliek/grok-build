@@ -449,7 +449,11 @@ async fn handle_inbound(
                 debug!(id, "gx-remote-api: response for an unknown request id");
                 return;
             };
-            let outcome = if let Some(error) = msg.get("error") {
+            // A literal `"error": null` is not an error. `{"id":N,"result":{…},"error":null}` is
+            // a legal response frame — any sender that serializes both members unconditionally
+            // emits it — and reading the null as a failure would discard the real `result` and
+            // report `code 0: unknown error`. Same null filter as the id above.
+            let outcome = if let Some(error) = msg.get("error").filter(|v| !v.is_null()) {
                 Err((
                     error.get("code").and_then(Value::as_i64).unwrap_or(0),
                     error
@@ -705,6 +709,39 @@ mod tests {
         let (a, b) = tokio::join!(a, b);
         assert_eq!(a.unwrap()["sessionId"], "a");
         assert_eq!(b.unwrap()["sessionId"], "b");
+    }
+
+    #[tokio::test]
+    async fn a_response_with_an_explicit_null_error_still_yields_its_result() {
+        // `{"jsonrpc":"2.0","id":N,"result":{…},"error":null}` is a legal response frame: a
+        // serializer that writes both members unconditionally produces it. Treating the null as a
+        // failure would throw the result away and report `code 0: unknown error`.
+        //
+        // `FakeLink`'s responder table emits `result` **or** `error`, never both, so the frame is
+        // pushed onto the link by hand while the request is in flight.
+        let (client, handle) = spawn_over_fake();
+        handle.never_respond("session/new");
+
+        let (result, ()) = tokio::join!(client.request("session/new", json!({ "cwd": "/w" })), {
+            let handle = &handle;
+            async move {
+                let sent = handle
+                    .wait_for_outbound("session/new", Duration::from_secs(5))
+                    .await;
+                let id = sent["id"].as_i64().expect("the lane numbers its requests");
+                handle.push(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": { "sessionId": "sess-1" },
+                    "error": Value::Null,
+                }));
+            }
+        });
+
+        assert_eq!(
+            result.expect("an explicit null error is a success")["sessionId"],
+            "sess-1"
+        );
     }
 
     #[tokio::test]

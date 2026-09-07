@@ -148,11 +148,53 @@ def dump_json_compact(obj: Any, cap: int = 600) -> str:
     return text[:cap] + f"... [truncated, {len(text)} chars total]"
 
 
+def agent_message_text(updates: list) -> str:
+    """The agent's streamed answer, concatenated from the `agent_message_chunk` updates in
+    arrival order.
+
+    Chunk boundaries fall anywhere -- a live run split "ROGER" into "RO" + "GER"
+    (docs/gx/handoff/prompt.md) -- so a token is only reliably visible once the chunks are
+    joined. Searching the JSON dump of the notifications instead would also match text the
+    agent never emitted (the echoed prompt, ids, timestamps, token counts)."""
+    out = []
+    for n in updates:
+        params = (getattr(n, "payload", None) or {}).get("params") or {}
+        update = params.get("update") or {}
+        if update.get("sessionUpdate") != "agent_message_chunk":
+            continue
+        text = (update.get("content") or {}).get("text")
+        if isinstance(text, str):
+            out.append(text)
+    return "".join(out)
+
+
+def numbers_present(text: str, first: int, last: int) -> tuple:
+    """`(seen, missing)` for the integers `first..last` appearing in `text` as whole numbers.
+
+    The digit lookarounds are what make this an actual assertion: without them "10" would
+    satisfy both 1 and 0, and a substring search for "20" is satisfied by "120" or a token
+    count. Every number must appear on its own."""
+    seen = []
+    missing = []
+    for n in range(first, last + 1):
+        (seen if re.search(rf"(?<!\d){n}(?!\d)", text) else missing).append(n)
+    return seen, missing
+
+
 def write_transcript(env: Env, cell: str, lines: list) -> str:
     fname = f"{cell}.md"
     path = env.handoff_docs_dir / fname
-    body = "\n".join(lines)
-    path.write_text(acp.sanitize(body) if isinstance(acp.sanitize(body), str) else body)
+    # Redact exactly once, and refuse to write anything that is not the redacted string.
+    # `sanitize()` returns a str for a str input; if that ever stops being true, the only safe
+    # response is to fail loudly -- falling back to the *original* body would write the very
+    # unredacted text this call exists to prevent.
+    redacted = acp.sanitize("\n".join(lines))
+    if not isinstance(redacted, str):
+        raise TypeError(
+            f"acp.sanitize() returned {type(redacted).__name__}, not str; "
+            f"refusing to write a possibly unredacted transcript to {path}"
+        )
+    path.write_text(redacted)
     return str(path)
 
 
@@ -162,9 +204,16 @@ def write_transcript(env: Env, cell: str, lines: list) -> str:
 
 SPAWNED_TUIS: list = []
 
+# Every pid this run is responsible for: the TUI PTY children we forked ourselves, plus the
+# leader pid read out of the lock file (the leader is auto-spawned by the first TUI, so it is
+# ours too). Used only as the fallback signal in `started_by_this_run()`.
+SPAWNED_PIDS: set = set()
+
 
 def track_tui(sess: tui_pty.TuiSession) -> tui_pty.TuiSession:
     SPAWNED_TUIS.append(sess)
+    if sess.pid > 0:
+        SPAWNED_PIDS.add(sess.pid)
     return sess
 
 
@@ -187,9 +236,59 @@ def wait_for_socket(path: str, timeout: float = 30.0) -> bool:
 def leader_pid(env: Env) -> Optional[int]:
     try:
         with open(env.lock_path) as f:
-            return int(f.read().strip())
+            pid = int(f.read().strip())
     except (OSError, ValueError):
         return None
+    # The lock file is scoped to *this* run's socket path, so whatever holds it is ours to
+    # clean up -- record it alongside the pids we forked directly.
+    if pid > 0:
+        SPAWNED_PIDS.add(pid)
+    return pid
+
+
+def read_environ(pid: int) -> dict:
+    """`/proc/<pid>/environ` as a dict. Populated for a settled own-uid process; **empty** for a
+    zombie (its mm is gone), for another user's process, and for the first instants of a process
+    that has not finished `exec`-ing. Callers must treat empty as "cannot tell", never as
+    "no such variables"."""
+    out: dict = {}
+    try:
+        with open(f"/proc/{pid}/environ", "rb") as f:
+            raw = f.read()
+    except OSError:
+        return out
+    for item in raw.split(b"\0"):
+        if not item:
+            continue
+        k, _, v = item.partition(b"=")
+        out[k.decode(errors="replace")] = v.decode(errors="replace")
+    return out
+
+
+def started_by_this_run(pid: int, env: Env) -> bool:
+    """True only for a gx process *this* run is responsible for.
+
+    Running the same binary is not enough: the developer may well have their own `gx` open
+    against their real `~/.grok` while the matrix runs, and reporting (let alone killing) it
+    would be a bug in the harness, not a finding about gx. Two narrower signals:
+
+    - its environment names this run's scratch `GROK_HOME` **and** `GROK_LEADER_SOCKET` --
+      `tui_pty.start_tui()` sets both explicitly, and the leader a TUI auto-spawns inherits
+      them, so every process this run creates carries them and nothing else does;
+    - failing that (environ empty, i.e. it has become a zombie), whether we forked or locked
+      that pid ourselves. A pid cannot be recycled while it is an unreaped zombie, so this
+      cannot alias somebody else's process.
+
+    The two are ordered, not OR-ed, on purpose: an empty environ means "cannot tell", so it
+    falls back to the pid set; a *readable* environ that names some other GROK_HOME is a
+    definite no, even for a pid we once tracked (pids get recycled)."""
+    environ = read_environ(pid)
+    if environ:
+        return (
+            environ.get("GROK_HOME") == env.grok_home
+            and environ.get("GROK_LEADER_SOCKET") == env.leader_socket
+        )
+    return pid in SPAWNED_PIDS
 
 
 def kill_pid(pid: int, grace: float = 3.0) -> None:
@@ -236,11 +335,15 @@ def teardown(env: Env) -> list:
             os.remove(p)
         except OSError:
             pass
-    # Verify: nothing of ours should be alive now. We check /proc/<pid>/exe against
-    # the resolved GX_BIN path rather than grepping cmdline text for "target/release/gx":
-    # this whole harness is itself invoked as a shell command containing that very
-    # substring, and a naive `pgrep -af` matches that ancestor shell, not a real gx
-    # process. Comparing the actual executable inode/path has no such false positive.
+    # Verify: nothing of ours should be alive now. Two filters, both required.
+    #
+    # 1. /proc/<pid>/exe must resolve to GX_BIN. We compare the executable rather than grepping
+    #    cmdline text for "target/release/gx": this whole harness is itself invoked as a shell
+    #    command containing that very substring, and a naive `pgrep -af` matches that ancestor
+    #    shell, not a real gx process.
+    # 2. `started_by_this_run()` -- the same binary is *not* evidence the harness started it.
+    #    A developer's own gx, running against their real ~/.grok, must never be reported here
+    #    (and must certainly never be killed by a future teardown that acts on this list).
     try:
         gx_real = os.path.realpath(env.gx_bin)
         for entry in os.listdir("/proc"):
@@ -251,6 +354,8 @@ def teardown(env: Env) -> list:
             except OSError:
                 continue
             if os.path.realpath(exe) != gx_real:
+                continue
+            if not started_by_this_run(int(entry), env):
                 continue
             try:
                 with open(f"/proc/{entry}/cmdline", "rb") as f:
@@ -427,7 +532,28 @@ def cell_prompt(env: Env, session_id: str, tui: tui_pty.TuiSession, model: str) 
         lines += ["```", ""]
 
         on_tui_screen = tui.wait_until_contains(MARKER_ROGER, timeout=15.0)
-        lines += [f"## TUI screen tail (proves/disproves it also rendered {MARKER_ROGER})", "```", tui.screen_text(1500), "```"]
+        # Capture the region AROUND the marker, not the tail. The turn keeps drawing after the
+        # answer lands (spinner, token counters, the "Starting session" line for the next turn),
+        # so `screen_text(tail_N)` routinely scrolls the very thing this cell asserts out of the
+        # retained transcript -- which is exactly how a reviewer caught this cell's evidence not
+        # backing its own "pass". `find_context` exists for this and cell 4 already used it.
+        context = tui.find_context(MARKER_ROGER) if on_tui_screen else None
+        if context:
+            lines += [
+                f"## TUI screen region containing the rendered {MARKER_ROGER} (the proof)",
+                "```text",
+                context,
+                "```",
+                "",
+            ]
+        else:
+            lines += [
+                f"## {MARKER_ROGER} was NOT found on the TUI screen",
+                "",
+                "The tail below is the whole retained screen; the marker is absent from it.",
+                "",
+            ]
+        lines += ["## TUI screen tail (context only, after the turn moved on)", "```text", tui.screen_text(1500), "```"]
 
         if streamed_to_client and on_tui_screen:
             cr.result = "pass"
@@ -483,7 +609,7 @@ def cell_interject(env: Env, session_id: str, tui: tui_pty.TuiSession, model: st
         tui.pump(20.0)
         lines += [
             f"## TUI screen around the interjection token (found={on_screen})",
-            "```",
+            "```text",
             context or tui.screen_text(2000),
             "```",
         ]
@@ -541,7 +667,7 @@ def cell_resume(env: Env, session_id: str, tui: tui_pty.TuiSession, model: str) 
         lines += [
             f"TUI cleanly exited before resume: {exited}",
             "## resumed TUI screen tail",
-            "```",
+            "```text",
             tui2.screen_text(3000),
             "```",
         ]
@@ -584,7 +710,7 @@ def cell_remote_create(env: Env, model: str) -> CellResult:
         cr.invocations.append(f"new TUI process: gx --leader --resume {session_id} --model {model}")
         tui.pump(3.0)
         found = tui.wait_until_contains(MARKER_TANGO, timeout=25.0)
-        lines += ["## TUI screen tail after --resume", "```", tui.screen_text(3000), "```"]
+        lines += ["## TUI screen tail after --resume", "```text", tui.screen_text(3000), "```"]
         tui.terminate()
         if tui in SPAWNED_TUIS:
             SPAWNED_TUIS.remove(tui)
@@ -638,23 +764,31 @@ def cell_disconnect(env: Env, model: str) -> CellResult:
         post_notes = client_b.collect_notifications_for(15.0)
         all_notes_b = client_b.notifications_snapshot()
         updates = [n for n in all_notes_b if n.method == "session/update"]
-        blob = json.dumps([acp.sanitize(n.payload) for n in updates])
         lines += [f"## session/update notifications on client B: {len(updates)}", "```json"]
         for n in updates[-25:]:
             lines.append(dump_json_compact(n.payload))
         lines += ["```", ""]
 
-        completed = "20" in blob and re.search(r"\b1\s*[\s\S]*20\b", blob) is not None
+        answer = agent_message_text(updates)
+        seen, missing = numbers_present(answer, 1, 20)
+        census = (
+            "all of 1..20 present in the streamed answer"
+            if not missing
+            else f"{len(seen)}/20 numbers present (seen {seen}, missing {missing})"
+        )
+        lines += [f"## 1..20 census on the reconnected client: {census}", ""]
+
+        completed = not missing
         still_streaming = len(post_notes) > 0
         if completed:
             cr.result = "pass"
             cr.notes = "turn completed (full 1..20 answer visible) to the reconnected client"
         elif still_streaming:
             cr.result = "pass"
-            cr.notes = f"turn was still streaming to the reconnected client B ({len(post_notes)} new session/update notifications after reconnect)"
+            cr.notes = f"turn was still streaming to the reconnected client B ({len(post_notes)} new session/update notifications after reconnect); {census}"
         elif updates:
             cr.result = "partial"
-            cr.notes = "replay contained prior updates but no further streaming/new content observed after reconnect"
+            cr.notes = f"replay contained prior updates but no further streaming/new content observed after reconnect; {census}"
         else:
             cr.result = "fail"
             cr.notes = "no session/update activity observed on the reconnected client at all"

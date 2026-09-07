@@ -97,6 +97,12 @@ fn create_token(path: &Path) -> std::io::Result<Token> {
         .create_new(true)
         .mode(REQUIRED_MODE)
         .open(path)?;
+    // `OpenOptions::mode` is masked by the process umask; `fchmod` on the handle we already hold
+    // is not, and cannot be raced by a path lookup. Without this, a leader started under (say)
+    // `umask 0277` mints a `0400` token — the first start works, and every later start refuses its
+    // own file in [`read_token`] ("has mode 0400"), which only a manual `chmod` gets out of. Same
+    // guard as `discovery::write_record`.
+    file.set_permissions(std::fs::Permissions::from_mode(REQUIRED_MODE))?;
     file.write_all(secret.as_bytes())?;
     file.write_all(b"\n")?;
     file.sync_all()?;
@@ -228,6 +234,58 @@ mod tests {
         assert_eq!(on_disk.len(), 64, "32 random bytes as hex");
         assert!(on_disk.chars().all(|c| c.is_ascii_hexdigit()));
         assert!(token.matches(on_disk));
+    }
+
+    /// Names the scratch `$GROK_HOME` for the child half of
+    /// [`a_token_minted_under_a_restrictive_umask_is_still_0600`]. Its presence is also what tells
+    /// that test it *is* the child.
+    const UMASK_CHILD_HOME: &str = "GX_REMOTE_API_UMASK_CHILD_HOME";
+
+    /// The `--exact` filter the parent re-executes. Kept next to the test so a rename is one edit;
+    /// the "1 passed" assertion below is what catches it if the two ever drift apart.
+    const UMASK_CHILD_TEST: &str =
+        "auth::tests::a_token_minted_under_a_restrictive_umask_is_still_0600";
+
+    #[test]
+    fn a_token_minted_under_a_restrictive_umask_is_still_0600() {
+        // `umask` is process-global and `cargo test` runs this crate's tests as threads in one
+        // process, so setting it here would hand a sibling test a write-only file or an
+        // unwritable tempdir. The umask half therefore runs in a *child* process: this same test
+        // binary, re-executed with `--exact` on this test plus the env var below, which makes it
+        // take the mint-and-exit branch instead of the parent branch.
+        if let Ok(home) = std::env::var(UMASK_CHILD_HOME) {
+            // SAFETY: `umask` takes a scalar, touches no memory and cannot fail. This process
+            // exists only to mint one token, so nothing else can observe the change.
+            unsafe { libc::umask(0o277) };
+            load_or_create_token(Path::new(&home)).expect("minting under a restrictive umask");
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "--nocapture", UMASK_CHILD_TEST])
+            .env(UMASK_CHILD_HOME, dir.path())
+            .output()
+            .expect("re-executing this test binary");
+        let report = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.status.success(), "child run failed:\n{report}");
+        assert!(
+            report.contains("1 passed"),
+            "the child ran no test — {UMASK_CHILD_TEST} no longer names this test:\n{report}"
+        );
+
+        // `OpenOptions::mode` is masked by the umask, so the open alone lands this at `0400`.
+        let path = token_path(dir.path());
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the mint must fchmod the handle back to 0600");
+        // The mode is the fix, but the operator-visible symptom was the *next* start refusing the
+        // token this one wrote, so assert the reload too.
+        let token = read_token(&path).expect("a freshly minted token must load on the next start");
+        assert!(token.matches(std::fs::read_to_string(&path).unwrap().trim()));
     }
 
     #[test]
