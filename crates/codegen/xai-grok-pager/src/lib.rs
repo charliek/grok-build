@@ -22,6 +22,8 @@ pub mod doctor_cmd;
 pub mod export_cmd;
 pub(crate) mod fs_size;
 pub mod git_info;
+// gx: hosts the `gx-remote-api` lane inside the leader process (docs/gx/REMOTE_API.md).
+pub mod gx_remote_lane;
 pub mod headless;
 pub mod hyperlink_route;
 pub mod inline_media_ffmpeg;
@@ -45,6 +47,8 @@ pub mod plugin_cmd;
 pub mod providers_cmd;
 pub mod pty_wrap;
 pub mod recent_dirs;
+// gx: `gx remote` — status/up for the loopback remote lane (docs/gx/REMOTE_API.md).
+pub mod remote_cmd;
 pub mod scrollback;
 pub mod sessions_cmd;
 pub mod settings;

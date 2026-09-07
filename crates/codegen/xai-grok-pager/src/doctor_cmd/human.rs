@@ -138,6 +138,13 @@ pub(super) fn format(report: &DiagnosticReport) -> String {
         }
     }
 
+    // gx: the leader + remote-lane section (`docs/gx/REMOTE_API.md`). Nothing is appended on a
+    // stock build — `collect()` returns `None` there — so upstream's exact-output fixtures are
+    // unaffected.
+    if let Some(facts) = super::gx_leader::collect() {
+        out.push_str(&super::gx_leader::human_section(&facts));
+    }
+
     if !report.findings.is_empty() {
         out.push_str("\nFindings\n");
         for finding in &report.findings {

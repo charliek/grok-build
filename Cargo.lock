@@ -4860,6 +4860,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "gx-remote-api"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "chrono",
+ "libc",
+ "rand 0.9.5",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tower",
+ "tracing",
+ "xai-dirs",
+ "xai-grok-shell",
+ "xai-grok-version",
+ "xai-message-delivery-core",
+]
+
+[[package]]
 name = "h2"
 version = "0.4.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -14113,6 +14137,7 @@ dependencies = [
  "dunce",
  "flate2",
  "git2",
+ "gx-remote-api",
  "image",
  "indexmap",
  "insta",

@@ -33,6 +33,8 @@ pub(crate) fn fake_caps(control_v1: bool, relaunch_v1: bool) -> LeaderCapabiliti
         profile_formats: Vec::new(),
         workspace_exposure: false,
         relaunch_v1,
+        // gx: a fake leader is not a gx leader; the observer contract stays off by default.
+        observer_v1: false,
     }
 }
 /// Wire behavior of a [`spawn_fake_leader`] instance.
