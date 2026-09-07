@@ -47,6 +47,9 @@ pub enum Command {
     // gx: manage the gx-only providers layer ($GROK_HOME/providers.toml).
     /// Manage gx model providers (providers.toml)
     Providers(crate::providers_cmd::ProvidersArgs),
+    // gx: inspect and start the gx-only loopback remote lane (docs/gx/REMOTE_API.md).
+    /// Inspect or start the gx remote lane (HTTP over the leader)
+    Remote(crate::remote_cmd::RemoteArgs),
     /// Manage cross-session memory
     Memory(crate::memory_cmd::MemoryArgs),
     /// List available models and exit

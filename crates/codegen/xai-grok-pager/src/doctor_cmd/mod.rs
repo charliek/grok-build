@@ -5,6 +5,9 @@ use anyhow::Result;
 
 use crate::diagnostics::{DiagnosticReport, FixActivation, FixPlan, ShellKind};
 
+// gx: the leader + remote-lane section, rendered by `human` and `json` below. Collects to `None`
+// on a stock build, so a stock report stays byte-for-byte upstream's.
+mod gx_leader;
 mod human;
 mod json;
 

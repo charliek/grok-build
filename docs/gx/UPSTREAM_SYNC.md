@@ -102,6 +102,24 @@ real pressure.
    obvious from reading both sides, means stop, abort, and investigate by hand — possibly
    falling back to the `format-patch` path from step 4.
 
+   **Recurring conflict points.** These are the hunks that live inside upstream-owned
+   files and therefore move with every upstream edit nearby. A conflict in one of them is
+   expected and usually mechanical; a conflict anywhere else is the signal to stop.
+
+   | file | what gx has there |
+   |---|---|
+   | `Cargo.toml` | one `# gx:`-marked line in the auto-generated, sorted `members` list (`"crates/gx/gx-remote-api",`). Upstream regenerates this list, so expect a conflict whenever a crate is added or removed near it. Re-insert in sorted position; never touch `[workspace.dependencies]`. |
+   | `crates/codegen/xai-grok-shell/src/leader/server.rs` | **five** `observer` hunks — never last-active, never driver on load/new, skipped in driver reassignment, excluded from the exit-on-disconnect count, identity-only injection in `inject_session_request_context` — plus the `#[path = "server_gx_tests.rs"]` mod line. Upstream edits this file often; re-read both sides rather than taking either wholesale. |
+   | `crates/codegen/xai-grok-shell/src/leader/protocol.rs` | `ClientCapabilities.observer` (`#[serde(default)]`) and `LeaderCapabilities::observer_v1`. |
+   | `crates/codegen/xai-grok-hooks/src/event.rs` | the `gxRemote` insert at the end of `to_hook_json()`. Small and self-contained; conflicts only if upstream reworks the alias loop. |
+   | `crates/codegen/xai-grok-pager-bin/src/main.rs` | four hunks: `Command::Remote(_)` in **both** early-exit match lists, the `Command::Remote(…)` dispatch arm, and the `gx_remote_lane::spawn` line in `AgentCmd::Leader`. The two match lists are exhaustive over `Command`, so an upstream variant addition conflicts here by construction. |
+   | `crates/codegen/xai-grok-pager/src/app/cli.rs` | the `Command::Providers` and `Command::Remote` variants. |
+   | `crates/codegen/xai-grok-pager/src/doctor_cmd/{mod,human,json}.rs` | the `gx_leader` mod line and one call site each. |
+   | `crates/common/xai-message-delivery-core/src/envelope.rs` | `OperationSet::with`. |
+
+   `Cargo.lock` will also change (the `gx-remote-api` member and `xai-grok-pager`'s path
+   dependency on it); see step 10 before touching it.
+
 10. **`Cargo.lock`: never blind-regenerate.** Do not run `cargo update` or delete-and-
     regenerate the lockfile speculatively "to fix things." Only touch it in response to a
     *concrete* `cargo` error that names it, and when you do, review the diff — a lockfile
@@ -123,6 +141,8 @@ real pressure.
     cargo test -p xai-grok-version --locked
     cargo test -p xai-grok-shell --lib --locked -- leader:: agent::model_providers::tests:: agent::reasoning_family session_compact auth::auth_provider::tests::resolve_auth_program
     cargo test -p xai-grok-shell --locked --bin chat-history-downgrade
+    cargo test -p gx-remote-api --locked
+    cargo test -p xai-message-delivery-core --locked
     ```
 
     All of the above must pass before continuing.
