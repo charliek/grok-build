@@ -307,6 +307,7 @@ pub async fn connect_via_leader(
         fs_read: flags.fs_read,
         fs_write: flags.fs_write,
         status_line: flags.status_line,
+        observer: false, // gx: observer
     };
 
     startup::enter(StartupPhase::LeaderConnect);
