@@ -308,6 +308,13 @@ pub async fn connect_via_leader(
         fs_write: flags.fs_write,
         status_line: flags.status_line,
         observer: false, // gx: observer
+        // gx: this is the process a roost tab actually launches, so this is the only place the
+        // roost identity can be read from a per-tab environment (issue #14). The leader inherits
+        // whichever tab spawned it, and neutralizes every inherited `ROOST_*` to an empty string in
+        // each hook child's environment, so a client that sends nothing here is invisible to roost
+        // rather than reporting the spawning tab. `capabilities` is cloned into `LeaderReconnector`
+        // below, so a reconnect re-registers the same identity.
+        hook_env: xai_grok_shell::agent::gx_hook_env::from_process_env(),
     };
 
     startup::enter(StartupPhase::LeaderConnect);

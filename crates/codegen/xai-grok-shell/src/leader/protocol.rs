@@ -171,6 +171,16 @@ pub struct ClientCapabilities {
     /// older clients (which never send the key) deserializing as `observer: false`.
     #[serde(default)]
     pub observer: bool,
+
+    /// gx: the client's own roost identity (`ROOST_TAB_ID` / `ROOST_SOCKET` / `ROOST_AGENT_HOOK`),
+    /// carried per client because the leader's own environment is whichever TUI spawned it — see
+    /// [`crate::agent::gx_hook_env`] and issue #14. The leader validates it at registration and
+    /// stamps it into that client's session requests as `_meta["gx/hookEnv"]`; the session actor
+    /// merges it into every hook spec's `extra_env`. Empty (the default, and every non-TUI client)
+    /// means "stamp nothing", which is the pre-gx behaviour.
+    /// `#[serde(default)]` like every other field here, so the wire stays compatible both ways.
+    #[serde(default)]
+    pub hook_env: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

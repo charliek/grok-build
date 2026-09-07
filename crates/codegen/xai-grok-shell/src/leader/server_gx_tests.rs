@@ -844,3 +844,339 @@ fn leader_capabilities_without_observer_v1_deserializes_to_false() {
         "sanity: the rest of the payload still parses"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 8. Roost hook identity (`gx/hookEnv`, issue #14)
+// ---------------------------------------------------------------------------
+//
+// The leader runs every session's hooks, and inherits the environment of whichever TUI spawned it,
+// so the identity has to travel per client: registered as a capability, stamped by the leader into
+// that client's session requests. These tests pin the properties that make the stamp safe - it
+// comes from the registration and only the registration, and the PRESENT/ABSENT distinction the
+// agent reads off it:
+//
+//   - a non-observer's session request carries the key even when the client registered no identity
+//     (an empty object, which tells the agent to CLEAR the session's identity);
+//   - an observer's never carries it, which tells the agent to leave the session's identity
+//     exactly as it is. Stamping an empty object for an observer would be the bug in reverse:
+//     merely opening a session from the phone would unhook the owning TUI's session from its tab.
+
+/// A tab identity as a TUI would register it.
+fn hook_env_of(tab: &str) -> std::collections::BTreeMap<String, String> {
+    [
+        ("ROOST_AGENT_HOOK", "/usr/local/bin/roost"),
+        ("ROOST_SOCKET", "/run/roost.sock"),
+        ("ROOST_TAB_ID", tab),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect()
+}
+
+fn caps_with_hook_env(observer: bool, tab: &str) -> ClientCapabilities {
+    ClientCapabilities {
+        observer,
+        hook_env: hook_env_of(tab),
+        ..Default::default()
+    }
+}
+
+/// The stamped `_meta` key, read back as a plain map.
+fn hook_env_meta(
+    request: &serde_json::Value,
+) -> Option<std::collections::BTreeMap<String, String>> {
+    let value = meta_of(request).get(crate::agent::gx_hook_env::META_KEY)?;
+    Some(
+        value
+            .as_object()
+            .expect("gx/hookEnv must be stamped as an object")
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.clone(),
+                    v.as_str()
+                        .expect("every value must be a string")
+                        .to_string(),
+                )
+            })
+            .collect(),
+    )
+}
+
+/// A `session/load` that supplies a `gx/hookEnv` in its own body.
+async fn load_session_claiming(
+    writer: &mut tokio::io::WriteHalf<LeaderStream>,
+    session_id: &str,
+    tab: &str,
+) {
+    let forged = serde_json::json!({
+        "ROOST_TAB_ID": tab,
+        "ROOST_SOCKET": "/tmp/forged.sock",
+        "ROOST_AGENT_HOOK": "/tmp/forged",
+    });
+    send_acp(
+        writer,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/load",
+            "id": 1,
+            "params": {
+                "sessionId": session_id,
+                "_meta": { crate::agent::gx_hook_env::META_KEY: forged },
+            },
+        })
+        .to_string(),
+    )
+    .await;
+}
+
+/// (c) A non-observer TUI that registered an identity gets it stamped: the agent SETS it on the
+/// session.
+#[tokio::test]
+async fn tui_session_load_gets_hook_env_stamped_from_its_registration() {
+    let temp = TempDir::new().unwrap();
+    let (sock_path, cancel, response_tx, mut acp_rx, _count, _srv) =
+        spawn_server(&temp, true).await;
+
+    let (_reader, mut writer) =
+        register_with(&sock_path, "grok-tui", caps_with_hook_env(false, "5")).await;
+    load_session(&mut writer, "sess-hookenv").await;
+    let load = complete_load(&mut acp_rx, &response_tx, None).await;
+
+    assert_eq!(
+        hook_env_meta(&load),
+        Some(hook_env_of("5")),
+        "the session must carry the identity the client registered: {:?}",
+        meta_of(&load)
+    );
+
+    cancel.cancel();
+}
+
+/// (a) An observer's `session/load` carries NO key at all, even when it asks for one in the
+/// request body - so the agent leaves the resident session's identity intact.
+///
+/// Both halves matter. `ROOST_AGENT_HOOK` names an executable every hook of the session then runs,
+/// and the remote lane attaches to sessions other clients are driving, so it must not choose that
+/// executable (no stamp from its own registration). And the key must be ABSENT rather than empty,
+/// because an empty object is the agent's instruction to clear: stamping one here would mean that
+/// merely opening a session from the phone wipes the owning TUI's roost identity and the session
+/// silently stops reporting to its tab.
+#[tokio::test]
+async fn observer_session_load_never_gets_hook_env() {
+    let temp = TempDir::new().unwrap();
+    let (sock_path, cancel, response_tx, mut acp_rx, _count, _srv) =
+        spawn_server(&temp, true).await;
+
+    // The observer registers WITH an identity and asks for another in the body: both must go.
+    let (_obs_reader, mut obs_writer) =
+        register_with(&sock_path, "gx-remote-api", caps_with_hook_env(true, "9")).await;
+    load_session_claiming(&mut obs_writer, "sess-hookenv-obs", "9").await;
+    let obs_load = complete_load(&mut acp_rx, &response_tx, None).await;
+
+    assert_eq!(
+        hook_env_meta(&obs_load),
+        None,
+        "an observer must neither set nor CLEAR a shared session's roost identity, so the key has \
+         to be absent rather than empty: {:?}",
+        meta_of(&obs_load)
+    );
+
+    // Positive control: the identical request from a non-observer IS stamped, so the assertion
+    // above cannot be passing because the stamp is broken for everyone.
+    let (_tui_reader, mut tui_writer) =
+        register_with(&sock_path, "grok-tui", caps_with_hook_env(false, "5")).await;
+    load_session(&mut tui_writer, "sess-hookenv-obs-control").await;
+    let tui_load = complete_load(&mut acp_rx, &response_tx, None).await;
+    assert_eq!(hook_env_meta(&tui_load), Some(hook_env_of("5")));
+
+    cancel.cancel();
+}
+
+/// (c) A client's own `gx/hookEnv` is replaced by its registration's, never trusted.
+#[tokio::test]
+async fn a_request_body_hook_env_is_replaced_by_the_registration() {
+    let temp = TempDir::new().unwrap();
+    let (sock_path, cancel, response_tx, mut acp_rx, _count, _srv) =
+        spawn_server(&temp, true).await;
+
+    let (_reader, mut writer) =
+        register_with(&sock_path, "grok-tui", caps_with_hook_env(false, "5")).await;
+    load_session_claiming(&mut writer, "sess-hookenv-forged", "99").await;
+    let load = complete_load(&mut acp_rx, &response_tx, None).await;
+
+    assert_eq!(
+        hook_env_meta(&load),
+        Some(hook_env_of("5")),
+        "the body's claim must be discarded in favour of the registration's: {:?}",
+        meta_of(&load)
+    );
+
+    cancel.cancel();
+}
+
+/// (b) A non-observer TUI that registered NO identity still gets the key, stamped as an empty
+/// object - the agent's instruction to CLEAR whatever the session was carrying.
+///
+/// Present-but-empty is the whole point: a TUI launched outside a roost tab, attaching to a
+/// session another tab used to own, must stop that session reporting to the old tab. Absent would
+/// mean "leave it alone", which is the observer's contract, not this one.
+///
+/// Paired with the forged-body case, so the client is shown unable to supply the value both on a
+/// bare request and on one that tried to fill the key in itself.
+#[tokio::test]
+async fn a_non_observer_with_no_identity_stamps_an_empty_object() {
+    let temp = TempDir::new().unwrap();
+    let (sock_path, cancel, response_tx, mut acp_rx, _count, _srv) =
+        spawn_server(&temp, true).await;
+
+    let (_reader, mut writer) =
+        register_with(&sock_path, "grok-tui", ClientCapabilities::default()).await;
+    load_session(&mut writer, "sess-hookenv-none").await;
+    let load = complete_load(&mut acp_rx, &response_tx, None).await;
+    assert_eq!(
+        hook_env_meta(&load),
+        Some(std::collections::BTreeMap::new()),
+        "a non-observer with no identity must stamp an EMPTY object, which clears - not nothing, \
+         which would leave the previous tab claimed: {:?}",
+        meta_of(&load)
+    );
+
+    load_session_claiming(&mut writer, "sess-hookenv-none-forged", "99").await;
+    let forged_load = complete_load(&mut acp_rx, &response_tx, None).await;
+    assert_eq!(
+        hook_env_meta(&forged_load),
+        Some(std::collections::BTreeMap::new()),
+        "a client with no registered identity must not be able to supply one: {:?}",
+        meta_of(&forged_load)
+    );
+
+    cancel.cancel();
+}
+
+/// The strip must beat `inject_session_request_context`'s capability early-return, which a client
+/// reaches deliberately by registering with no capabilities AND an empty client type. Without the
+/// pre-guard strip this is the shape that smuggles a forged identity straight through.
+///
+/// That path deliberately strips without stamping, so a request upstream would forward untouched
+/// still is; no real client reaches it (every one registers a non-empty client type), and for the
+/// anonymous shape that can, an absent key is the conservative reading.
+#[tokio::test]
+async fn a_client_with_no_capabilities_at_all_cannot_smuggle_a_hook_env() {
+    let temp = TempDir::new().unwrap();
+    let (sock_path, cancel, response_tx, mut acp_rx, _count, _srv) =
+        spawn_server(&temp, true).await;
+
+    let (_reader, mut writer) = register_with(&sock_path, "", ClientCapabilities::default()).await;
+    load_session_claiming(&mut writer, "sess-hookenv-bare", "99").await;
+    let load = complete_load(&mut acp_rx, &response_tx, None).await;
+
+    assert_eq!(
+        hook_env_meta(&load),
+        None,
+        "the early-return path is strip-only, so the forged identity is gone and no key is left \
+         behind: this anonymous shape can neither set a session's identity nor clear one: {:?}",
+        meta_of(&load)
+    );
+
+    cancel.cancel();
+}
+
+/// Registration-time validation: a forged map never reaches a session at all, so the leader holds
+/// nothing it would have to re-check later.
+#[tokio::test]
+async fn an_invalid_registered_hook_env_is_dropped_at_registration() {
+    let temp = TempDir::new().unwrap();
+    let (sock_path, cancel, response_tx, mut acp_rx, _count, _srv) =
+        spawn_server(&temp, true).await;
+
+    let mut forged = hook_env_of("5");
+    forged.insert("PATH".to_string(), "/tmp/evil".to_string());
+    let (_reader, mut writer) = register_with(
+        &sock_path,
+        "grok-tui",
+        ClientCapabilities {
+            hook_env: forged,
+            ..Default::default()
+        },
+    )
+    .await;
+    load_session(&mut writer, "sess-hookenv-invalid").await;
+    let load = complete_load(&mut acp_rx, &response_tx, None).await;
+
+    assert_eq!(
+        hook_env_meta(&load),
+        Some(std::collections::BTreeMap::new()),
+        "a registration carrying a key outside the carried set must be dropped whole, leaving the \
+         client indistinguishable from one that registered no identity: {:?}",
+        meta_of(&load)
+    );
+
+    cancel.cancel();
+}
+
+/// Registration-time validation, the incomplete case (finding 2): a client carrying only
+/// `ROOST_AGENT_HOOK` - the executable a hook runs - must not register an identity out of it.
+/// Registration calls `validate` directly, so the all-or-none rule has to live there.
+#[tokio::test]
+async fn an_incomplete_registered_hook_env_is_dropped_at_registration() {
+    let temp = TempDir::new().unwrap();
+    let (sock_path, cancel, response_tx, mut acp_rx, _count, _srv) =
+        spawn_server(&temp, true).await;
+
+    let partial = [("ROOST_AGENT_HOOK", "/tmp/attacker")]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    let (_reader, mut writer) = register_with(
+        &sock_path,
+        "grok-tui",
+        ClientCapabilities {
+            hook_env: partial,
+            ..Default::default()
+        },
+    )
+    .await;
+    load_session(&mut writer, "sess-hookenv-partial").await;
+    let load = complete_load(&mut acp_rx, &response_tx, None).await;
+
+    assert_eq!(
+        hook_env_meta(&load),
+        Some(std::collections::BTreeMap::new()),
+        "a hook executable with no tab and no socket is not an identity; the whole map must go: \
+         {:?}",
+        meta_of(&load)
+    );
+
+    cancel.cancel();
+}
+
+/// Wire compatibility, same shape as `observer`: an older client never sends `hook_env`, and its
+/// registration must still decode - as "no identity", which stamps nothing.
+#[test]
+fn client_capabilities_without_hook_env_deserializes_to_empty() {
+    let caps: ClientCapabilities = serde_json::from_str(
+        r#"{"yolo_mode":true,"observer":false,"terminal":true,"fs_read":true,"fs_write":true,"status_line":true,"code_nav_enabled":true}"#,
+    )
+    .expect("a payload with no `hook_env` key must still deserialize");
+    assert!(
+        caps.hook_env.is_empty(),
+        "a client that never heard of `hook_env` must carry no identity"
+    );
+    assert!(
+        caps.yolo_mode,
+        "sanity: the rest of the payload still parses"
+    );
+    assert!(ClientCapabilities::default().hook_env.is_empty());
+
+    let with_env = ClientCapabilities {
+        hook_env: hook_env_of("5"),
+        ..Default::default()
+    };
+    assert_eq!(
+        serde_json::from_str::<ClientCapabilities>(&serde_json::to_string(&with_env).unwrap())
+            .unwrap(),
+        with_env,
+        "ClientCapabilities must round-trip through the wire with `hook_env` set"
+    );
+}

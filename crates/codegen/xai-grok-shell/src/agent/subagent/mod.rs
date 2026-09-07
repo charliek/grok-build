@@ -248,6 +248,10 @@ pub(crate) struct SubagentSpawnContext {
     /// GCS upload method (direct or proxy).
     pub gcs_upload_method: Option<crate::session::repo_changes::UploadMethod>,
     pub hook_registry: Option<std::sync::Arc<xai_grok_hooks::discovery::HookRegistry>>,
+    /// gx: the parent session's roost identity, applied to the child before its first hook fires
+    /// (issue #14). Without it a subagent would report whichever tab started the leader — or, once
+    /// the leader scrubs its environment, no tab at all.
+    pub gx_hook_env: std::collections::BTreeMap<String, String>,
     pub permission_handle: Option<xai_grok_workspace::permission::PermissionHandle>,
     pub worktree_type: crate::util::config::WorktreeType,
     pub api_key_provider: Option<xai_grok_tools::types::SharedApiKeyProvider>,

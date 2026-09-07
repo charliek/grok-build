@@ -1387,6 +1387,11 @@ async fn run_agent_command(
             fs_write: false,
             status_line: false,
             observer: false, // gx: observer
+            // gx: `grok agent` is not a roost tab, so it carries no roost identity (issue #14).
+            // It is still a driver, not an observer, so the leader stamps an EMPTY `gx/hookEnv`
+            // for it: a session it takes over stops reporting to whichever tab used to own it,
+            // rather than keeping a claim no one is watching.
+            hook_env: Default::default(),
         };
         let conn = connect_or_spawn(&client_type, mode, &env_urls, capabilities.clone()).await?;
         let (tx, rx) = conn.into_channels();
@@ -1562,6 +1567,19 @@ async fn run_agent_command(
             xai_grok_shell::agent::run_agent_server(server_config, agent_config).await
         }
         Some(AgentCmd::Leader(a)) => {
+            // gx: the leader inherits the environment of whichever TUI spawned it, and hooks run
+            // inside this process — so without this every session's hooks reported the FIRST tab's
+            // `ROOST_TAB_ID` (issue #14). Snapshot the inherited `ROOST_*` NAMES here, read-only
+            // and before any session exists; the session actor then neutralizes each of them to an
+            // empty string in every hook spec's `extra_env` and overlays the session's own
+            // identity, so a session with no carried identity is invisible to roost instead of
+            // impersonating a tab. The process environment is never mutated — only the hook
+            // child's. Safe for a properly-launched tab: roost's hook command references
+            // `${ROOST_AGENT_HOOK:-}`, a parameter-expansion-modifier form that
+            // `xai_grok_hooks::env_expand` deliberately preserves verbatim at parse time and leaves
+            // for the `sh -c` to resolve from the CHILD environment at spawn — which is where the
+            // per-session identity is injected via `extra_env`.
+            xai_grok_shell::agent::gx_hook_env::snapshot_inherited_roost_names();
             let mut agent_config = agent_config.clone();
             apply_headless_args_to_config(&a.headless, &mut agent_config);
             let leader_auto_update = if !should_check_for_updates(

@@ -4916,6 +4916,23 @@ impl MvpAgent {
         if handle_display_cwd.is_some() {
             handle.display_cwd = handle_display_cwd;
         }
+        // gx: (issue #14) hand the session the roost identity the leader stamped for the client
+        // that asked for it. Serves `session/new` AND a cold `session/load`/`session/resume`,
+        // which are the only two callers of this function. Queued BEFORE the SessionStart dispatch
+        // below, because roost claims a tab on that event and the actor drains commands in order,
+        // so the very first SessionStart already names the right tab. Sent only when the key is
+        // PRESENT: absent means the requester is an observer (or predates the stamp) and the
+        // session's identity must be left alone, while present-but-empty means a client with no
+        // roost identity and explicitly clears.
+        if let Some(gx_hook_env) = crate::agent::gx_hook_env::from_meta_json(
+            session_meta.and_then(|m| m.get(crate::agent::gx_hook_env::META_KEY)),
+        ) {
+            // Recorded on the handle so a subagent can inherit its parent's identity.
+            handle.gx_hook_env = gx_hook_env.clone();
+            let _ = handle
+                .cmd_tx
+                .send(SessionCommand::SetHookEnv { env: gx_hook_env });
+        }
         let source = if chat_history.is_empty() { "new" } else { "load" };
         let _ = handle
             .cmd_tx

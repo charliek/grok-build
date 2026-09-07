@@ -664,6 +664,29 @@ fn backfill_child_routes(
 fn is_registered_non_observer(clients: &HashMap<ClientId, ClientState>, id: ClientId) -> bool {
     clients.get(&id).is_none_or(|c| !c.capabilities.observer)
 }
+/// gx: remove a client-supplied `_meta["gx/hookEnv"]` from a session request, returning whether it
+/// removed anything (issue #14).
+///
+/// `gx/hookEnv` is stamped by the leader from the client's REGISTRATION, never taken from the
+/// request body: `ROOST_AGENT_HOOK` names an executable every hook of that session then runs, so a
+/// client that could put it in the body could pick that executable for a session another client is
+/// driving. The strip runs ahead of `inject_session_request_context`'s capability early-return
+/// because a client chooses its own capabilities and client type, and could therefore reach that
+/// return deliberately with a forged key still in the body.
+fn gx_strip_hook_env_from_request(json: &mut serde_json::Value) -> bool {
+    let method = json.get("method").and_then(|m| m.as_str()).unwrap_or("");
+    if method != AGENT_METHOD_NAMES.session_new
+        && method != AGENT_METHOD_NAMES.session_load
+        && method != AGENT_METHOD_NAMES.session_resume
+    {
+        return false;
+    }
+    json.get_mut("params")
+        .and_then(|p| p.as_object_mut())
+        .and_then(|params| params.get_mut("_meta"))
+        .and_then(|meta| meta.as_object_mut())
+        .is_some_and(|meta| meta.remove(crate::agent::gx_hook_env::META_KEY).is_some())
+}
 /// Inject the requesting client's context into a `session/new`, `session/load`, or `session/resume` request, **in place**.
 /// The agent's own state names whichever client initialized last, which in leader mode is the wrong client.
 ///
@@ -683,6 +706,10 @@ fn inject_session_request_context(
         .default_model
         .as_ref()
         .is_some_and(|m| !m.is_empty());
+    // gx: strip first and unconditionally — a forged `gx/hookEnv` must not survive the early-return
+    // below, which a client can reach by registering with no capabilities and an empty client type.
+    // See `gx_strip_hook_env_from_request`.
+    let gx_stripped_hook_env = gx_strip_hook_env_from_request(json);
     if !capabilities.yolo_mode
         && !capabilities.auto_mode
         && !has_model
@@ -692,8 +719,14 @@ fn inject_session_request_context(
         && !capabilities.fs_read
         && !capabilities.fs_write
         && !capabilities.status_line
+        // gx: a client whose only capability is a roost identity still has meta to inject.
+        && capabilities.hook_env.is_empty()
     {
-        return false;
+        // gx: strip-only on this path, so a request upstream would forward untouched still is. A
+        // real client never lands here — every one of them registers a non-empty client type — and
+        // for the anonymous shape that can, leaving the key ABSENT is the conservative reading:
+        // it can neither set a session's identity nor clear one.
+        return gx_stripped_hook_env;
     }
     let method = json.get("method").and_then(|m| m.as_str()).unwrap_or("");
     let is_session_new = method == AGENT_METHOD_NAMES.session_new;
@@ -783,6 +816,23 @@ fn inject_session_request_context(
             meta_obj.insert(
                 xai_grok_status_line::CLIENT_STATUS_LINE_META.to_string(),
                 serde_json::json!(capabilities.status_line),
+            );
+            // gx: stamp the requesting client's own roost identity (issue #14). Unconditional, so
+            // the key's PRESENCE — not its contents — is what the agent keys off: present-and-empty
+            // says "this client has no roost identity", which CLEARS whatever the session was
+            // carrying, and is how a TUI outside a roost tab stops a session reporting to the tab
+            // that used to own it. Only reached for a non-observer: the observer branch above
+            // returns before this, so the remote lane can neither choose the `ROOST_AGENT_HOOK`
+            // executable a session's hooks run nor clear the owning tab's identity by attaching.
+            // The key the client may have sent was already removed above, so this is the
+            // registration's value or nothing.
+            meta_obj.insert(
+                crate::agent::gx_hook_env::META_KEY.to_string(),
+                serde_json::json!(capabilities.hook_env),
+            );
+            debug!(
+                entries = capabilities.hook_env.len(),
+                "gx: injected hook env into session request"
             );
         }
     }
@@ -1666,7 +1716,12 @@ pub async fn run_leader_server(
                 Err(e) => error!(error = %e, "Accept failed"),
             },
             LeaderServerPoll::Event(event) => match event {
-                ServerEvent::Registered(id, mode, capabilities, client_type) => {
+                ServerEvent::Registered(id, mode, mut capabilities, client_type) => {
+                    // gx: clamp the client's roost identity once, here, where the leader takes
+                    // ownership of it — so an oversized or forged map is never held, let alone
+                    // stamped into a session request (issue #14).
+                    capabilities.hook_env =
+                        crate::agent::gx_hook_env::validate(capabilities.hook_env);
                     if let Some(client) = clients.get_mut(&id) {
                         client.mode = mode;
                         client

@@ -1848,6 +1848,14 @@ pub(super) async fn run_session(
                                 s.reload_skills_from_disk().await;
                             });
                         }
+                        // gx: (issue #14) apply the attaching client's roost identity to this
+                        // session's hooks. A change from one live tab to a different one re-fires
+                        // SessionStart, because roost claims a tab only on that event.
+                        SessionCommand::SetHookEnv { env } => {
+                            if session.gx_apply_hook_env(env) {
+                                session.gx_dispatch_session_start_for_resume().await;
+                            }
+                        }
                         SessionCommand::DispatchSessionStartHook { source } => {
                             let envelope = session.fire_hook(
                                 xai_grok_hooks::event::HookEventName::SessionStart,

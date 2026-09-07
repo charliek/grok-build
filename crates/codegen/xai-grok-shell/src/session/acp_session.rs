@@ -204,6 +204,9 @@ pub(crate) use goal_support::*;
 #[path = "acp_session_impl/hook_dispatch.rs"]
 mod hook_dispatch;
 use hook_dispatch::*;
+// gx: per-session roost hook identity (issue #14); see the module docs.
+#[path = "acp_session_impl/gx_hook_env.rs"]
+mod gx_hook_env;
 #[path = "acp_session_impl/turn_report_slot.rs"]
 mod turn_report_slot;
 pub(crate) use turn_report_slot::TurnEpoch;
@@ -1030,6 +1033,9 @@ pub(crate) struct SessionActor {
     /// Safe: session actor is single-threaded (LocalSet), no concurrent access.
     pub(crate) hook_registry:
         std::cell::RefCell<Option<Arc<xai_grok_hooks::discovery::HookRegistry>>>,
+    /// gx: the roost identity this session's hooks export, plus the pristine registry it is
+    /// layered onto (issue #14). See [`gx_hook_env`].
+    pub(crate) gx_hook_env: gx_hook_env::GxHookEnvState,
     /// The turn's single end-of-turn hook report.
     /// Actor-scoped rather than turn-local because the gate runs on the turn task while a cancel runs on the command loop.
     pub(crate) turn_report: turn_report_slot::TurnReportSlot,
