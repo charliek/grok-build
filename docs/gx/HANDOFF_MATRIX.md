@@ -15,10 +15,9 @@ bottom.
 - **Date:** 2026-09-07.
 - **Host:** Linux popos 7.1.5-76070105-generic x86_64, Python 3.12.3 (harness is stdlib
   only, no pip deps).
-- **Models used:** `gpt-5.6-luna` (OpenAI ChatGPT-plan via gx's `openai-codex`
-  provider) for every cell — the configured default worked on the first attempt in
-  every run, so the `glm-5.3-flash` fallback path was never exercised for real (it was
-  code-reviewed but not empirically triggered).
+- **Models used:** `glm-5.3-flash` for the run of record. The matrix was re-run in full on
+  2026-09-07 after two review rounds strengthened the assertions (see the harness notes below);
+  every row's evidence below comes from that run, not from the original one.
 
 ## Environment
 
@@ -69,13 +68,13 @@ bottom.
 
 | # | Cell | Result | Exact invocation | Model | Notes |
 |---|------|--------|-------------------|-------|-------|
-| 1 | **list** | pass | TUI: `gx --leader --session-id <id> --model gpt-5.6-luna --cwd <a1-cwd>`, prompted "reply with the single word PONG". Client: connect+register+`initialize`, then `_x.ai/session/list {"cwd":"<a1-cwd>"}` and `_x.ai/sessions/list {}` | gpt-5.6-luna | Session id found in both responses; cwd matched in `session/list`. |
-| 2 | **load/replay** | pass | Client: `session/load {"sessionId":"<id>","cwd":"<a1-cwd>","mcpServers":[]}` | gpt-5.6-luna | 6 `session/update` replay notifications arrived after the response; prior turn's `PONG` answer was present verbatim in the replay stream. |
-| 3 | **prompt** | pass | Client: `session/load` (to subscribe) then `session/prompt {"sessionId":"<id>","prompt":[{"type":"text","text":"reply with the single word ROGER"}]}` | glm-5.3-flash (re-run) | Answer streamed to the client as `session/update`s **and** rendered on the TUI's own screen. **Re-run 2026-09-07** after review: the first run's retained transcript captured the screen *tail*, and the turn had already drawn past the answer, so the artifact did not back the claim even though the assertion had passed. The cell now records the screen region around the marker (`find_context`, which cell 4 already used); `docs/gx/handoff/prompt.md` shows the rendered `ROGER` under "the proof". |
-| 4 | **interject renders in the running TUI** | pass | TUI: typed "count slowly from 1 to 30, writing exactly one number per line and nothing else" + Enter. ~1s later, client: connect+register+`initialize`, then `_x.ai/interject {"sessionId":"<id>","text":"INTERJECT-7A3F"}` | gpt-5.6-luna | `INTERJECT-7A3F` appeared on the running TUI's screen with **no resume**. The client also received a `_x.ai/session/interjection` broadcast notification carrying the same text. |
-| 5 | **resume** | pass | TUI: typed `/exit` + Enter (clean exit confirmed via PTY child reaping). New process: `gx --leader --resume <id> --model gpt-5.6-luna` | gpt-5.6-luna | The remotely-driven `ROGER` turn from cell 3 (and the `INTERJECT-7A3F` text from cell 4) were both visible in the resumed TUI's replayed screen. |
-| 6 | **remote-create** | pass | Client only (no TUI attached): `session/new {"cwd":"<a1-cwd>","mcpServers":[]}` → new id, then `session/prompt {"sessionId":"<new-id>",...,"text":"reply with the single word TANGO"}`. Then a fresh TUI: `gx --leader --resume <new-id> --model gpt-5.6-luna` | gpt-5.6-luna | `TANGO` visible in the TUI opened purely via `--resume`, proving a session created and driven end-to-end with zero TUI involvement is fully resumable. |
-| 7 | **disconnect survival** | pass | Client A: `session/new`, then fire-and-forget `session/prompt` for "count slowly from 1 to 20, ...", `time.sleep(1.5)`, then closed its socket mid-turn. Client B (fresh connection): register+`initialize`+`session/load {"sessionId":"<id>","cwd":"<a1-cwd>"}` | glm-5.3-flash (re-run) | The turn was **not** aborted by the disconnect: client B observed the full `1..20` answer. **Re-run 2026-09-07** after review: the original check was `"20" in blob and re.search(r"\b1\s*[\s\S]*20\b", blob)`, which is nearly unconditional once a `20` appears anywhere — and it searched the raw JSON, matching ids and token counts the agent never emitted. It now joins the `agent_message_chunk` texts in order and requires every number 1..20 individually; the census is recorded in `docs/gx/handoff/disconnect.md`. |
+| 1 | **list** | pass | TUI: `gx --leader --session-id <id> --model glm-5.3-flash --cwd <a1-cwd>`, prompted "reply with the single word PONG". Client: connect+register+`initialize`, then `_x.ai/session/list {"cwd":"<a1-cwd>"}` and `_x.ai/sessions/list {}` | glm-5.3-flash | Session id found in both responses; cwd matched in `session/list`. |
+| 2 | **load/replay** | pass | Client: `session/load {"sessionId":"<id>","cwd":"<a1-cwd>","mcpServers":[]}` | glm-5.3-flash | 6 `session/update` replay notifications arrived after the response; prior turn's `PONG` answer was present verbatim in the replay stream. |
+| 3 | **prompt** | pass | Client: `session/load` (to subscribe) then `session/prompt {"sessionId":"<id>","prompt":[{"type":"text","text":"reply with the single word ROGER"}]}` | glm-5.3-flash | Answer streamed to the client as `session/update`s **and** rendered on the TUI's own screen. **Re-run 2026-09-07** after review: the first run's retained transcript captured the screen *tail*, and the turn had already drawn past the answer, so the artifact did not back the claim even though the assertion had passed. The cell now records the screen region around the marker (`find_context`, which cell 4 already used); `docs/gx/handoff/prompt.md` shows the rendered `ROGER` under "the proof". |
+| 4 | **interject renders in the running TUI** | pass | TUI: typed "count slowly from 1 to 30, writing exactly one number per line and nothing else" + Enter. ~1s later, client: connect+register+`initialize`, then `_x.ai/interject {"sessionId":"<id>","text":"INTERJECT-7A3F"}` | glm-5.3-flash | `INTERJECT-7A3F` appeared on the running TUI's screen with **no resume**. The client also received a `_x.ai/session/interjection` broadcast notification carrying the same text. |
+| 5 | **resume** | pass | TUI: typed `/exit` + Enter (clean exit confirmed via PTY child reaping). New process: `gx --leader --resume <id> --model glm-5.3-flash` | glm-5.3-flash | The remotely-driven `ROGER` turn from cell 3 (and the `INTERJECT-7A3F` text from cell 4) were both visible in the resumed TUI's replayed screen. |
+| 6 | **remote-create** | pass | Client only (no TUI attached): `session/new {"cwd":"<a1-cwd>","mcpServers":[]}` → new id, then `session/prompt {"sessionId":"<new-id>",...,"text":"reply with the single word TANGO"}`. Then a fresh TUI: `gx --leader --resume <new-id> --model glm-5.3-flash` | glm-5.3-flash | `TANGO` visible in the TUI opened purely via `--resume`, proving a session created and driven end-to-end with zero TUI involvement is fully resumable. |
+| 7 | **disconnect survival** | pass | Client A: `session/new`, then fire-and-forget `session/prompt` for "count slowly from 1 to 20, ...", `time.sleep(1.5)`, then closed its socket mid-turn. Client B (fresh connection): register+`initialize`+`session/load {"sessionId":"<id>","cwd":"<a1-cwd>"}` | glm-5.3-flash | The turn was **not** aborted by the disconnect: client B observed the full `1..20` answer. **Re-run 2026-09-07** after review: the original check was `"20" in blob and re.search(r"\b1\s*[\s\S]*20\b", blob)`, which is nearly unconditional once a `20` appears anywhere — and it searched the raw JSON, matching ids and token counts the agent never emitted. It now joins the `agent_message_chunk` texts in order and requires every number 1..20 individually; the census is recorded in `docs/gx/handoff/disconnect.md`. |
 
 Full per-cell request/response JSON (sanitized) and TUI screen captures are in
 `docs/gx/handoff/<cell>.md`:
@@ -95,6 +94,21 @@ Full per-cell request/response JSON (sanitized) and TUI screen captures are in
   fine, "not found" on the TUI screen) until this was fixed. Point of the callout: if
   a future re-run reports a TUI-screen assertion failing, check whether it's a real
   regression or another such rendering artifact before writing it up as a finding.
+- **A marker that appears in your own prompt proves nothing on its own.** A second review round
+  found that every cell asserting `MARKER in <the screen>` or `MARKER in <the notification blob>`
+  was satisfied by the TUI's echo of the prompt we typed — and the prompt is literally "reply with
+  the single word ROGER". A turn that produced nothing at all would have passed. The client-side
+  checks now read `agent_message_text()` (the joined `agent_message_chunk` texts, which never
+  contain the echo) and the screen checks go through `wait_until_answered(marker, prompt)`, which
+  skips any line carrying the prompt. Cell 7's "still streaming" had the same shape from the other
+  direction: after a reconnect the leader replays the transcript, so *any* notification arriving
+  post-reconnect satisfied it; it now ignores anything stamped `_meta.isReplay`.
+- **The resumed TUI's viewport is not its history.** With the echo no longer counted, cell 5 failed
+  on a full run: by the time it resumes, the session has had a prompt, a thirty-line count and an
+  interjection, so `ROGER` had scrolled above a 40-row terminal. The session was intact and the
+  earlier turns were rendered — they were just above the fold. The cell now accepts the marker
+  anywhere the resumed process rendered, not only on the visible grid, and records which of the two
+  carried the proof.
 - **Capture the region around your marker, not the screen tail.** Cells 3 and 7 were re-run on
   2026-09-07 after a PR review pointed out that their retained artifacts did not actually back their
   own `pass`. Neither assertion was wrong — the evidence was. Cell 3 waited until the grid contained

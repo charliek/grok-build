@@ -74,7 +74,23 @@ class Env:
 
     @property
     def lock_path(self) -> str:
-        return re.sub(r"\.sock$", ".lock", self.leader_socket)
+        """The leader's flock file for `leader_socket`.
+
+        The leader derives it as `socket.with_extension("lock")`
+        (`lock_path_for_socket` in crates/.../leader/lock.rs), which *replaces* whatever
+        extension the socket path has rather than requiring a `.sock` one. `Path.with_suffix`
+        is Python's exact counterpart, including the no-extension case (`/tmp/leader` ->
+        `/tmp/leader.lock`) and the dotted-directory case (only the file name is touched).
+
+        A plain `.replace(".sock", ".lock")` returns the socket path *unchanged* for any
+        socket that does not end in `.sock` -- which would make `leader_pid()` read the
+        socket as a pid file and `cleanup_stale_leader()`/`teardown()` unlink the live socket
+        as if it were the lock. Deriving the real sibling keeps all three honest."""
+        socket_path = Path(self.leader_socket)
+        if not socket_path.name:
+            # `with_suffix` raises on a nameless path ("/", "."); nothing sane to derive.
+            return self.leader_socket + ".lock"
+        return str(socket_path.with_suffix(".lock"))
 
 
 def load_env(args: argparse.Namespace) -> Env:
@@ -166,6 +182,34 @@ def agent_message_text(updates: list) -> str:
         if isinstance(text, str):
             out.append(text)
     return "".join(out)
+
+
+def is_replay_update(note) -> bool:
+    """True when the leader stamped this notification as historical replay.
+
+    `session/load` replays the whole transcript to the reconnecting client, stamping each
+    replayed notification with `_meta.isReplay: true` (`forward_raw_replay_line` in
+    crates/.../agent/mvp_agent/replay.rs, `mark_as_replay` in its mod.rs). Those say nothing
+    about whether the turn is still alive -- they are the *past* being re-sent -- so any
+    assertion about post-reconnect activity has to exclude them.
+
+    The stamp normally sits on `params._meta`, but the leader also forwards some
+    notifications wrapped (`_x.ai/session/update` carries the original params under
+    `params.params`, see server_tests.rs), and an envelope-level `_meta` is legal JSON-RPC.
+    All three are checked; anything unparseable is treated as *not* replay, so an
+    unrecognized shape can never silently erase live traffic."""
+    payload = getattr(note, "payload", None)
+    if not isinstance(payload, dict):
+        return False
+    params = payload.get("params")
+    inner = params.get("params") if isinstance(params, dict) else None
+    for scope in (payload, params, inner):
+        if not isinstance(scope, dict):
+            continue
+        meta = scope.get("_meta")
+        if isinstance(meta, dict) and meta.get("isReplay"):
+            return True
+    return False
 
 
 def numbers_present(text: str, first: int, last: int) -> tuple:
@@ -378,6 +422,12 @@ MARKER_TANGO = "TANGO"
 # A screen-scrape marker, not a credential: the harness greps the TUI for this exact
 # string to prove an interjection rendered. Named MARKER, never TOKEN — gitleaks'
 # generic-api-key rule fires on a *_TOKEN name holding a high-entropy string.
+# The prompt we type for each marker. `wait_until_answered` needs it so it can ignore the TUI's
+# echo of our own prompt -- which contains the marker -- and only accept the agent's answer.
+PROMPT_PONG = "reply with the single word " + MARKER_PONG
+PROMPT_ROGER = "reply with the single word " + MARKER_ROGER
+PROMPT_TANGO = "reply with the single word " + MARKER_TANGO
+
 INTERJECT_MARKER = "INTERJECT-7A3F"
 
 
@@ -410,8 +460,8 @@ def cell_bootstrap(env: Env) -> dict:
     tui = start_tui_with_session(env, session_id, model)
     tui.pump(2.0)
     booted = tui.wait_until_contains("❯", timeout=25.0) or tui.wait_until_matches(re.compile(r"Grok|gpt|glm", re.I), timeout=5.0)
-    tui.send_line("reply with the single word " + MARKER_PONG)
-    got = tui.wait_until_contains(MARKER_PONG, timeout=60.0)
+    tui.send_line(PROMPT_PONG)
+    got = tui.wait_until_answered(MARKER_PONG, PROMPT_PONG, timeout=60.0)
     if not got and model != env.fallback_model:
         # Retry with the fallback model on a fresh session id.
         tui.terminate()
@@ -420,8 +470,8 @@ def cell_bootstrap(env: Env) -> dict:
         model = env.fallback_model
         tui = start_tui_with_session(env, session_id, model)
         tui.pump(2.0)
-        tui.send_line("reply with the single word " + MARKER_PONG)
-        got = tui.wait_until_contains(MARKER_PONG, timeout=60.0)
+        tui.send_line(PROMPT_PONG)
+        got = tui.wait_until_answered(MARKER_PONG, PROMPT_PONG, timeout=60.0)
     return {"session_id": session_id, "tui": tui, "model_used": model, "bootstrap_ok": got, "booted": booted}
 
 
@@ -487,13 +537,24 @@ def cell_load(env: Env, session_id: str, model: str) -> CellResult:
         for n in replay_updates[:20]:
             lines.append(dump_json_compact(n.payload))
         lines += ["```", ""]
-        blob = json.dumps([acp.sanitize(n.payload) for n in replay_updates])
-        if replay_updates and MARKER_PONG in blob:
+        # Assert on the replayed *agent* answer, never on a JSON dump of the whole
+        # notification list: that dump also contains the replayed `user_message_chunk` echo of
+        # the prompt, whose text is "reply with the single word PONG" -- so a blob search for
+        # PONG is satisfied by our own prompt coming back, even if the agent never answered.
+        replayed_answer = agent_message_text(replay_updates)
+        lines += [
+            "## replayed agent answer (agent_message_chunk texts, joined) -- the string actually searched",
+            "```text",
+            replayed_answer or "(no agent_message_chunk text was replayed)",
+            "```",
+            "",
+        ]
+        if replay_updates and MARKER_PONG in replayed_answer:
             cr.result = "pass"
-            cr.notes = f"{len(replay_updates)} session/update replay notifications received, prior turn ({MARKER_PONG}) visible"
+            cr.notes = f"{len(replay_updates)} session/update replay notifications received, prior turn ({MARKER_PONG}) visible in the replayed agent answer"
         elif replay_updates:
             cr.result = "partial"
-            cr.notes = f"{len(replay_updates)} session/update notifications received but prior answer not found verbatim"
+            cr.notes = f"{len(replay_updates)} session/update notifications received but the replayed agent answer does not contain {MARKER_PONG}"
         else:
             cr.result = "fail"
             cr.notes = "no session/update replay notifications received after session/load"
@@ -524,14 +585,25 @@ def cell_prompt(env: Env, session_id: str, tui: tui_pty.TuiSession, model: str) 
         lines += ["## session/prompt response", "```json", dump_json(resp), "```", ""]
         notes = client.notifications_snapshot()
         updates = [n for n in notes if n.method == "session/update"]
-        blob = json.dumps([acp.sanitize(n.payload) for n in updates])
-        streamed_to_client = MARKER_ROGER in blob
+        # Read the agent's answer, not a JSON dump of every notification. The updates include
+        # the `user_message_chunk` echo of the prompt we just sent, and that prompt is literally
+        # "reply with the single word ROGER" -- so searching the dump finds the marker whether or
+        # not the agent ever replied, and this cell would "pass" on a turn that produced nothing.
+        answer = agent_message_text(updates)
+        streamed_to_client = MARKER_ROGER in answer
         lines += [f"## session/update notifications during turn: {len(updates)}", "```json"]
         for n in updates[-20:]:
             lines.append(dump_json_compact(n.payload))
         lines += ["```", ""]
+        lines += [
+            "## agent answer as streamed to the external client (agent_message_chunk texts, joined) -- the string actually searched",
+            "```text",
+            answer or "(no agent_message_chunk text received)",
+            "```",
+            "",
+        ]
 
-        on_tui_screen = tui.wait_until_contains(MARKER_ROGER, timeout=15.0)
+        on_tui_screen = tui.wait_until_answered(MARKER_ROGER, PROMPT_ROGER, timeout=15.0)
         # Capture the region AROUND the marker, not the tail. The turn keeps drawing after the
         # answer lands (spinner, token counters, the "Starting session" line for the next turn),
         # so `screen_text(tail_N)` routinely scrolls the very thing this cell asserts out of the
@@ -662,21 +734,50 @@ def cell_resume(env: Env, session_id: str, tui: tui_pty.TuiSession, model: str) 
         tui2 = resume_tui(env, session_id, model=model)
         cr.invocations.append(f"new TUI process: gx --leader --resume {session_id} --model {model}")
         tui2.pump(3.0)
-        found_roger = tui2.wait_until_contains(MARKER_ROGER, timeout=25.0)
+        # A resumed TUI replays the whole transcript into a 40-row terminal, so an *earlier* turn
+        # legitimately scrolls above the fold: by this cell the session has had a prompt, a long
+        # count and an interjection since ROGER. Asserting on the visible grid alone therefore
+        # tests the viewport, not the resume. Look at everything the resumed process rendered --
+        # still ignoring the echo of the prompt, which is the whole point of `wait_until_answered`
+        # -- and record both answers so a reader can see which one carried the proof.
+        found_roger_onscreen = tui2.wait_until_answered(MARKER_ROGER, PROMPT_ROGER, timeout=25.0)
+        rendered = tui2.raw_screen_text()
+        found_roger_rendered = any(
+            MARKER_ROGER in line and PROMPT_ROGER not in line for line in rendered.splitlines()
+        )
+        found_roger = found_roger_onscreen or found_roger_rendered
         found_interject = INTERJECT_MARKER in tui2.screen_text()
+        context = tui2.find_context(MARKER_ROGER)
         lines += [
             f"TUI cleanly exited before resume: {exited}",
-            "## resumed TUI screen tail",
+            f"`{MARKER_ROGER}` on the visible grid: {found_roger_onscreen}; "
+            f"anywhere the resumed TUI rendered: {found_roger_rendered}",
+            "",
+        ]
+        if context:
+            lines += [
+                f"## region around the replayed {MARKER_ROGER} (the proof)",
+                "```text",
+                context,
+                "```",
+                "",
+            ]
+        lines += [
+            "## resumed TUI screen tail (context only; an earlier turn may be above the fold)",
             "```text",
             tui2.screen_text(3000),
             "```",
         ]
         if found_roger:
+            where = "on the visible grid" if found_roger_onscreen else "in the replayed scrollback (above the fold)"
             cr.result = "pass"
-            cr.notes = f"remote turn from cell 3 ({MARKER_ROGER}) visible after --resume; clean exit={exited}; interject token also present={found_interject}"
+            cr.notes = (
+                f"remote turn from cell 3 ({MARKER_ROGER}) present after --resume {where}; "
+                f"clean exit={exited}; interject token also present={found_interject}"
+            )
         else:
             cr.result = "fail"
-            cr.notes = f"{MARKER_ROGER} not visible on the resumed TUI screen; clean exit={exited}"
+            cr.notes = f"{MARKER_ROGER} neither on the resumed TUI screen nor anywhere it rendered; clean exit={exited}"
     except Exception as e:  # noqa: BLE001
         cr.result = "fail"
         cr.notes = f"exception: {e!r}"
@@ -709,7 +810,7 @@ def cell_remote_create(env: Env, model: str) -> CellResult:
         tui = resume_tui(env, session_id, model=model)
         cr.invocations.append(f"new TUI process: gx --leader --resume {session_id} --model {model}")
         tui.pump(3.0)
-        found = tui.wait_until_contains(MARKER_TANGO, timeout=25.0)
+        found = tui.wait_until_answered(MARKER_TANGO, PROMPT_TANGO, timeout=25.0)
         lines += ["## TUI screen tail after --resume", "```text", tui.screen_text(3000), "```"]
         tui.terminate()
         if tui in SPAWNED_TUIS:
@@ -769,6 +870,21 @@ def cell_disconnect(env: Env, model: str) -> CellResult:
             lines.append(dump_json_compact(n.payload))
         lines += ["```", ""]
 
+        # "Still streaming" must be about *live* traffic. `session/load` replays the whole
+        # transcript to client B, and those replayed notifications land in `post_notes` too --
+        # counting them would report "still streaming" for a turn that died with client A, which
+        # is the exact thing this cell exists to rule out. Drop everything stamped
+        # `_meta.isReplay` before deciding.
+        replayed_post = [n for n in post_notes if is_replay_update(n)]
+        live_post = [n for n in post_notes if not is_replay_update(n)]
+        live_updates = [n for n in live_post if n.method == "session/update"]
+        lines += [
+            f"## post-reconnect notifications in the 15s listen window: {len(post_notes)} total, "
+            f"{len(replayed_post)} replay-stamped (`_meta.isReplay`), {len(live_post)} live "
+            f"({len(live_updates)} of them session/update)",
+            "",
+        ]
+
         answer = agent_message_text(updates)
         seen, missing = numbers_present(answer, 1, 20)
         census = (
@@ -779,13 +895,17 @@ def cell_disconnect(env: Env, model: str) -> CellResult:
         lines += [f"## 1..20 census on the reconnected client: {census}", ""]
 
         completed = not missing
-        still_streaming = len(post_notes) > 0
+        still_streaming = len(live_updates) > 0
         if completed:
             cr.result = "pass"
             cr.notes = "turn completed (full 1..20 answer visible) to the reconnected client"
         elif still_streaming:
             cr.result = "pass"
-            cr.notes = f"turn was still streaming to the reconnected client B ({len(post_notes)} new session/update notifications after reconnect); {census}"
+            cr.notes = (
+                f"turn was still streaming to the reconnected client B ({len(live_updates)} live "
+                f"non-replay session/update notifications after reconnect, out of {len(post_notes)} "
+                f"notifications in the window); {census}"
+            )
         elif updates:
             cr.result = "partial"
             cr.notes = f"replay contained prior updates but no further streaming/new content observed after reconnect; {census}"

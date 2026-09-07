@@ -6,9 +6,9 @@
   "jsonrpc": "2.0",
   "id": 2,
   "result": {
-    "sessionId": "01a07a18-3fb3-7bb2-8eab-23c62547bd90",
+    "sessionId": "01a07bca-bb49-7b23-95e1-4638cc62ebad",
     "models": {
-      "currentModelId": "gpt-5.6-luna",
+      "currentModelId": "grok-4.6",
       "availableModels": [
         {
           "modelId": "grok-4.6",
@@ -18,7 +18,7 @@
             "totalContextTokens": 500000,
             "agentType": "grok-build-plan",
             "supportsReasoningEffort": true,
-            "reasoningEffort": "high",
+            "reasoningEffort": "medium",
             "reasoningEfforts": [
               {
                 "id": "xhigh",
@@ -46,11 +46,11 @@
                 "value": "low",
                 "label": "Low Effort",
                 "description": "Quick, fast implementations",
-
-... [truncated, 36141 chars total]
+         
+... [truncated, 36576 chars total]
 ```
 
-Remote-created session id: `01a07a18-3fb3-7bb2-8eab-23c62547bd90`
+Remote-created session id: `01a07bca-bb49-7b23-95e1-4638cc62ebad`
 
 ## session/prompt response
 ```json
@@ -60,34 +60,36 @@ Remote-created session id: `01a07a18-3fb3-7bb2-8eab-23c62547bd90`
   "result": {
     "stopReason": "end_turn",
     "_meta": {
-      "sessionId": "01a07a18-3fb3-7bb2-8eab-23c62547bd90",
-      "requestId": "7dfb3372-019a-4deb-bb7f-4bb72b204a47",
-      "promptId": "7dfb3372-019a-4deb-bb7f-4bb72b204a47",
-      "totalTokens": 13187,
-      "modelId": "gpt-5.6-luna",
-      "inputTokens": 13181,
-      "outputTokens": 6,
-      "cachedReadTokens": 12800,
-      "reasoningTokens": 0,
+      "sessionId": "01a07bca-bb49-7b23-95e1-4638cc62ebad",
+      "requestId": "54a344c8-f261-49db-8f35-d055169f4c8d",
+      "promptId": "54a344c8-f261-49db-8f35-d055169f4c8d",
+      "totalTokens": 17330,
+      "modelId": "grok-4.6",
+      "inputTokens": 17302,
+      "outputTokens": 28,
+      "cachedReadTokens": 0,
+      "reasoningTokens": 22,
       "usage": {
-        "inputTokens": 13181,
-        "outputTokens": 6,
-        "totalTokens": 13187,
-        "cachedReadTokens": 12800,
+        "inputTokens": 17302,
+        "outputTokens": 28,
+        "totalTokens": 17330,
+        "cachedReadTokens": 0,
         "cacheCreationTokens": 0,
-        "reasoningTokens": 0,
+        "reasoningTokens": 22,
         "modelCalls": 1,
-        "apiDurationMs": 1974,
+        "apiDurationMs": 3176,
+        "costUsdTicks": 59112400,
         "modelUsage": {
-          "gpt-5.6-luna": {
-            "inputTokens": 13181,
-            "outputTokens": 6,
-            "totalTokens": 13187,
-            "cachedReadTokens": 12800,
+          "grok-4.6-build": {
+            "inputTokens": 17302,
+            "outputTokens": 28,
+            "totalTokens": 17330,
+            "cachedReadTokens": 0,
             "cacheCreationTokens": 0,
-            "reasoningTokens": 0,
+            "reasoningTokens": 22,
             "modelCalls": 1,
-            "apiDurationMs": 1974
+            "apiDurationMs": 3176,
+            "costUsdTicks": 59112400
           }
         },
         "numTurns": 1
@@ -100,19 +102,19 @@ Remote-created session id: `01a07a18-3fb3-7bb2-8eab-23c62547bd90`
 ## TUI screen tail after --resume
 ```text
 
-  <scratch>/a1-… 1.6K / 272K
+  <scratch> 1.6K / 500K
 
 
-     ❯ reply with the single word TANGO                                                                     11:20 PM
+     ❯ reply with the single word TANGO                                                                      7:14 AM
 
 
-     TANGO                                                                                                  11:20 PM
+     ◆ Thought for 1.7s
 
-     Worked for 2.0s
+     TANGO                                                                                                   7:14 AM
 
+     Worked for 3.2s
 
-
-
+     Switched to GLM 5.3 Flash (Z.AI) (high effort)
 
 
 
@@ -135,7 +137,7 @@ Remote-created session id: `01a07a18-3fb3-7bb2-8eab-23c62547bd90`
 
   ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
   │ ❯                                                                                                                │
-  ╰─────────────────────────────────────────────────────────────── GPT-5.6 Luna (ChatGPT) (medium) · always-approve ─╯
+  ╰─────────────────────────────────────────────────────────────────── GLM 5.3 Flash (Z.AI) (high) · always-approve ─╯
 
   Shift+Tab:mode  │  Ctrl+.:shortcuts
 

@@ -104,6 +104,20 @@ processes (matched by scratch `GROK_HOME` path, leader socket path, or leader pi
 stderr and via a non-zero exit code — that list should always be empty; if it isn't,
 something in the harness itself needs fixing (not a matrix finding).
 
+### Unit tests for the harness itself
+
+```bash
+python3 scripts/gx/handoff/test_handoff.py
+```
+
+Offline (`unittest`, stdlib, no gx binary and no leader) and fast. It pins the parts of the
+harness that decide whether a cell passes: that a cell reads the agent's answer
+(`agent_message_text`) rather than a JSON dump that also contains the echo of the prompt it
+sent, that `session/load`'s replayed notifications (`_meta.isReplay`) never count as live
+post-reconnect traffic, that the lock path derived from a socket path is the leader's and not
+the socket itself, and that `tui_pty.TerminalGrid` never renders a torn escape sequence into
+the screen it is asserted against.
+
 ### Manual / debugging use of `acp_client.py`
 
 ```bash
@@ -115,5 +129,11 @@ python3 acp_client.py --socket /tmp/gx-handoff-XXXX.sock raw --method x.ai/sessi
 ```
 
 Each subcommand connects, registers, calls `initialize`, runs the one RPC, and
-exits — handy for poking at a leader you started by hand (`GROK_HOME=... GX_LEADER_SOCKET=...
+exits — handy for poking at a leader you started by hand (`GROK_HOME=... GROK_LEADER_SOCKET=...
 gx --leader --cwd ...`) without running the whole matrix.
+
+`GROK_LEADER_SOCKET` is what gx itself reads (`LEADER_SOCKET_ENV` in
+`crates/codegen/xai-grok-shell/src/leader/lock.rs`); `GX_LEADER_SOCKET` is only
+`run_matrix.py`'s own input name for the same path. Exporting the harness's name to a
+hand-started leader would leave it bound to the default `$GROK_HOME/gx-leader.sock`,
+not the socket the `--socket` arguments above point at.

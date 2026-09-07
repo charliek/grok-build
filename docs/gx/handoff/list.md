@@ -1,6 +1,6 @@
 # Cell 1: list
 
-Session id under test: `c63f9ebb-c4d1-4c48-9bc3-150d066f19ca`
+Session id under test: `b23aec6d-4cee-4aa4-9b20-357151821e1d`
 
 ## initialize response (capped)
 ```json
@@ -69,7 +69,7 @@ Session id under test: `c63f9ebb-c4d1-4c48-9bc3-150d066f19ca`
         "id": "grok.com",
         "name": "Grok",
         "description": "Sign in with Grok
-... [truncated, 33172 chars total]
+... [truncated, 33174 chars total]
 ```
 
 ## x.ai/session/list response
@@ -81,38 +81,47 @@ Session id under test: `c63f9ebb-c4d1-4c48-9bc3-150d066f19ca`
     "result": {
       "sessions": [
         {
-          "sessionId": "c63f9ebb-c4d1-4c48-9bc3-150d066f19ca",
+          "sessionId": "b23aec6d-4cee-4aa4-9b20-357151821e1d",
           "summary": "",
-          "updatedAt": "2026-09-07T04:19:33.443052086+00:00",
-          "createdAt": "2026-09-07T04:19:33.158649864+00:00",
-          "cwd": "<scratch>/a1-cwd",
+          "updatedAt": "2026-09-07T12:13:57.621228109+00:00",
+          "createdAt": "2026-09-07T12:13:55.599768516+00:00",
+          "cwd": "<scratch>/cwd",
           "source": "local",
-          "modelId": "gpt-5.6-luna",
-          "numMessages": 1,
-          "lastActiveAt": "2026-09-07T04:19:33.443052086+00:00",
+          "modelId": "glm-5.3-flash",
+          "numMessages": 3,
+          "lastActiveAt": "2026-09-07T12:13:57.621228109+00:00",
           "title": "",
           "_meta": {
             "x.ai/session": {
               "kind": "build",
               "facets": {
-                "cwd": "<scratch>/a1-cwd",
+                "cwd": "<scratch>/cwd",
                 "kind": "build"
               }
             }
           }
-        },
-        {
-          "sessionId": "01a07a16-89b9-7d81-9309-9403bd8369c3",
-          "summary": "Count slowly from 1 to 20 per line",
-          "updatedAt": "2026-09-07T04:18:19.902543050+00:00",
-          "createdAt": "2026-09-07T04:18:12.545981492+00:00",
-          "cwd": "<scratch>/a1-cwd",
-          "source": "local",
-          "modelId": "gpt-5.6-luna",
-          "numMessages": 4,
-          "lastActiveAt": "2026-09-07T04:18:16.450527512+00:00",
-          "lastTur
-... [truncated, 14119 chars total]
+        }
+      ],
+      "_meta": {
+        "x.ai/facets": {
+          "scope": "window",
+          "keys": [
+            {
+              "key": "cwd",
+              "values": [
+                {
+                  "value": "<scratch>/cwd",
+                  "count": 1
+                }
+              ]
+            },
+            {
+              "key": "kind",
+              "values": [
+                {
+                  "value": "build",
+                  "count
+... [truncated, 1664 chars total]
 ```
 
 ## x.ai/sessions/list response
@@ -124,39 +133,22 @@ Session id under test: `c63f9ebb-c4d1-4c48-9bc3-150d066f19ca`
     "result": {
       "sessions": [
         {
-          "sessionId": "c63f9ebb-c4d1-4c48-9bc3-150d066f19ca",
+          "sessionId": "b23aec6d-4cee-4aa4-9b20-357151821e1d",
           "title": null,
-          "cwd": "<scratch>/a1-cwd",
+          "cwd": "<scratch>/cwd",
           "isWorktree": false,
-          "modelId": "gpt-5.6-luna",
+          "modelId": "glm-5.3-flash",
           "reasoningEffort": "medium",
           "yolo": true,
-          "activity": "working",
+          "activity": "idle",
           "resident": true,
-          "lastChangeUnixMs": 1788754773785,
+          "lastChangeUnixMs": 1788783237621,
           "origin": {
             "kind": "local"
           }
-        },
-        {
-          "sessionId": "01a07a16-89b9-7d81-9309-9403bd8369c3",
-          "title": "Count slowly from 1 to 20 per line",
-          "cwd": "<scratch>/a1-cwd",
-          "isWorktree": false,
-          "modelId": "gpt-5.6-luna",
-          "reasoningEffort": "medium",
-          "yolo": false,
-          "activity": "dormant",
-          "lastTurnSummary": "Counted from 1 through 20, one number per line",
-          "resident": false,
-          "lastChangeUnixMs": 1788754696450,
-          "origin": {
-            "kind": "local"
-          }
-        },
-        {
-          "sessionId": "01a07a16-6b2e-7e22-b522-b039a9190eb0",
-          "title": "Request reply with single word TANGO",
-          "cwd": "<scratch>
-... [truncated, 8571 chars total]
+        }
+      ]
+    }
+  }
+}
 ```

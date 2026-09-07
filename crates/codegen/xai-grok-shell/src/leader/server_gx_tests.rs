@@ -175,7 +175,10 @@ async fn register_with(
 async fn next_acp_payload(reader: &mut tokio::io::ReadHalf<LeaderStream>) -> Option<String> {
     let deadline = tokio::time::Instant::now() + Duration::from_millis(800);
     loop {
-        let remaining = deadline - tokio::time::Instant::now();
+        // Saturate explicitly rather than leaning on `Sub`'s saturation: an expired deadline is
+        // the normal exit from this loop (that is what the `is_zero()` guard below is for), so
+        // the subtraction must never be the thing that decides what happens on it.
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             return None;
         }

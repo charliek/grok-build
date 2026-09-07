@@ -41,6 +41,58 @@ ANSI_RE = re.compile(
 )
 
 
+# Upper bound on how much of a still-unterminated escape sequence `TerminalGrid.feed()` will
+# hold back waiting for the rest. Every sequence a TUI actually emits is far shorter than this;
+# a stash that keeps growing means the stream is not really inside a sequence (a stray ESC
+# ahead of text, say), and holding it forever would swallow the screen output behind it.
+MAX_PENDING_ESCAPE = 512
+
+
+def _is_incomplete_escape(data: bytes, i: int) -> bool:
+    """Could `data[i:]` -- which starts with ESC -- still be the *prefix* of an escape
+    sequence that the next read will complete?
+
+    This is what decides whether `feed()` stashes the tail or gives up and skips the ESC, and
+    it has to be answered from the bytes themselves. The previous "fewer than 16 bytes left"
+    heuristic got both directions wrong: a sequence longer than the threshold (a long OSC
+    title, a truecolor SGR run) was rendered into the grid as literal parameter text, and a
+    short sequence could also land past it depending on where the read boundary fell.
+
+    True only while the sequence is genuinely unterminated. An already-terminated sequence
+    returns False even when the regexes above do not model it (`ESC [ > 4 ; 2 m`, private
+    parameter bytes) -- so it is skipped now rather than stashed forever."""
+    tail = data[i:]
+    if len(tail) > MAX_PENDING_ESCAPE:
+        return False
+    if len(tail) == 1:
+        return True  # a lone trailing ESC: any sequence could still follow
+    intro = tail[1]
+    if intro == 0x5B:  # '[' -- CSI: parameter bytes, then intermediates, then one final byte
+        seen_intermediate = False
+        for b in tail[2:]:
+            if 0x40 <= b <= 0x7E:  # final byte: the sequence is complete
+                return False
+            if 0x20 <= b <= 0x2F:  # intermediate
+                seen_intermediate = True
+                continue
+            if 0x30 <= b <= 0x3F and not seen_intermediate:  # parameter
+                continue
+            return False  # not a well-formed CSI at all
+        return True
+    if intro == 0x5D:  # ']' -- OSC: a string running until BEL or ST (ESC \), as OSC_RE has it
+        body = tail[2:]
+        if 0x07 in body:
+            return False
+        esc = body.find(0x1B)
+        if esc == -1:
+            return True  # still collecting the string
+        return esc == len(body) - 1  # a trailing ESC may yet turn out to be the ST's `ESC \`
+    if intro in b"()#":  # charset designation (ESC I F): one byte still to come
+        return len(tail) == 2
+    # ESC 7/8/=/>/O/M are complete at two bytes; anything else is not a sequence we model.
+    return False
+
+
 def strip_ansi(raw: bytes) -> str:
     """Legacy helper kept for anything that wants a flat, order-preserving strip
     (e.g. dumping raw-ish output for a human to read). Prefer `TerminalGrid` for
@@ -86,9 +138,16 @@ class TerminalGrid:
                 if m:
                     i = m.end()
                     continue
-                # Incomplete escape sequence at the end of this chunk: stash it
-                # for the next feed() so we don't render a torn escape as text.
-                if n - i < 16:
+                # Nothing matched. Either the chunk ends mid-sequence (stash it for the next
+                # feed(), so a torn escape is never rendered as text), or this really is not a
+                # sequence we model (fall through and skip the ESC, as before).
+                #
+                # The test is what the bytes *are*, not how many are left: a fixed byte-count
+                # threshold rendered any longer sequence (a long OSC title, an SGR truecolor
+                # run) into the grid as literal parameter text whenever the read boundary fell
+                # inside it, and a short sequence split unluckily across two reads could exceed
+                # it too.
+                if _is_incomplete_escape(data, i):
                     self._pending = data[i:]
                     break
                 i += 1
@@ -290,6 +349,35 @@ class TuiSession:
                 return True
             self.pump(poll)
         return needle in self.screen_text()
+
+    def wait_until_answered(
+        self, needle: str, prompt_text: str, timeout: float = 20.0, poll: float = 0.3
+    ) -> bool:
+        """Wait for `needle` to appear on a screen line that is NOT the echo of our own prompt.
+
+        The TUI renders what you typed (`❯ reply with the single word ROGER`) as well as what the
+        agent answered (a bare `ROGER` line). A plain `wait_until_contains(needle)` is therefore
+        satisfied the instant the prompt is echoed, before the model has produced anything -- the
+        same flaw a reviewer found in the client-side check, which searched a blob containing the
+        same echo. Ignore any line that carries the prompt text, and require the needle somewhere
+        else.
+        """
+        deadline = time.time() + timeout
+        while True:
+            if self._answered(needle, prompt_text):
+                return True
+            if time.time() >= deadline:
+                return self._answered(needle, prompt_text)
+            self.pump(poll)
+
+    def _answered(self, needle: str, prompt_text: str) -> bool:
+        probe = prompt_text.strip()
+        for line in self.screen_text().splitlines():
+            if probe and probe in line:
+                continue  # the echo of what we typed
+            if needle in line:
+                return True
+        return False
 
     def wait_until_matches(self, pattern: "re.Pattern", timeout: float = 20.0, poll: float = 0.3) -> bool:
         deadline = time.time() + timeout

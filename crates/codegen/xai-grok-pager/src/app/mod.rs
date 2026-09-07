@@ -1891,12 +1891,24 @@ mod tests {
         assert!(!use_leader);
         assert_eq!(reason, Some("config"));
     }
+    // gx: asserts the *upstream* fall-through, so it names `default_on = false` explicitly.
+    // Going through `resolve_use_leader`/`resolve_leader_mode` would read the compiled-in
+    // `is_gx_build()`, and this expectation only holds for a stock-flavoured build -- a test
+    // binary stamped with a gx `GROK_VERSION` would flip it.
+    // `resolve_leader_mode_agrees_with_the_build_flavour_default` covers that wiring instead.
     #[test]
     fn default_is_false() {
-        let (use_leader, reason) =
-            resolve_use_leader(false, false, &empty_config(), None, true, None);
-        assert!(!use_leader);
-        assert_eq!(reason, None);
+        let resolved = resolve_leader_mode_with_default(
+            false,
+            false,
+            &empty_config(),
+            None,
+            true,
+            None,
+            false,
+        );
+        assert!(!resolved.use_leader);
+        assert_eq!(resolved.policy_disable_reason, None);
     }
     #[test]
     fn cli_flag_overrides_config() {
@@ -2003,18 +2015,70 @@ mod tests {
             assert_eq!(resolved.use_leader, expect_leader, "{label}");
             assert_eq!(resolved.disabled_by_confinement, None, "{label}");
         }
+        // gx: these rows are the "leader mode was already off, so the sandbox took nothing
+        // away" half of the matrix, and the "default" row only belongs here when the build
+        // default is off. Spelling `default_on = false` out keeps the row asserting the
+        // upstream policy it is about, instead of silently depending on the flavour the test
+        // binary happened to be compiled as (a gx-stamped build would turn the default on, and
+        // then the sandbox *would* have something to take away).
         for (label, leader_flag, no_leader_flag, cfg, eligible) in [
             ("config off", false, false, &off, true),
             ("--no-leader over config on", false, true, &on, true),
             ("default", false, false, &empty_config(), true),
             ("ineligible mode with config on", false, false, &on, false),
         ] {
-            let resolved =
-                resolve_leader_mode(leader_flag, no_leader_flag, cfg, None, eligible, sandbox);
+            let resolved = resolve_leader_mode_with_default(
+                leader_flag,
+                no_leader_flag,
+                cfg,
+                None,
+                eligible,
+                sandbox,
+                false,
+            );
             assert!(!resolved.use_leader, "{label}");
             assert_eq!(
                 resolved.disabled_by_confinement, None,
                 "{label}: the sandbox took nothing away, so it must stay silent"
+            );
+        }
+    }
+    /// gx: the `is_gx_build()` wiring itself, asserted without hard-coding either flavour's
+    /// outcome: `resolve_leader_mode` must be exactly `resolve_leader_mode_with_default` with
+    /// the compiled-in build flavour as `default_on`. Holds for a stock `cargo test` and for a
+    /// binary stamped with a gx `GROK_VERSION`, and fails if the two ever drift apart.
+    #[test]
+    fn resolve_leader_mode_agrees_with_the_build_flavour_default() {
+        let on = config_with_leader(true);
+        let off = config_with_leader(false);
+        for (label, leader_flag, no_leader_flag, cfg, eligible, sandbox) in [
+            ("default", false, false, &empty_config(), true, None),
+            ("--leader", true, false, &empty_config(), true, None),
+            ("--no-leader", false, true, &empty_config(), true, None),
+            ("config on", false, false, &on, true, None),
+            ("config off", false, false, &off, true, None),
+            ("ineligible", false, false, &empty_config(), false, None),
+            (
+                "default under a sandbox profile",
+                false,
+                false,
+                &empty_config(),
+                true,
+                Some("strict"),
+            ),
+        ] {
+            assert_eq!(
+                resolve_leader_mode(leader_flag, no_leader_flag, cfg, None, eligible, sandbox),
+                resolve_leader_mode_with_default(
+                    leader_flag,
+                    no_leader_flag,
+                    cfg,
+                    None,
+                    eligible,
+                    sandbox,
+                    xai_grok_version::is_gx_build(),
+                ),
+                "{label}: resolve_leader_mode must delegate with default_on = is_gx_build()"
             );
         }
     }
@@ -2118,12 +2182,21 @@ mod tests {
         assert!(args.no_leader);
         assert!(matches!(args.command, Some(Command::Agent(_))));
     }
+    // gx: upstream fall-through again -- `default_on = false` spelled out, not inherited from
+    // the build flavour. See `default_is_false`.
     #[test]
     fn remote_settings_none_falls_through_to_default() {
-        let (use_leader, reason) =
-            resolve_use_leader(false, false, &empty_config(), None, true, None);
-        assert!(!use_leader);
-        assert_eq!(reason, None);
+        let resolved = resolve_leader_mode_with_default(
+            false,
+            false,
+            &empty_config(),
+            None,
+            true,
+            None,
+            false,
+        );
+        assert!(!resolved.use_leader);
+        assert_eq!(resolved.policy_disable_reason, None);
     }
     #[cfg(feature = "release-dist")]
     #[test]
@@ -2149,6 +2222,9 @@ mod tests {
         assert!(!use_leader);
         assert_eq!(reason, Some("remote"));
     }
+    // gx: unknown remote state falls through to the build default, so this one names
+    // `default_on = false` too -- the assertion is "unknown is not a policy disable", not
+    // "leader mode is off for this build". See `default_is_false`.
     #[cfg(feature = "release-dist")]
     #[test]
     fn remote_settings_unknown_leader_mode_is_not_policy_disable() {
@@ -2156,10 +2232,17 @@ mod tests {
             leader_mode: None,
             ..Default::default()
         };
-        let (use_leader, reason) =
-            resolve_use_leader(false, false, &empty_config(), Some(&rs), true, None);
-        assert!(!use_leader);
-        assert_eq!(reason, None);
+        let resolved = resolve_leader_mode_with_default(
+            false,
+            false,
+            &empty_config(),
+            Some(&rs),
+            true,
+            None,
+            false,
+        );
+        assert!(!resolved.use_leader);
+        assert_eq!(resolved.policy_disable_reason, None);
     }
     #[cfg(feature = "release-dist")]
     #[test]
