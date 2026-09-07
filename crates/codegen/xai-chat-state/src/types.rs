@@ -187,6 +187,8 @@ mod tests {
                 reasoning_effort: None,
                 stream_tool_calls: None,
                 codex_compat: None,
+                // gx: see `SamplingConfig::hoist_tool_images`.
+                hoist_tool_images: None,
             },
             prompt_index: 0,
             total_tokens: 0,
@@ -233,6 +235,8 @@ mod tests {
                 reasoning_effort: None,
                 stream_tool_calls: None,
                 codex_compat: None,
+                // gx: see `SamplingConfig::hoist_tool_images`.
+                hoist_tool_images: None,
             },
             prompt_index: 5,
             total_tokens: 1234,

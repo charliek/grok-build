@@ -187,12 +187,35 @@ pub fn conversation_item_to_chat_message(item: ConversationItem) -> ChatRequestM
 /// `model_id` preserved must use [`conversation_item_to_chat_message`], which
 /// is the on-disk / v0-downgrade conversion and is left untouched.
 
-pub fn conversation_to_chat_messages(items: Vec<ConversationItem>) -> Vec<ChatRequestMessage> {
+pub fn conversation_to_chat_messages(
+    items: Vec<ConversationItem>,
+    // gx: hoist tool-result images into a following `user` message; see
+    // `ConversationRequest::hoist_tool_images` and `HoistedToolImages`.
+    hoist_tool_images: bool,
+) -> Vec<ChatRequestMessage> {
     let mut out: Vec<ChatRequestMessage> = Vec::with_capacity(items.len());
     let mut pending_reasoning: Vec<String> = Vec::new();
+    let mut hoisted = HoistedToolImages::default();
 
     for item in items {
+        // gx: a run of consecutive tool results shares one hoisted user
+        // message, so parallel tool calls keep their `tool` messages adjacent.
+        // Any other item ends the run — a no-op while nothing is buffered,
+        // which is always the case with hoisting off.
+        if !matches!(item, ConversationItem::ToolResult(_)) {
+            hoisted.flush_into(&mut out);
+        }
         match item {
+            // gx: text-only `tool` message; the images go to the flushed user
+            // message. Clears `pending_reasoning` like the `other` arm below.
+            ConversationItem::ToolResult(t) if hoist_tool_images => {
+                pending_reasoning.clear();
+                hoisted.push_tool_result(&t.tool_call_id, t.images);
+                out.push(ChatRequestMessage::tool(
+                    t.tool_call_id,
+                    t.content.as_ref().to_owned(),
+                ));
+            }
             ConversationItem::Reasoning(r) => {
                 let text = reasoning_item_text(&r);
                 if !text.is_empty() {
@@ -217,9 +240,69 @@ pub fn conversation_to_chat_messages(items: Vec<ConversationItem>) -> Vec<ChatRe
             }
         }
     }
+    // gx: a run that ends the conversation still needs its user message.
+    hoisted.flush_into(&mut out);
 
     strip_wire_incompatible_message_fields(&mut out);
     out
+}
+
+/// gx: the images pulled out of a run of consecutive tool results, waiting to
+/// be emitted as one `user` message after the run's last `tool` message.
+///
+/// A run that carried no image emits nothing, so a conversation without images
+/// is byte-identical whether or not hoisting is on.
+#[derive(Default)]
+struct HoistedToolImages {
+    blocks: Vec<ChatContentBlock>,
+    /// Only the tool calls that actually contributed an image, so the preamble
+    /// never names one whose result was text-only.
+    ids: Vec<String>,
+}
+
+impl HoistedToolImages {
+    fn push_tool_result(&mut self, tool_call_id: &str, images: Vec<ContentPart>) {
+        let before = self.blocks.len();
+        self.blocks
+            .extend(images.into_iter().filter_map(|part| match part {
+                ContentPart::Image { url } => Some(ChatContentBlock::ImageUrl {
+                    image_url: ImageUrl {
+                        url: url.as_ref().to_owned(),
+                    },
+                }),
+                ContentPart::Text { .. } => None,
+            }));
+        if self.blocks.len() > before {
+            self.ids.push(tool_call_id.to_owned());
+        }
+    }
+
+    /// Emit the buffered run, if it carried anything, and reset for the next one.
+    fn flush_into(&mut self, out: &mut Vec<ChatRequestMessage>) {
+        if self.blocks.is_empty() {
+            return;
+        }
+        let mut blocks = Vec::with_capacity(self.blocks.len() + 1);
+        blocks.push(ChatContentBlock::Text {
+            text: format!(
+                "The following images were returned by tool call(s) {}; they are \
+                 attached here because this provider only accepts text in tool \
+                 messages. Continue the task.",
+                self.ids.join(", ")
+            ),
+        });
+        blocks.append(&mut self.blocks);
+        self.ids.clear();
+        out.push(ChatRequestMessage {
+            role: Role::User,
+            content: MessageContent::Blocks(blocks),
+            name: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            model_id: None,
+            reasoning_content: None,
+        });
+    }
 }
 
 /// Drop per-message fields that OpenAI-compatible hosts reject.
@@ -303,7 +386,9 @@ impl From<ChatResponseMessage> for ConversationItem {
 
 impl From<ConversationRequest> for ChatCompletionRequest {
     fn from(req: ConversationRequest) -> Self {
-        let messages: Vec<ChatRequestMessage> = conversation_to_chat_messages(req.items);
+        // gx: see `ConversationRequest::hoist_tool_images`.
+        let messages: Vec<ChatRequestMessage> =
+            conversation_to_chat_messages(req.items, req.hoist_tool_images);
 
         let tools_is_empty = req.tools.is_empty();
         let tools: Option<Vec<ToolDefinition>> = if tools_is_empty {
@@ -484,14 +569,16 @@ mod compat_tests {
     /// in `xai-grok-shell` both go through it, so the strip lives here.
     #[test]
     fn conversation_to_chat_messages_clears_model_id() {
-        let msgs =
-            conversation_to_chat_messages(vec![ConversationItem::Assistant(AssistantItem {
+        let msgs = conversation_to_chat_messages(
+            vec![ConversationItem::Assistant(AssistantItem {
                 content: "hi".into(),
                 tool_calls: vec![],
                 model_id: Some("grok-4".to_string()),
                 model_fingerprint: None,
                 reasoning_effort: None,
-            })]);
+            })],
+            false,
+        );
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].model_id, None);
 

@@ -182,6 +182,8 @@ fn test_config(base_url: &str) -> SamplerConfig {
         max_retries: None,
         stream_tool_calls: false,
         codex_compat: false,
+        // gx: see `SamplingConfig::hoist_tool_images`.
+        hoist_tool_images: false,
         idle_timeout_secs: None,
         client_identifier: None,
         reasoning_effort: None,

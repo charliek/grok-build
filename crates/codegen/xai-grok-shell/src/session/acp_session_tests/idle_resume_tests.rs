@@ -117,6 +117,8 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
                     reasoning_effort: None,
                     stream_tool_calls: None,
                     codex_compat: None,
+                    // gx: see `SamplingConfig::hoist_tool_images`.
+                    hoist_tool_images: None,
                 },
                 Box::new(xai_chat_state::NullChatPersistence),
                 chat_event_tx,

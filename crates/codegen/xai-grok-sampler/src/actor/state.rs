@@ -85,6 +85,8 @@ mod tests {
             max_retries: None,
             stream_tool_calls: false,
             codex_compat: false,
+            // gx: see `SamplerConfig::hoist_tool_images`.
+            hoist_tool_images: false,
             idle_timeout_secs: None,
             reasoning_effort: None,
             origin_client: None,

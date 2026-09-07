@@ -675,6 +675,17 @@ pub struct ConversationRequest {
     // `Default` is `false`, so every non-codex request — xAI included — is
     // byte-for-byte what it was.
     pub codex_compat: bool,
+    // gx: emit a tool result's images as a following `user` message instead of
+    // as image blocks inside the `tool` message. `[Text, ImageUrl…]` in a tool
+    // message is an xAI extension — the OpenAI spec allows text only there —
+    // and Meta's Muse gateway 400s on it (`messages[N].content did not match
+    // any supported type`) while accepting the same image in a user message.
+    // Set from `[model.<id>].tool_result_images` via `SamplerConfig`; see
+    // `conversation_to_chat_messages` in `conversation/chat_completions.rs`.
+    //
+    // `Default` is `false`, so every request that does not opt in — xAI
+    // included — is byte-for-byte what it was.
+    pub hoist_tool_images: bool,
 }
 
 impl ConversationRequest {
@@ -4616,7 +4627,7 @@ mod tests {
             ConversationItem::assistant("answer"),
         ];
 
-        let msgs = conversation_to_chat_messages(items);
+        let msgs = conversation_to_chat_messages(items, false);
         assert_eq!(msgs.len(), 2, "user + assistant; reasoning items folded");
         assert_eq!(msgs[0].role, Role::User);
         assert_eq!(msgs[1].role, Role::Assistant);
@@ -4642,7 +4653,7 @@ mod tests {
                 status: None,
             }),
         ];
-        let msgs = conversation_to_chat_messages(items);
+        let msgs = conversation_to_chat_messages(items, false);
         assert_eq!(
             msgs.len(),
             1,
@@ -4673,7 +4684,7 @@ mod tests {
             ConversationItem::assistant("answer"),
         ];
 
-        let msgs = conversation_to_chat_messages(items);
+        let msgs = conversation_to_chat_messages(items, false);
 
         assert_eq!(msgs.len(), 3, "user + synthetic BTC assistant + assistant");
         assert_eq!(msgs[0].role, Role::User);

@@ -243,6 +243,22 @@ explicit `context_window` gx sets itself, since grok's model catalog has no entr
 third-party id. Run `gx providers status` to see exactly what's configured and where
 each value came from (`providers.toml` vs `config.toml` vs environment).
 
+### `tool_result_images`
+
+When a tool returns an image (`read_file` on a screenshot, say), grok puts the image
+*inside* the `tool` message. That is an xAI extension — the OpenAI Chat Completions spec
+allows only text there — and Meta's Muse gateway rejects it with
+`messages[N].content did not match any supported type`. So on any **non-xAI Chat
+Completions** provider gx hoists those images into a short `user` message emitted right
+after the tool message(s) that produced them; xAI and the Responses/Messages backends keep
+the inline shape. Set `tool_result_images = "inline"` or `"hoist"` on a `[model."<id>"]`
+table in `config.toml` (or `providers.toml`) to override that per-provider default if your
+endpoint disagrees with the guess.
+
+A loopback base URL is treated as xAI's cli-chat-proxy, so a local OpenAI-compatible server
+(Ollama, LM Studio) keeps the inline shape by default. That is the behaviour it already had;
+set `tool_result_images = "hoist"` on it if its server rejects images in a tool message.
+
 ## Remote lane
 
 A gx build starts a **leader** by default (stock grok does not), and that leader hosts a

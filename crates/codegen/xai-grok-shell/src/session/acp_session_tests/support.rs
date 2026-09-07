@@ -302,6 +302,8 @@ async fn create_test_actor_inner(
             reasoning_effort: None,
             stream_tool_calls: None,
             codex_compat: None,
+            // gx: see `SamplingConfig::hoist_tool_images`.
+            hoist_tool_images: None,
         },
         chat_persistence,
         chat_event_tx,

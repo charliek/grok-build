@@ -490,8 +490,12 @@ pub(crate) async fn generate_session_compact(
     let output = match sampling_config.api_backend {
         ApiBackend::ChatCompletions => {
             // Fold `Reasoning` siblings into the following assistant via `conversation_to_chat_messages`.
+            // gx: this branch builds the request itself instead of going
+            // through the sampler's `apply_conversation_defaults`, so the
+            // tool-image hoist has to be passed in explicitly or a compaction
+            // request would 400 on the provider the flag exists for.
             let chat_messages: Vec<ChatRequestMessage> =
-                conversation_to_chat_messages(chat_history);
+                conversation_to_chat_messages(chat_history, sampling_config.hoist_tool_images);
             let mut message =
                 ChatCompletionRequest::new(sampling_config.model.to_owned(), chat_messages)
                     .with_temperature(1.0);

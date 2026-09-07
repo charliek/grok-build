@@ -715,6 +715,7 @@ async fn read_parent_sampling_config(
                 // gx: a subagent inherits the parent model's provider, so it
                 // must inherit its body shaping too.
                 codex_compat: cfg.codex_compat.unwrap_or(false),
+                hoist_tool_images: cfg.hoist_tool_images.unwrap_or(false),
                 idle_timeout_secs: None,
                 client_identifier: ctx.sampling_config.client_identifier.clone(),
                 deployment_id: ctx.sampling_config.deployment_id.clone(),

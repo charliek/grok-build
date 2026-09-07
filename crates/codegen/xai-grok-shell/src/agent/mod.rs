@@ -8,6 +8,8 @@ mod ext_parsers;
 pub mod external_otel_pin;
 pub mod feedback_client;
 pub mod folder_trust;
+// gx: where a tool result's images go on the Chat Completions wire.
+pub mod gx_tool_images;
 pub(crate) mod handlers;
 pub mod init;
 pub mod model_providers;

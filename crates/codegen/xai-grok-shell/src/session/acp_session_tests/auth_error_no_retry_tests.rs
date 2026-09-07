@@ -1153,6 +1153,8 @@ async fn set_session_model_invalidates_byok_memo_for_same_model_id() {
                 max_retries: None,
                 stream_tool_calls: false,
                 codex_compat: false,
+                // gx: see `SamplingConfig::hoist_tool_images`.
+                hoist_tool_images: false,
                 idle_timeout_secs: None,
                 client_identifier: None,
                 reasoning_effort: None,
@@ -1246,6 +1248,8 @@ async fn switch_to_first_party_model_drops_minted_provider_token() {
                 max_retries: None,
                 stream_tool_calls: false,
                 codex_compat: false,
+                // gx: see `SamplingConfig::hoist_tool_images`.
+                hoist_tool_images: false,
                 idle_timeout_secs: None,
                 client_identifier: None,
                 reasoning_effort: None,

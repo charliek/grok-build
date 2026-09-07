@@ -127,6 +127,8 @@ async fn create_test_actor_with_memory(
             reasoning_effort: None,
             stream_tool_calls: None,
             codex_compat: None,
+            // gx: see `SamplingConfig::hoist_tool_images`.
+            hoist_tool_images: None,
         },
         Box::new(xai_chat_state::NullChatPersistence),
         chat_event_tx,

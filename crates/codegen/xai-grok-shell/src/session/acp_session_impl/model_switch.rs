@@ -61,6 +61,8 @@ impl SessionActor {
                 reasoning_effort: sampling_config.reasoning_effort,
                 stream_tool_calls: Some(sampling_config.stream_tool_calls),
                 codex_compat: Some(sampling_config.codex_compat),
+                // gx: see `SamplingConfig::hoist_tool_images`.
+                hoist_tool_images: Some(sampling_config.hoist_tool_images),
             });
         let existing = self.chat_state_handle.get_credentials().await;
         let session_key = self

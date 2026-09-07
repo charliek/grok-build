@@ -69,6 +69,14 @@ pub struct SamplerConfig {
     // requires. `false` everywhere else, which is the pre-gx behavior.
     #[serde(default)]
     pub codex_compat: bool,
+    // gx: emit tool-result images as a following `user` message rather than as
+    // image blocks inside the `tool` message. Set from
+    // `[model.<id>].tool_result_images` (defaulted per provider by
+    // `agent::gx_tool_images`); carried onto every `ConversationRequest` this
+    // client sends (see `SamplingClient::apply_conversation_defaults`).
+    // `false` everywhere else, which is the pre-gx behavior.
+    #[serde(default)]
+    pub hoist_tool_images: bool,
     pub idle_timeout_secs: Option<u64>,
 
     // Reasoning effort
@@ -138,6 +146,8 @@ impl Default for SamplerConfig {
             max_retries: None,
             stream_tool_calls: false,
             codex_compat: false,
+            // gx: see `SamplerConfig::hoist_tool_images`.
+            hoist_tool_images: false,
             idle_timeout_secs: None,
             reasoning_effort: None,
             origin_client: None,

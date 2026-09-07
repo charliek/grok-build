@@ -3765,6 +3765,8 @@ fn default_models(endpoints: &EndpointsConfig) -> IndexMap<String, ModelEntryCon
                 show_model_fingerprint: m.show_model_fingerprint,
                 stream_tool_calls: None,
                 codex_compat: None,
+                // gx: see `ModelEntryConfig::tool_result_images`.
+                tool_result_images: None,
                 laziness_detector: LazinessDetectorPerModelConfig::default(),
             };
             (key, config)
@@ -3896,6 +3898,13 @@ pub struct ModelEntryConfig {
     /// replays. Per-model opt-in; every other provider is unaffected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_compat: Option<bool>,
+    /// gx: where a tool result's images go on the Chat Completions wire —
+    /// `"inline"` keeps xAI's image blocks inside the `tool` message,
+    /// `"hoist"` moves them to a following `user` message for a provider that
+    /// only accepts text there (Meta's Muse 400s on the inline shape).
+    /// Unset derives per provider; see `agent::gx_tool_images`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_result_images: Option<crate::agent::gx_tool_images::ToolResultImages>,
     /// Per-model Layer-3 LazinessDetector configuration.
     /// Defaults to the all-disabled state via `#[serde(default)]`.
 
@@ -3964,6 +3973,8 @@ pub struct ConfigModelOverride {
     pub stream_tool_calls: Option<bool>,
     // gx: see `ModelEntryConfig::codex_compat`.
     pub codex_compat: Option<bool>,
+    // gx: see `ModelEntryConfig::tool_result_images`.
+    pub tool_result_images: Option<crate::agent::gx_tool_images::ToolResultImages>,
 }
 impl ConfigModelOverride {
     pub(crate) fn apply(
@@ -4068,6 +4079,10 @@ impl ConfigModelOverride {
         if self.codex_compat.is_some() {
             entry.info.codex_compat = self.codex_compat;
         }
+        // gx: per-model override for where tool-result images go.
+        if self.tool_result_images.is_some() {
+            entry.info.tool_result_images = self.tool_result_images;
+        }
         if self.api_key.is_some() {
             entry.api_key.clone_from(&self.api_key);
         }
@@ -4161,6 +4176,9 @@ pub struct ModelInfo {
     /// gx: see `ModelEntryConfig::codex_compat`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_compat: Option<bool>,
+    /// gx: see `ModelEntryConfig::tool_result_images`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_result_images: Option<crate::agent::gx_tool_images::ToolResultImages>,
     /// Per-model Layer-3 LazinessDetector configuration. Defaults to the all-disabled state.
     /// The feature is per-model opt-in, with a second-step `max_nudges_per_session > 0` opt-in for actually injecting nudges.
     /// See [`LazinessDetectorPerModelConfig`].
@@ -4208,6 +4226,8 @@ impl ModelInfo {
             show_model_fingerprint: false,
             stream_tool_calls: None,
             codex_compat: None,
+            // gx: see `ModelEntryConfig::tool_result_images`.
+            tool_result_images: None,
             laziness_detector: LazinessDetectorPerModelConfig::default(),
         }
     }
@@ -4248,6 +4268,8 @@ impl ModelInfo {
             show_model_fingerprint: entry.show_model_fingerprint,
             stream_tool_calls: entry.stream_tool_calls,
             codex_compat: entry.codex_compat,
+            // gx: see `ModelEntryConfig::tool_result_images`.
+            tool_result_images: entry.tool_result_images,
             laziness_detector: entry.laziness_detector.clone(),
         }
     }
@@ -5006,6 +5028,8 @@ pub(crate) fn resolve_aux_model_sampling_config(
                 show_model_fingerprint: false,
                 stream_tool_calls: None,
                 codex_compat: None,
+                // gx: see `ModelEntryConfig::tool_result_images`.
+                tool_result_images: None,
                 laziness_detector: LazinessDetectorPerModelConfig::default(),
             },
             api_key: Some(bearer),
@@ -5152,6 +5176,8 @@ pub(crate) fn sampling_config_for_model(
         stream_tool_calls: info.stream_tool_calls.unwrap_or(false),
         // gx: per-model ChatGPT/Codex body shaping.
         codex_compat: info.codex_compat.unwrap_or(false),
+        // gx: per-model placement of tool-result images.
+        hoist_tool_images: crate::agent::gx_tool_images::hoist_tool_images(info),
         idle_timeout_secs: None,
         client_identifier: None,
         deployment_id,
@@ -5239,6 +5265,8 @@ fn resolve_hidden_default_web_search_sampling_config(
             show_model_fingerprint: false,
             stream_tool_calls: None,
             codex_compat: None,
+            // gx: see `ModelEntryConfig::tool_result_images`.
+            tool_result_images: None,
             laziness_detector: LazinessDetectorPerModelConfig::default(),
         },
         api_key: None,
