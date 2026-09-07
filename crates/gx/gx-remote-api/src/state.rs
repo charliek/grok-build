@@ -1,6 +1,6 @@
 //! Shared state behind every handler.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -9,6 +9,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::acp_client::AcpClient;
+use crate::approvals::ApprovalStore;
 use crate::auth::Token;
 use crate::envelope::NormalizedEnvelope;
 use crate::ring::EventRing;
@@ -50,7 +51,11 @@ pub struct AppState {
     pub acp: AcpClient,
     pub token: Token,
     pub health: HealthInfo,
-    pub attachments: Attachments,
+    /// Shared with the [`ApprovalStore`], which declines any interaction for a session this lane
+    /// has not attached to — hence the `Arc` rather than a plain field.
+    pub attachments: Arc<Attachments>,
+    /// Open and recently-resolved interactions. The same handle the ACP link task captures into.
+    pub approvals: Arc<ApprovalStore>,
     /// Recent live frames, per session. Filled by [`spawn_event_pump`], read by the SSE resume.
     pub ring: EventRing,
     pub sse: SseSettings,
@@ -67,6 +72,10 @@ pub struct AppState {
 /// practice nothing else arrives; the check is what keeps a stray broadcast from spending the
 /// global cap on a session no client can ask about.
 ///
+/// It is also where `pending_interaction` / `interaction_resolved` reach the approval store
+/// ([`ApprovalStore::observe`]) — here rather than per SSE connection, because an interaction has
+/// to resolve whether or not anybody is watching the stream.
+///
 /// The task ends with `cancel`, or when the link closes and the broadcast sender drops with it.
 pub fn spawn_event_pump(state: Arc<AppState>, cancel: CancellationToken) {
     let mut notifications = state.acp.subscribe();
@@ -78,6 +87,7 @@ pub fn spawn_event_pump(state: Arc<AppState>, cancel: CancellationToken) {
             };
             match notification {
                 Ok(notification) => {
+                    state.approvals.observe(&notification);
                     let Some(session_id) = notification.session_id.clone() else {
                         // Machine-wide broadcasts (`x.ai/sessions/changed` and friends) are not
                         // session frames; SSE renders them as `event: session` from its own
@@ -154,17 +164,6 @@ impl Attachments {
         let slots = self.slots.lock().unwrap();
         slots.get(session_id).is_some_and(|slot| slot.initialized())
     }
-
-    /// Ids of every successfully attached session. Used to stamp `attached` on roster rows, so it
-    /// is a set: the roster is scanned against it once per row.
-    pub fn attached_ids(&self) -> HashSet<String> {
-        let slots = self.slots.lock().unwrap();
-        slots
-            .iter()
-            .filter(|(_, slot)| slot.initialized())
-            .map(|(id, _)| id.clone())
-            .collect()
-    }
 }
 
 #[cfg(test)]
@@ -192,10 +191,7 @@ mod tests {
             .await
             .unwrap();
         assert!(attachments.is_attached("s1"));
-        assert_eq!(
-            attachments.attached_ids(),
-            HashSet::from(["s1".to_string()])
-        );
+        assert!(!attachments.is_attached("s2"));
     }
 
     #[tokio::test]

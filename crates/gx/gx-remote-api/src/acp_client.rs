@@ -8,18 +8,25 @@
 //! |---|---|---|
 //! | `id` + (`result` \| `error`), no `method` | response to one of our requests | resolve the waiting oneshot |
 //! | `method`, no `id` | notification (session update, roster change, interjection) | broadcast |
-//! | `method` + `id` | **reverse**-request: the agent asking *us* something | answered `-32601` (see below) |
+//! | `method` + `id` | **reverse**-request: the agent asking *us* something | captured, or answered `-32601` (see below) |
 //!
 //! A response's JSON-RPC `result` is not necessarily the method's payload: most `_x.ai/…`
 //! extension methods wrap it once more in an `ExtMethodResult` envelope. [`unwrap_ext_envelope`]
 //! is the single place that is undone, and its doc comment carries the live-leader evidence.
 //!
-//! Reverse-requests are the permission / question / plan-approval / MCP-elicitation interactions.
-//! C6 intercepts them and turns them into approval resources; until then every one is refused with
-//! `-32601 method not found` the instant it arrives. Refusing is strictly better than dropping: the
-//! agent broadcasts an interaction to *all* subscribers and takes the first answer, so a fast
-//! `-32601` from the lane is discarded in favour of the TUI's real answer, whereas silence would
-//! leave the request outstanding forever if the lane were the only subscriber.
+//! Reverse-requests split in two. The four **interaction** methods — permission, question,
+//! plan-approval, MCP elicitation — are handed to [`crate::approvals`], which keeps the request
+//! *and its JSON-RPC id* so an HTTP call on a later connection can answer it; nothing goes back on
+//! the link until a client does. Everything else — and any interaction the store declines — is
+//! refused with `-32601 method not found` the instant it arrives. Refusing is strictly better than
+//! dropping: the agent broadcasts an interaction to *all* subscribers and takes the first answer,
+//! so a fast `-32601` from the lane is discarded in favour of the TUI's real answer, whereas
+//! silence would leave the request outstanding forever if the lane were the only subscriber.
+//!
+//! That asymmetry is the whole risk of C6 and is worth stating plainly: a captured request is one
+//! **nothing** will answer until a phone does. It is safe only because capture is limited to the
+//! four shared methods, for sessions this lane has attached, which a TUI (if there is one) is also
+//! subscribed to and can still answer first.
 //!
 //! Reconnection is deliberately absent (plan D3): the lane is hosted inside the leader process and
 //! dies with it. A closed link cancels [`AcpClient::cancel_token`], which is what stops the HTTP
@@ -36,6 +43,7 @@ use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
+use crate::approvals::ApprovalStore;
 use crate::link::LeaderLink;
 
 /// How long a request waits for its response before the caller gets `leader_unavailable`.
@@ -45,7 +53,8 @@ pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// silently losing frames; C5's SSE lane turns a lag into an `event: reset`.
 const NOTIFICATION_BUFFER: usize = 1024;
 
-/// JSON-RPC "method not found". Our standing answer to any reverse-request until C6.
+/// JSON-RPC "method not found". Our standing answer to every reverse-request the approval store
+/// does not take custody of.
 const METHOD_NOT_FOUND: i64 = -32601;
 
 /// Extension ACP methods travel with a **leading underscore** on the wire.
@@ -189,7 +198,17 @@ impl AcpClient {
     ///
     /// `cancel` is shared, not cloned-from: cancelling it stops the task, and the task cancels it
     /// when the link closes. Callers use that second direction to shut the HTTP server down.
-    pub fn spawn<L: LeaderLink>(link: L, cancel: CancellationToken, timeout: Duration) -> Self {
+    ///
+    /// `approvals` is the same store [`crate::state::AppState`] hands the routes. It has to exist
+    /// before the link task does — a reverse-request can arrive on the first millisecond of the
+    /// connection — which is why it is a constructor argument rather than something installed
+    /// afterwards.
+    pub fn spawn<L: LeaderLink>(
+        link: L,
+        cancel: CancellationToken,
+        timeout: Duration,
+        approvals: Arc<ApprovalStore>,
+    ) -> Self {
         let (outbound_tx, outbound_rx) = mpsc::unbounded_channel();
         let (notifications, _) = broadcast::channel(NOTIFICATION_BUFFER);
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
@@ -209,6 +228,7 @@ impl AcpClient {
             outbound_tx,
             pending,
             notifications,
+            approvals,
             cancel,
         ));
 
@@ -318,6 +338,25 @@ impl AcpClient {
         Ok((id, rx))
     }
 
+    /// Answer a reverse-request the lane took custody of.
+    ///
+    /// `id` is echoed **verbatim** — it belongs to the agent's own id space, not ours, and JSON-RPC
+    /// ids are not required to be integers. `result` is the client's body, passed through
+    /// unexamined: the agent is the authority on what it accepts, and a lane that reshaped these
+    /// would need a release every time an option kind is added.
+    ///
+    /// Synchronous, because [`crate::approvals::ApprovalStore::submit`] calls it while holding the
+    /// state lock — that is what makes "check pending, then send" one atomic step.
+    pub fn respond(&self, id: &Value, result: Value) -> Result<(), AcpError> {
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": result,
+        })
+        .to_string();
+        self.outbound.send(payload).map_err(|_| AcpError::Closed)
+    }
+
     /// Send a JSON-RPC notification (no id, no response).
     pub fn notify(&self, method: &str, params: Value) -> Result<(), AcpError> {
         let payload = json!({
@@ -350,6 +389,7 @@ async fn run_link<L: LeaderLink>(
     outbound_tx: mpsc::UnboundedSender<String>,
     pending: Pending,
     notifications: broadcast::Sender<Notification>,
+    approvals: Arc<ApprovalStore>,
     cancel: CancellationToken,
 ) {
     loop {
@@ -371,7 +411,7 @@ async fn run_link<L: LeaderLink>(
                     debug!("gx-remote-api: leader link closed");
                     break;
                 };
-                handle_inbound(&payload, &pending, &outbound_tx, &notifications).await;
+                handle_inbound(&payload, &pending, &outbound_tx, &notifications, &approvals).await;
             }
         }
     }
@@ -387,6 +427,7 @@ async fn handle_inbound(
     pending: &Pending,
     outbound: &mpsc::UnboundedSender<String>,
     notifications: &broadcast::Sender<Notification>,
+    approvals: &ApprovalStore,
 ) {
     let Ok(msg) = serde_json::from_str::<Value>(payload) else {
         warn!("gx-remote-api: dropping unparseable payload from the leader");
@@ -422,12 +463,21 @@ async fn handle_inbound(
             };
             let _ = tx.send(outcome);
         }
-        // Reverse-request from the agent. Refuse it so nothing can hang; see the module docs.
+        // Reverse-request from the agent: hold it if it is an interaction this lane can answer
+        // later, otherwise refuse it so nothing can hang. See the module docs.
         (Some(method), Some(id)) => {
-            debug!(
-                method,
-                "gx-remote-api: refusing a reverse-request (C6 will handle these)"
-            );
+            let logical = logical_method(method);
+            let params = msg.get("params").cloned().unwrap_or(Value::Null);
+            if let Some(approval) = approvals.intercept(logical, id, &params) {
+                debug!(
+                    method = logical,
+                    session_id = approval.session_id,
+                    tool_call_id = approval.id,
+                    "gx-remote-api: holding an interaction for a client to answer"
+                );
+                return;
+            }
+            debug!(method, "gx-remote-api: refusing a reverse-request");
             let reply = json!({
                 "jsonrpc": "2.0",
                 "id": id,
@@ -462,9 +512,28 @@ mod tests {
     use super::*;
     use crate::link::FakeLink;
 
-    fn spawn_over_fake() -> (AcpClient, crate::link::FakeLinkHandle) {
+    /// A client whose approval store is attached to `sessions`, so an interaction naming one of
+    /// them is captured and everything else is refused.
+    fn spawn_over_fake_attached_to(
+        sessions: &[&str],
+    ) -> (AcpClient, crate::link::FakeLinkHandle, Arc<ApprovalStore>) {
+        let attachments = Arc::new(crate::state::Attachments::default());
+        for session in sessions {
+            attachments.mark_attached(session);
+        }
+        let approvals = Arc::new(ApprovalStore::new(attachments));
         let (link, handle) = FakeLink::new();
-        let client = AcpClient::spawn(link, CancellationToken::new(), Duration::from_secs(5));
+        let client = AcpClient::spawn(
+            link,
+            CancellationToken::new(),
+            Duration::from_secs(5),
+            approvals.clone(),
+        );
+        (client, handle, approvals)
+    }
+
+    fn spawn_over_fake() -> (AcpClient, crate::link::FakeLinkHandle) {
+        let (client, handle, _) = spawn_over_fake_attached_to(&[]);
         (client, handle)
     }
 
@@ -650,26 +719,14 @@ mod tests {
         assert!(matches!(err, AcpError::Rpc { code: -32602, .. }), "{err}");
     }
 
-    #[tokio::test]
-    async fn a_reverse_request_is_answered_with_method_not_found() {
-        let (client, handle) = spawn_over_fake();
-        // Get the task running so the push below is definitely observed.
-        client.initialize().await.unwrap();
-
-        handle.push(json!({
-            "jsonrpc": "2.0",
-            "id": 99,
-            "method": "session/request_permission",
-            "params": { "sessionId": "s1" },
-        }));
-
-        // The refusal is sent back over the same link, so it shows up as outbound traffic.
-        let reply = tokio::time::timeout(Duration::from_secs(2), async {
+    /// The reply the lane put on the link for reverse-request `id`, if it has sent one.
+    async fn await_reply(handle: &crate::link::FakeLinkHandle, id: i64) -> Value {
+        tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 if let Some(v) = handle
                     .outbound()
                     .into_iter()
-                    .find(|v| v.get("id").and_then(Value::as_i64) == Some(99))
+                    .find(|v| v.get("id").and_then(Value::as_i64) == Some(id))
                 {
                     return v;
                 }
@@ -677,8 +734,88 @@ mod tests {
             }
         })
         .await
-        .expect("the lane must answer a reverse-request");
-        assert_eq!(reply["error"]["code"], METHOD_NOT_FOUND);
+        .expect("the lane must answer a reverse-request it does not hold")
+    }
+
+    #[tokio::test]
+    async fn a_reverse_request_that_is_not_an_interaction_is_answered_with_method_not_found() {
+        let (client, handle, _) = spawn_over_fake_attached_to(&["s1"]);
+        // Get the task running so the push below is definitely observed.
+        client.initialize().await.unwrap();
+
+        handle.push(json!({
+            "jsonrpc": "2.0",
+            "id": 99,
+            "method": "fs/read_text_file",
+            "params": { "sessionId": "s1", "path": "/etc/passwd" },
+        }));
+
+        // The refusal is sent back over the same link, so it shows up as outbound traffic.
+        assert_eq!(
+            await_reply(&handle, 99).await["error"]["code"],
+            METHOD_NOT_FOUND
+        );
+
+        // The **method name** is the gate, not the shape: a reverse-request carrying everything an
+        // interaction carries is still refused if it is not one of the four. Otherwise a future
+        // driver-only request with a `toolCallId` would silently be parked forever.
+        handle.push(json!({
+            "jsonrpc": "2.0",
+            "id": 100,
+            "method": "_x.ai/some_future_driver_only_request",
+            "params": { "sessionId": "s1", "toolCallId": "tc-1", "options": [] },
+        }));
+        assert_eq!(
+            await_reply(&handle, 100).await["error"]["code"],
+            METHOD_NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn an_interaction_for_an_unattached_session_is_refused_not_held() {
+        let (client, handle) = spawn_over_fake();
+        client.initialize().await.unwrap();
+
+        handle.push(json!({
+            "jsonrpc": "2.0",
+            "id": 99,
+            "method": "session/request_permission",
+            "params": { "sessionId": "s1", "toolCall": { "toolCallId": "tc-1" } },
+        }));
+
+        assert_eq!(
+            await_reply(&handle, 99).await["error"]["code"],
+            METHOD_NOT_FOUND,
+            "an interaction no client can address must not be parked"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_interaction_for_an_attached_session_is_held_silently() {
+        let (client, handle, approvals) = spawn_over_fake_attached_to(&["s1"]);
+        client.initialize().await.unwrap();
+
+        // The extension methods arrive underscored; capture routes on the logical name.
+        handle.push(json!({
+            "jsonrpc": "2.0",
+            "id": 99,
+            "method": "_x.ai/exit_plan_mode",
+            "params": { "sessionId": "s1", "toolCallId": "tc-1", "planContent": "# Plan" },
+        }));
+        // The fake answers inside `send`, so this response is queued *behind* the push above: once
+        // it resolves, the link task has necessarily already handled the reverse-request.
+        client.initialize().await.unwrap();
+
+        assert!(
+            handle
+                .outbound()
+                .iter()
+                .all(|v| v.get("id").and_then(Value::as_i64) != Some(99)),
+            "a held interaction must not be answered by the lane itself"
+        );
+        let held = approvals.get("s1", "tc-1").unwrap();
+        assert_eq!(held.method.as_deref(), Some("x.ai/exit_plan_mode"));
+        assert_eq!(held.request["planContent"], "# Plan");
     }
 
     #[tokio::test]
@@ -750,7 +887,14 @@ mod tests {
     async fn a_detached_request_on_a_dead_link_reports_the_send_failure() {
         let (link, _handle) = FakeLink::new();
         let cancel = CancellationToken::new();
-        let client = AcpClient::spawn(link, cancel.clone(), Duration::from_secs(5));
+        let client = AcpClient::spawn(
+            link,
+            cancel.clone(),
+            Duration::from_secs(5),
+            Arc::new(ApprovalStore::new(Arc::new(
+                crate::state::Attachments::default(),
+            ))),
+        );
         cancel.cancel();
 
         assert!(matches!(
@@ -763,7 +907,14 @@ mod tests {
     async fn a_closed_link_cancels_the_token_and_fails_requests() {
         let (link, handle) = FakeLink::new();
         let cancel = CancellationToken::new();
-        let client = AcpClient::spawn(link, cancel.clone(), Duration::from_secs(5));
+        let client = AcpClient::spawn(
+            link,
+            cancel.clone(),
+            Duration::from_secs(5),
+            Arc::new(ApprovalStore::new(Arc::new(
+                crate::state::Attachments::default(),
+            ))),
+        );
         client.initialize().await.unwrap();
 
         // Dropping the handle is not enough — the link owns its own inbound sender. Cancelling

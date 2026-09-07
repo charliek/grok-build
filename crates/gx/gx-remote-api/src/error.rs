@@ -4,8 +4,8 @@
 //! gx errors with the code it already has. `error` is a stable machine code; `message` is prose and
 //! may change.
 //!
-//! C4 raised four of the plan's codes and C5 adds `not_accepting`; `unknown_approval`,
-//! `already_submitted` and `already_resolved` arrive with the approval routes in C6.
+//! C4 raised four of the plan's codes, C5 added `not_accepting`, and C6 completes the list with
+//! `unknown_approval`, `already_submitted` and `already_resolved`.
 
 use axum::Json;
 use axum::http::StatusCode;
@@ -23,12 +23,30 @@ pub enum ApiError {
     BadRequest(String),
     #[error("no session {0}")]
     UnknownSession(String),
+    /// No such open or recently-resolved interaction. Approvals are keyed by
+    /// `(sessionId, toolCallId)`, so both halves are named.
+    #[error("no approval {tool_call_id} for session {session_id}")]
+    UnknownApproval {
+        session_id: String,
+        tool_call_id: String,
+    },
+    /// This lane already put an answer for that interaction on the wire.
+    #[error("{0}")]
+    AlreadySubmitted(String),
+    /// The agent closed the interaction — our answer, another client's, or a cancel. Which one is
+    /// not observable: the leader acknowledges no individual answer.
+    #[error("{0}")]
+    AlreadyResolved(String),
     /// The session's current state does not admit this verb. Not a permission failure — the caller
     /// is authorized; the *session* is not accepting. See [`crate::policy`].
     #[error("{0}")]
     NotAccepting(String),
     /// The leader did not answer, answered an error, or is gone. From a client's point of view
     /// these are one condition: retry later.
+    ///
+    /// Also the answer to a POST against an approval this lane knows about only from a
+    /// `pending_interaction` hint: the request it would reply to has not arrived, so there is
+    /// nothing to answer *yet* — a retry, not a client error. See [`crate::routes::approvals`].
     #[error("{0}")]
     LeaderUnavailable(String),
 }
@@ -40,6 +58,9 @@ impl ApiError {
             Self::Unauthorized => "unauthorized",
             Self::BadRequest(_) => "bad_request",
             Self::UnknownSession(_) => "unknown_session",
+            Self::UnknownApproval { .. } => "unknown_approval",
+            Self::AlreadySubmitted(_) => "already_submitted",
+            Self::AlreadyResolved(_) => "already_resolved",
             Self::NotAccepting(_) => "not_accepting",
             Self::LeaderUnavailable(_) => "leader_unavailable",
         }
@@ -50,6 +71,8 @@ impl ApiError {
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::UnknownSession(_) => StatusCode::NOT_FOUND,
+            Self::UnknownApproval { .. } => StatusCode::NOT_FOUND,
+            Self::AlreadySubmitted(_) | Self::AlreadyResolved(_) => StatusCode::CONFLICT,
             Self::NotAccepting(_) => StatusCode::CONFLICT,
             Self::LeaderUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
         }
@@ -89,6 +112,24 @@ mod tests {
             (ApiError::Unauthorized, "unauthorized", 401),
             (ApiError::BadRequest("x".into()), "bad_request", 400),
             (ApiError::UnknownSession("s".into()), "unknown_session", 404),
+            (
+                ApiError::UnknownApproval {
+                    session_id: "s".into(),
+                    tool_call_id: "tc".into(),
+                },
+                "unknown_approval",
+                404,
+            ),
+            (
+                ApiError::AlreadySubmitted("x".into()),
+                "already_submitted",
+                409,
+            ),
+            (
+                ApiError::AlreadyResolved("x".into()),
+                "already_resolved",
+                409,
+            ),
             (ApiError::NotAccepting("x".into()), "not_accepting", 409),
             (
                 ApiError::LeaderUnavailable("x".into()),
@@ -100,6 +141,19 @@ mod tests {
             assert_eq!(err.code(), code);
             assert_eq!(err.status().as_u16(), status);
         }
+    }
+
+    #[test]
+    fn an_unknown_approval_names_both_halves_of_its_key() {
+        // Approvals are keyed by `(sessionId, toolCallId)`; a message naming only one of them
+        // would not tell a client which lookup missed.
+        let message = ApiError::UnknownApproval {
+            session_id: "sess-1".into(),
+            tool_call_id: "tc-9".into(),
+        }
+        .to_string();
+        assert!(message.contains("sess-1"), "{message}");
+        assert!(message.contains("tc-9"), "{message}");
     }
 
     #[test]

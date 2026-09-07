@@ -17,6 +17,7 @@ use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
 
 use crate::acp_client::AcpClient;
+use crate::approvals::ApprovalStore;
 use crate::auth::Token;
 use crate::link::{FakeLink, FakeLinkHandle};
 use crate::ring::EventRing;
@@ -36,7 +37,14 @@ fn test_app() -> (Router, FakeLinkHandle) {
 /// filling before any connection exists, because that is exactly the window a resume is for.
 fn test_app_with(sse: SseSettings, ring: EventRing) -> (Router, FakeLinkHandle) {
     let (link, handle) = FakeLink::new();
-    let acp = AcpClient::spawn(link, CancellationToken::new(), Duration::from_secs(5));
+    let attachments = Arc::new(Attachments::default());
+    let approvals = Arc::new(ApprovalStore::new(attachments.clone()));
+    let acp = AcpClient::spawn(
+        link,
+        CancellationToken::new(),
+        Duration::from_secs(5),
+        approvals.clone(),
+    );
     let state = Arc::new(AppState {
         acp,
         token: Token::from_secret(TOKEN),
@@ -45,7 +53,8 @@ fn test_app_with(sse: SseSettings, ring: EventRing) -> (Router, FakeLinkHandle) 
             leader_pid: 4242,
             instance_id: "inst-abc".into(),
         },
-        attachments: Attachments::default(),
+        attachments,
+        approvals,
         ring,
         sse,
     });
@@ -1463,5 +1472,593 @@ async fn the_ring_is_filled_from_the_live_fan_out_so_a_reconnect_resumes_from_me
             .filter(|m| *m == "session/load")
             .count(),
         1
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Approvals — the reverse-request as state a phone can answer later
+// ---------------------------------------------------------------------------
+
+/// A resident `session_id` in `activity` that attaches cleanly and accepts every write verb.
+///
+/// The approval routes attach exactly like `/history` does, so they need the same roster row and
+/// `session/load`; the write stubs are here because the interject/cancel assertions share it.
+fn stub_interactive_session(handle: &FakeLinkHandle, session_id: &str, activity: &str) {
+    handle.respond_ext_ok(
+        "x.ai/sessions/list",
+        json!({ "sessions": [roster_row(session_id, activity)] }),
+    );
+    handle.respond_ok("session/load", json!({}));
+    handle.never_respond("session/prompt");
+    handle.respond_ext_ok("x.ai/interject", json!({ "status": "queued" }));
+    handle.respond_ok(
+        "x.ai/session/updates",
+        json!({ "updates": [], "totalCount": 0, "hasMore": false }),
+    );
+}
+
+/// One interaction, as the agent really puts it on the wire, with an answer of the right shape.
+struct Interaction {
+    kind: &'static str,
+    /// Wire spelling: the three ext methods are underscored, `session/request_permission` is not.
+    wire_method: &'static str,
+    /// Everything but `sessionId`, which [`Interaction::request`] adds.
+    params: Value,
+    /// The `response` object a client POSTs, per that method's response type.
+    answer: Value,
+}
+
+impl Interaction {
+    fn request(&self, session_id: &str, rpc_id: i64) -> Value {
+        let mut params = self.params.clone();
+        params["sessionId"] = json!(session_id);
+        json!({
+            "jsonrpc": "2.0",
+            "id": rpc_id,
+            "method": self.wire_method,
+            "params": params,
+        })
+    }
+}
+
+/// All four, keyed on `tc-1` throughout. Shapes taken from the types that deserialize them:
+/// `RequestPermissionResponse` (ACP schema), `AskUserQuestionExtResponse`,
+/// `ExitPlanModeExtResponse` and `McpElicitExtResponse`.
+fn interactions() -> Vec<Interaction> {
+    vec![
+        Interaction {
+            kind: "permission",
+            wire_method: "session/request_permission",
+            params: json!({
+                // The only one of the four that nests its tool call id.
+                "toolCall": { "toolCallId": "tc-1", "title": "rm -rf build/" },
+                "options": [
+                    { "optionId": "allow-once", "name": "Allow once", "kind": "allow_once" },
+                    { "optionId": "reject-once", "name": "Reject", "kind": "reject_once" },
+                ],
+            }),
+            answer: json!({ "outcome": { "outcome": "selected", "optionId": "allow-once" } }),
+        },
+        Interaction {
+            kind: "question",
+            wire_method: "_x.ai/ask_user_question",
+            params: json!({
+                "toolCallId": "tc-1",
+                "questions": [{ "id": "q1", "question": "Which database?" }],
+                "mode": "plan",
+            }),
+            answer: json!({ "outcome": "accepted", "answers": { "q1": ["Postgres"] } }),
+        },
+        Interaction {
+            kind: "plan_approval",
+            wire_method: "_x.ai/exit_plan_mode",
+            params: json!({ "toolCallId": "tc-1", "planContent": "# Plan\n1. Do it" }),
+            // "approved", never "approve".
+            answer: json!({ "outcome": "approved" }),
+        },
+        Interaction {
+            kind: "mcp_elicitation",
+            wire_method: "_x.ai/mcp/elicit",
+            params: json!({
+                "toolCallId": "tc-1",
+                "serverName": "files",
+                "message": "Which mailbox?",
+                "mode": "form",
+                "requestedSchema": { "type": "object" },
+            }),
+            answer: json!({ "outcome": "accept", "content": { "email": "me@example.com" } }),
+        },
+    ]
+}
+
+/// The `x.ai/session_notification` the agent broadcasts when an interaction closes.
+///
+/// Snake-case `tool_call_id` because that is what `SessionUpdate`'s `rename_all = "snake_case"`
+/// actually emits for the *variant's fields* — the leader's own extractor reads it that way too.
+fn interaction_resolved(session_id: &str, tool_call_id: &str) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "method": "_x.ai/session_notification",
+        "params": {
+            "sessionId": session_id,
+            "update": { "sessionUpdate": "interaction_resolved", "tool_call_id": tool_call_id },
+        },
+    })
+}
+
+fn pending_interaction(session_id: &str, tool_call_id: &str, kind: &str) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "method": "_x.ai/session_notification",
+        "params": {
+            "sessionId": session_id,
+            "update": {
+                "sessionUpdate": "pending_interaction",
+                "tool_call_id": tool_call_id,
+                "kind": kind,
+            },
+        },
+    })
+}
+
+/// Wait for the JSON-RPC **response** the lane put on the link for reverse-request `rpc_id`.
+///
+/// Matched on "has that id and no `method`", never on the id alone: this lane numbers its own
+/// outbound *requests* from 1, so a small reverse-request id would otherwise match one of them.
+/// And it has to wait: `submit` queues the payload for the task that owns the link, so the POST can
+/// answer before the leader has seen anything.
+async fn wait_for_response(handle: &FakeLinkHandle, rpc_id: i64) -> Value {
+    tokio::time::timeout(FRAME_TIMEOUT, async {
+        loop {
+            if let Some(payload) = response_with_id(handle, rpc_id) {
+                return payload;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("the lane never answered reverse-request {rpc_id}"))
+}
+
+/// The response the lane sent for `rpc_id`, if it has sent one.
+fn response_with_id(handle: &FakeLinkHandle, rpc_id: i64) -> Option<Value> {
+    handle.outbound().into_iter().find(|payload| {
+        payload.get("method").is_none() && payload.get("id").and_then(Value::as_i64) == Some(rpc_id)
+    })
+}
+
+/// The next frame of type `event`, skipping the ones this assertion is not about.
+///
+/// `interaction_resolved` is both an approval change *and* an ordinary session notification, so a
+/// stream sees an `update` frame for it as well as the `approval` frame; which lands first is not
+/// something a client should depend on either.
+async fn next_frame_named(stream: &mut SseStream, event: &str) -> SseFrame {
+    for _ in 0..8 {
+        let frame = stream.next_frame().await;
+        if frame.is(event) {
+            return frame;
+        }
+    }
+    panic!("no `event: {event}` frame arrived");
+}
+
+fn approvals_uri(session_id: &str) -> String {
+    format!("/v1/sessions/{session_id}/approvals")
+}
+
+/// `GET …/approvals` with the crate's token, asserting 200.
+async fn list_approvals(app: &Router, session_id: &str) -> Value {
+    let (status, body) = call(app, authed_get(&approvals_uri(session_id))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    body
+}
+
+/// Poll `…/approvals` until `tool_call_id` reads `status`, or fail with what it did read.
+///
+/// Needed only for the notification-driven transitions: those travel through the broadcast and the
+/// event pump's own task, so unlike a pushed reverse-request they are not ordered against the next
+/// HTTP call by the link task alone.
+async fn wait_for_status(
+    app: &Router,
+    session_id: &str,
+    tool_call_id: &str,
+    status: &str,
+) -> Value {
+    let mut last = Value::Null;
+    let deadline = tokio::time::Instant::now() + FRAME_TIMEOUT;
+    while tokio::time::Instant::now() < deadline {
+        last = list_approvals(app, session_id).await;
+        let found = last["approvals"]
+            .as_array()
+            .and_then(|rows| rows.iter().find(|row| row["id"] == tool_call_id))
+            .cloned();
+        if let Some(found) = found
+            && found["status"] == status
+        {
+            return found;
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("approval {tool_call_id} never reached {status}: {last}");
+}
+
+/// The full life of an approval, for each of the four kinds: the request arrives on the link, the
+/// GET routes show it, the POST puts a correctly-shaped JSON-RPC response back on the link, and the
+/// agent's `interaction_resolved` — not our own POST — is what closes it.
+#[tokio::test]
+async fn every_interaction_kind_is_capturable_answerable_and_resolvable() {
+    for interaction in interactions() {
+        let (app, handle) = test_app();
+        stub_interactive_session(&handle, "sess-1", "working");
+
+        // Nothing is held before the lane has attached, so the first call is what attaches.
+        let body = list_approvals(&app, "sess-1").await;
+        assert_eq!(body["approvals"], json!([]), "{}", interaction.kind);
+
+        handle.push(interaction.request("sess-1", 9077));
+
+        // Pending, with the request verbatim and the kind the leader would have named.
+        let body = list_approvals(&app, "sess-1").await;
+        let row = &body["approvals"][0];
+        assert_eq!(row["id"], "tc-1", "{}", interaction.kind);
+        assert_eq!(row["sessionId"], "sess-1", "{}", interaction.kind);
+        assert_eq!(row["kind"], interaction.kind);
+        assert_eq!(row["status"], "pending", "{}", interaction.kind);
+        assert_eq!(
+            row["method"],
+            crate::acp_client::logical_method(interaction.wire_method),
+            "{}",
+            interaction.kind
+        );
+        assert!(row["createdAt"].is_i64(), "{}", interaction.kind);
+
+        // …and addressable one at a time.
+        let (status, single) = call(
+            &app,
+            authed_get(&format!("{}/tc-1", approvals_uri("sess-1"))),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", interaction.kind);
+        assert_eq!(single, *row, "{}", interaction.kind);
+
+        // The answer goes out as a JSON-RPC *response*: the agent's own id, the body verbatim as
+        // `result`, and no method at all.
+        let (status, body) = call(
+            &app,
+            authed_post(
+                &format!("{}/tc-1", approvals_uri("sess-1")),
+                json!({ "response": interaction.answer }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{}: {body}", interaction.kind);
+        assert_eq!(body["status"], "submitted", "{}", interaction.kind);
+
+        let answer = wait_for_response(&handle, 9077).await;
+        assert_eq!(answer["jsonrpc"], "2.0", "{}", interaction.kind);
+        assert_eq!(answer["result"], interaction.answer, "{}", interaction.kind);
+        assert!(answer.get("method").is_none(), "{}", interaction.kind);
+        assert!(answer.get("error").is_none(), "{}", interaction.kind);
+
+        // Submitted is not resolved: the agent acknowledges no individual answer.
+        let row = &list_approvals(&app, "sess-1").await["approvals"][0];
+        assert_eq!(row["status"], "submitted", "{}", interaction.kind);
+        assert!(row["submittedAt"].is_i64(), "{}", interaction.kind);
+        assert!(row.get("resolvedAt").is_none(), "{}", interaction.kind);
+
+        handle.push(interaction_resolved("sess-1", "tc-1"));
+        let row = wait_for_status(&app, "sess-1", "tc-1", "resolved").await;
+        assert!(row["resolvedAt"].is_i64(), "{}", interaction.kind);
+    }
+}
+
+#[tokio::test]
+async fn a_tui_that_answers_first_leaves_the_phone_a_409() {
+    let (app, handle) = test_app();
+    stub_interactive_session(&handle, "sess-1", "working");
+    list_approvals(&app, "sess-1").await;
+
+    handle.push(interactions()[0].request("sess-1", 9005));
+    list_approvals(&app, "sess-1").await;
+    // The TUI answered on its own connection; all this lane ever sees is the resolution.
+    handle.push(interaction_resolved("sess-1", "tc-1"));
+    wait_for_status(&app, "sess-1", "tc-1", "resolved").await;
+
+    let (status, body) = call(
+        &app,
+        authed_post(
+            &format!("{}/tc-1", approvals_uri("sess-1")),
+            json!({ "response": { "outcome": { "outcome": "cancelled" } } }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"], "already_resolved");
+    assert!(
+        response_with_id(&handle, 9005).is_none(),
+        "answering a resolved interaction would be a stale write"
+    );
+}
+
+#[tokio::test]
+async fn a_second_post_is_a_409_and_is_not_sent_twice() {
+    let (app, handle) = test_app();
+    stub_interactive_session(&handle, "sess-1", "working");
+    list_approvals(&app, "sess-1").await;
+    handle.push(interactions()[0].request("sess-1", 9005));
+    list_approvals(&app, "sess-1").await;
+
+    let answer =
+        json!({ "response": { "outcome": { "outcome": "selected", "optionId": "allow-once" } } });
+    let uri = format!("{}/tc-1", approvals_uri("sess-1"));
+    let (status, _) = call(&app, authed_post(&uri, answer.clone())).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+
+    let (status, body) = call(&app, authed_post(&uri, answer)).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"], "already_submitted");
+    // The first answer is on the wire…
+    wait_for_response(&handle, 9005).await;
+    // …and exactly once.
+    assert_eq!(
+        handle
+            .outbound()
+            .iter()
+            .filter(|payload| payload.get("method").is_none()
+                && payload.get("id").and_then(Value::as_i64) == Some(9005))
+            .count(),
+        1,
+        "the agent must never see two answers from this lane"
+    );
+}
+
+#[tokio::test]
+async fn a_body_that_is_not_an_object_is_a_400_before_the_lookup() {
+    let (app, handle) = test_app();
+    stub_interactive_session(&handle, "sess-1", "working");
+    list_approvals(&app, "sess-1").await;
+    handle.push(interactions()[0].request("sess-1", 9005));
+    list_approvals(&app, "sess-1").await;
+
+    let uri = format!("{}/tc-1", approvals_uri("sess-1"));
+    for body in [
+        json!({ "response": "allow-once" }),
+        json!({ "response": ["allow-once"] }),
+        json!({ "response": null }),
+        // `response` is required: an empty body is not "answer with nothing".
+        json!({}),
+    ] {
+        let (status, answer) = call(&app, authed_post(&uri, body.clone())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(answer["error"], "bad_request", "{body}");
+    }
+    assert!(
+        response_with_id(&handle, 9005).is_none(),
+        "a malformed answer must not reach the agent, which would cancel the tool call over it"
+    );
+    // Still answerable afterwards.
+    assert_eq!(
+        list_approvals(&app, "sess-1").await["approvals"][0]["status"],
+        "pending"
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_tool_call_id_is_404_on_both_verbs() {
+    let (app, handle) = test_app();
+    stub_interactive_session(&handle, "sess-1", "working");
+
+    let (status, body) = call(
+        &app,
+        authed_get(&format!("{}/tc-nope", approvals_uri("sess-1"))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["error"], "unknown_approval");
+    assert!(
+        body["message"].as_str().unwrap().contains("sess-1"),
+        "{body}"
+    );
+
+    let (status, body) = call(
+        &app,
+        authed_post(
+            &format!("{}/tc-nope", approvals_uri("sess-1")),
+            json!({ "response": { "outcome": "approved" } }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["error"], "unknown_approval");
+
+    // And a session that does not exist is still `unknown_session`, resolved before approvals.
+    let (app, handle) = test_app();
+    stub_no_such_session(&handle);
+    let (status, body) = call(&app, authed_get(&approvals_uri("sess-9"))).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["error"], "unknown_session");
+}
+
+#[tokio::test]
+async fn a_hint_that_arrives_before_its_request_becomes_one_approval_not_two() {
+    let (app, handle) = test_app();
+    stub_interactive_session(&handle, "sess-1", "working");
+    list_approvals(&app, "sess-1").await;
+
+    // `PendingInteractionGuard::new` broadcasts this *before* the gateway sends the request.
+    handle.push(pending_interaction("sess-1", "tc-1", "plan_approval"));
+    let row = wait_for_status(&app, "sess-1", "tc-1", "pending").await;
+    assert_eq!(row["kind"], "plan_approval", "the hint carries the kind");
+    assert_eq!(row["method"], Value::Null, "…but not the request");
+    assert_eq!(row["request"], Value::Null);
+
+    // Answering a placeholder is a retry-later: there is no id to respond to yet.
+    let uri = format!("{}/tc-1", approvals_uri("sess-1"));
+    let (status, body) = call(
+        &app,
+        authed_post(&uri, json!({ "response": { "outcome": "approved" } })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["error"], "leader_unavailable");
+
+    handle.push(interactions()[2].request("sess-1", 9021));
+    let body = list_approvals(&app, "sess-1").await;
+    assert_eq!(
+        body["approvals"].as_array().unwrap().len(),
+        1,
+        "the request must merge into the hint's entry, not add another: {body}"
+    );
+    assert_eq!(body["approvals"][0]["method"], "x.ai/exit_plan_mode");
+    assert_eq!(body["approvals"][0]["createdAt"], row["createdAt"]);
+
+    let (status, _) = call(
+        &app,
+        authed_post(&uri, json!({ "response": { "outcome": "approved" } })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::ACCEPTED,
+        "answerable once it has arrived"
+    );
+}
+
+#[tokio::test]
+async fn a_held_approval_denies_an_interject_a_stale_roster_would_have_allowed() {
+    let (app, handle) = test_app();
+    // The roster still says `working`: it lags the turn boundary by up to one broadcast, and this
+    // is exactly the window `effective_activity` exists to close.
+    stub_interactive_session(&handle, "sess-1", "working");
+    list_approvals(&app, "sess-1").await;
+    handle.push(interactions()[0].request("sess-1", 9005));
+    list_approvals(&app, "sess-1").await;
+
+    let (status, body) = call(
+        &app,
+        authed_post(
+            "/v1/sessions/sess-1/messages",
+            json!({ "text": "hi", "mode": "interject" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"], "not_accepting");
+    let message = body["message"].as_str().unwrap();
+    assert!(message.contains("needs_input"), "{message}");
+    assert!(message.contains("pending approval"), "{message}");
+
+    // The two verbs `needs_input` does admit still work.
+    for request in [
+        authed_post("/v1/sessions/sess-1/messages", json!({ "text": "queued" })),
+        authed_post("/v1/sessions/sess-1/cancel", json!({})),
+    ] {
+        let (status, body) = call(&app, request).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    }
+}
+
+#[tokio::test]
+async fn an_attached_sessions_pending_count_is_exact_while_an_unattached_ones_is_not() {
+    let (app, handle) = test_app();
+    stub_interactive_session(&handle, "sess-1", "needs_input");
+
+    // Never touched by this lane: all it can do is render the roster's bit, and say so.
+    let (status, body) = call(&app, authed_get("/v1/sessions")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["sessions"][0]["pendingApprovals"], 1);
+    assert_eq!(body["sessions"][0]["approximate"], true);
+    assert_eq!(body["sessions"][0]["attached"], false);
+
+    // Attached, holding nothing: an exact zero, even though the roster still says needs_input.
+    list_approvals(&app, "sess-1").await;
+    let (_, body) = call(&app, authed_get("/v1/sessions/sess-1")).await;
+    assert_eq!(body["pendingApprovals"], 0);
+    assert_eq!(body["approximate"], false);
+    assert_eq!(body["attached"], true);
+
+    // Two at once — a count the roster's single bit could not have expressed.
+    handle.push(interactions()[0].request("sess-1", 9005));
+    handle.push(interactions()[1].request("sess-2-unrelated", 9006));
+    let mut second = interactions()[1].request("sess-1", 9007);
+    second["params"]["toolCallId"] = json!("tc-2");
+    handle.push(second);
+    list_approvals(&app, "sess-1").await;
+
+    let (_, body) = call(&app, authed_get("/v1/sessions/sess-1")).await;
+    assert_eq!(body["pendingApprovals"], 2);
+    assert_eq!(body["approximate"], false);
+}
+
+#[tokio::test]
+async fn an_approval_reaches_the_event_stream_without_an_id_line() {
+    let (app, handle) = test_app_with(test_sse(256), EventRing::new());
+    stub_interactive_session(&handle, "sess-1", "working");
+
+    let (status, _, mut stream) = SseStream::open(&app, events_request("sess-1", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    handle.push(interactions()[0].request("sess-1", 9005));
+    let frame = next_frame_named(&mut stream, "approval").await;
+    assert_eq!(
+        frame.id, None,
+        "an approval is a state invalidation, not a position a browser may resume from"
+    );
+    let approval = frame.json();
+    assert_eq!(approval["id"], "tc-1");
+    assert_eq!(approval["status"], "pending");
+    assert_eq!(approval["kind"], "permission");
+
+    // The same resource shape the GET returns, so a client parses one thing.
+    assert_eq!(
+        approval,
+        list_approvals(&app, "sess-1").await["approvals"][0]
+    );
+
+    // Answering and resolving are changes too.
+    let (status, _) = call(
+        &app,
+        authed_post(
+            &format!("{}/tc-1", approvals_uri("sess-1")),
+            json!({ "response": { "outcome": { "outcome": "selected", "optionId": "allow-once" } } }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let frame = next_frame_named(&mut stream, "approval").await;
+    assert_eq!(frame.json()["status"], "submitted");
+    assert_eq!(frame.id, None);
+
+    handle.push(interaction_resolved("sess-1", "tc-1"));
+    let frame = next_frame_named(&mut stream, "approval").await;
+    assert_eq!(frame.json()["status"], "resolved");
+    assert_eq!(frame.id, None);
+}
+
+#[tokio::test]
+async fn another_sessions_approval_is_not_this_streams_business() {
+    let (app, handle) = test_app_with(test_sse(256), EventRing::new());
+    handle.respond_ext_ok(
+        "x.ai/sessions/list",
+        json!({ "sessions": [roster_row("sess-1", "working"), roster_row("sess-2", "working")] }),
+    );
+    handle.respond_ok("session/load", json!({}));
+    handle.respond_ok(
+        "x.ai/session/updates",
+        json!({ "updates": [], "totalCount": 0, "hasMore": false }),
+    );
+
+    // Attach both, so the store would capture either one.
+    list_approvals(&app, "sess-1").await;
+    list_approvals(&app, "sess-2").await;
+
+    let (_, _, mut stream) = SseStream::open(&app, events_request("sess-1", None)).await;
+    handle.push(interactions()[0].request("sess-2", 9005));
+    stream.expect_quiet().await;
+
+    // It was captured — just not for this stream.
+    assert_eq!(
+        list_approvals(&app, "sess-2").await["approvals"][0]["id"],
+        "tc-1"
     );
 }

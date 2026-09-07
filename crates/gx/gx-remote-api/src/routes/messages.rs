@@ -28,6 +28,7 @@ use xai_message_delivery_core::Operation;
 
 use crate::error::ApiError;
 use crate::policy;
+use crate::routes::parse_body;
 use crate::routes::sessions::{ensure_attached, resolve_session};
 use crate::state::AppState;
 
@@ -105,7 +106,7 @@ pub async fn post_message(
     ensure_attached(&state, &id, &session.cwd).await?;
     policy::authorize(
         &id,
-        &policy::effective_activity(&id, &session.activity),
+        &policy::effective_activity(&state.approvals, &id, &session.activity),
         mode.operation(),
     )?;
 
@@ -146,7 +147,7 @@ pub async fn post_cancel(
     ensure_attached(&state, &id, &session.cwd).await?;
     policy::authorize(
         &id,
-        &policy::effective_activity(&id, &session.activity),
+        &policy::effective_activity(&state.approvals, &id, &session.activity),
         Operation::InterruptAndSend,
     )?;
 
@@ -221,16 +222,6 @@ fn interject_status(response: &Value) -> &str {
 
 fn accepted(body: Value) -> (StatusCode, Json<Value>) {
     (StatusCode::ACCEPTED, Json(body))
-}
-
-/// Parse a request body into `T`, reporting a failure in *this* API's error envelope.
-///
-/// Deliberately not axum's `Json<T>` extractor: its rejection is axum's own shape, so a phone with
-/// a typo in its body would get an error it has no parser for, on the one code path where a clear
-/// message matters most.
-fn parse_body<T: serde::de::DeserializeOwned>(body: &Bytes) -> Result<T, ApiError> {
-    serde_json::from_slice(body)
-        .map_err(|err| ApiError::BadRequest(format!("could not parse the request body: {err}")))
 }
 
 #[cfg(test)]

@@ -40,8 +40,12 @@ pub struct SessionSummary {
     pub attached: bool,
     /// Number of interactions waiting for an answer.
     pub pending_approvals: u32,
-    /// `true` while `pendingApprovals` is inferred from `activity` rather than counted. C6 keeps a
-    /// real per-session map and clears this flag for attached sessions.
+    /// `true` while `pendingApprovals` is inferred from `activity` rather than counted.
+    ///
+    /// A session this lane has attached is counted from the approval store and reads `false`; one
+    /// it has not is the roster's `needs_input` bit rendered as 0-or-1, and stays `true`. The flag
+    /// is not decoration: a client deciding whether to show "1 approval" or "needs your attention"
+    /// has to know which it is holding.
     pub approximate: bool,
 }
 
@@ -54,14 +58,10 @@ pub struct SessionList {
 pub async fn list_sessions(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<SessionList>, ApiError> {
-    let attached = state.attachments.attached_ids();
     let sessions = fetch_roster(&state)
         .await?
-        .into_iter()
-        .map(|entry| {
-            let attached = attached.contains(&entry.session_id);
-            summarize_entry(&entry, attached)
-        })
+        .iter()
+        .map(|entry| summarize(&state, entry))
         .collect();
     Ok(Json(SessionList { sessions }))
 }
@@ -80,17 +80,17 @@ pub async fn get_session(
 /// carries resident sessions plus the most recent persisted summaries, while `x.ai/session/list` is
 /// the full local listing.
 pub async fn resolve_session(state: &Arc<AppState>, id: &str) -> Result<SessionSummary, ApiError> {
-    let attached = state.attachments.is_attached(id);
-
     if let Some(entry) = fetch_roster(state)
         .await?
         .into_iter()
         .find(|e| e.session_id == id)
     {
-        return Ok(summarize_entry(&entry, attached));
+        return Ok(summarize(state, &entry));
     }
 
-    if let Some(summary) = unified_list_fallback(state, id, attached).await? {
+    if let Some(summary) =
+        unified_list_fallback(state, id, state.attachments.is_attached(id)).await?
+    {
         return Ok(summary);
     }
 
@@ -162,11 +162,18 @@ async fn fetch_roster(state: &Arc<AppState>) -> Result<Vec<RosterEntry>, ApiErro
         .collect())
 }
 
-/// One roster row as this API renders it.
+/// One roster row as this API renders it, against the lane's own view of the session.
 ///
-/// Shared with the SSE lane, which renders an `x.ai/sessions/changed` upsert as an `event: session`
-/// frame — the same summary the roster GET returns, so a client parses one shape.
-pub fn summarize_entry(entry: &RosterEntry, attached: bool) -> SessionSummary {
+/// The single place a summary is built — the roster GET, the per-session GET, and the SSE lane's
+/// `event: session` frame all come through here, so a client parses one shape and the three can
+/// never disagree about `attached` or `pendingApprovals`.
+pub fn summarize(state: &AppState, entry: &RosterEntry) -> SessionSummary {
+    let attached = state.attachments.is_attached(&entry.session_id);
+    // Counted only where counting means something. For a session this lane never attached, the
+    // approval store is empty because nothing was ever captured — not because nothing is pending —
+    // so the roster's own bit is the honest answer, flagged as the approximation it is.
+    let counted = attached.then(|| state.approvals.pending_count(&entry.session_id));
+
     SessionSummary {
         session_id: entry.session_id.clone(),
         title: entry.title.clone(),
@@ -176,9 +183,9 @@ pub fn summarize_entry(entry: &RosterEntry, attached: bool) -> SessionSummary {
         model_id: entry.model_id.clone(),
         last_change_unix_ms: entry.last_change_unix_ms,
         attached,
-        // C6 replaces this with the real pending-interaction map for attached sessions.
-        pending_approvals: u32::from(entry.activity == RosterActivity::NeedsInput),
-        approximate: true,
+        pending_approvals: counted
+            .unwrap_or_else(|| u32::from(entry.activity == RosterActivity::NeedsInput)),
+        approximate: counted.is_none(),
     }
 }
 
@@ -281,8 +288,35 @@ mod tests {
         assert_eq!(activity_wire_name(RosterActivity::Idle), "idle");
     }
 
-    #[test]
-    fn needs_input_is_the_only_activity_that_infers_a_pending_approval() {
+    /// An `AppState` with no leader behind it: enough to exercise [`summarize`], which only reads
+    /// the attachment set and the approval store.
+    fn state_for_summaries() -> Arc<AppState> {
+        let attachments = Arc::new(crate::state::Attachments::default());
+        let approvals = Arc::new(crate::approvals::ApprovalStore::new(attachments.clone()));
+        let (link, _handle) = crate::link::FakeLink::new();
+        Arc::new(AppState {
+            acp: crate::acp_client::AcpClient::spawn(
+                link,
+                tokio_util::sync::CancellationToken::new(),
+                std::time::Duration::from_secs(5),
+                approvals.clone(),
+            ),
+            token: crate::auth::Token::from_secret("0000"),
+            health: crate::state::HealthInfo {
+                version: "test".into(),
+                leader_pid: 1,
+                instance_id: "inst".into(),
+            },
+            attachments,
+            approvals,
+            ring: crate::ring::EventRing::new(),
+            sse: crate::state::SseSettings::default(),
+        })
+    }
+
+    #[tokio::test]
+    async fn an_unattached_session_falls_back_to_the_roster_bit_and_says_so() {
+        let state = state_for_summaries();
         for activity in [
             RosterActivity::Working,
             RosterActivity::Idle,
@@ -290,14 +324,41 @@ mod tests {
             RosterActivity::Completed,
             RosterActivity::Dead,
         ] {
-            let summary = summarize_entry(&roster_entry(activity), false);
+            let summary = summarize(&state, &roster_entry(activity));
             assert_eq!(summary.pending_approvals, 0, "{activity:?}");
-            assert!(summary.approximate);
+            assert!(summary.approximate, "{activity:?}");
+            assert!(!summary.attached, "{activity:?}");
         }
-        let summary = summarize_entry(&roster_entry(RosterActivity::NeedsInput), true);
+        let summary = summarize(&state, &roster_entry(RosterActivity::NeedsInput));
         assert_eq!(summary.pending_approvals, 1);
-        assert!(summary.approximate);
+        assert!(summary.approximate, "the roster's bit is not a count");
+    }
+
+    #[tokio::test]
+    async fn an_attached_session_is_counted_from_the_store_and_says_that_too() {
+        let state = state_for_summaries();
+        state.attachments.mark_attached("sess-1");
+
+        // Attached, nothing captured: an exact zero, even though the roster still says needs_input.
+        let summary = summarize(&state, &roster_entry(RosterActivity::NeedsInput));
+        assert_eq!(summary.pending_approvals, 0);
+        assert!(!summary.approximate);
         assert!(summary.attached);
+
+        for id in ["tc-1", "tc-2"] {
+            state
+                .approvals
+                .intercept(
+                    crate::approvals::REQUEST_PERMISSION,
+                    &json!(1),
+                    &json!({ "sessionId": "sess-1", "toolCall": { "toolCallId": id } }),
+                )
+                .unwrap();
+        }
+        // Two at once is a count the roster's single bit cannot express.
+        let summary = summarize(&state, &roster_entry(RosterActivity::Working));
+        assert_eq!(summary.pending_approvals, 2);
+        assert!(!summary.approximate);
     }
 
     #[test]

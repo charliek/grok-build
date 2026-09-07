@@ -1,5 +1,6 @@
 //! Route table and the bearer-token gate.
 
+pub mod approvals;
 pub mod events;
 pub mod health;
 pub mod history;
@@ -8,6 +9,7 @@ pub mod sessions;
 
 use std::sync::Arc;
 
+use axum::body::Bytes;
 use axum::extract::{Request, State};
 use axum::middleware::{self, Next};
 use axum::response::Response;
@@ -17,7 +19,7 @@ use axum::{Router, http};
 use crate::error::ApiError;
 use crate::state::AppState;
 
-/// Every route the lane serves through C5.
+/// Every route the lane serves through C6.
 ///
 /// `/v1/healthz` is registered on a separate router and merged in, so the token layer — attached
 /// with `route_layer`, which only runs on a matched route — cannot reach it. That is the plan's
@@ -34,6 +36,14 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/sessions/{id}/events", get(events::get_events))
         .route("/v1/sessions/{id}/messages", post(messages::post_message))
         .route("/v1/sessions/{id}/cancel", post(messages::post_cancel))
+        .route(
+            "/v1/sessions/{id}/approvals",
+            get(approvals::list_approvals),
+        )
+        .route(
+            "/v1/sessions/{id}/approvals/{tool_call_id}",
+            get(approvals::get_approval).post(approvals::post_approval),
+        )
         .route_layer(middleware::from_fn_with_state(state.clone(), require_token));
 
     Router::new()
@@ -60,6 +70,16 @@ async fn require_token(
         // Same answer for absent and wrong: nothing here should help someone guess.
         _ => Err(ApiError::Unauthorized),
     }
+}
+
+/// Parse a request body into `T`, reporting a failure in *this* API's error envelope.
+///
+/// Deliberately not axum's `Json<T>` extractor: its rejection is axum's own shape, so a phone with
+/// a typo in its body would get an error it has no parser for, on the one code path where a clear
+/// message matters most.
+pub(crate) fn parse_body<T: serde::de::DeserializeOwned>(body: &Bytes) -> Result<T, ApiError> {
+    serde_json::from_slice(body)
+        .map_err(|err| ApiError::BadRequest(format!("could not parse the request body: {err}")))
 }
 
 /// The token out of an `Authorization: Bearer …` header, if it is well formed.

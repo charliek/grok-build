@@ -24,6 +24,9 @@
 //! | `idle`, `completed` | allow | deny | deny |
 //! | `dormant`, `dead` | allow (the attach that precedes it makes the session resident) | deny | deny |
 //!
+//! The activity that table is read with is [`effective_activity`], not the roster's own: a session
+//! this lane is holding an unanswered interaction for is `needs_input` whatever the roster says.
+//!
 //! Mapping `POST …/cancel` to [`Operation::InterruptAndSend`] is a vocabulary choice and is
 //! recorded as one: the lane sends a bare `session/cancel` notification with nothing following it.
 //! There is no "interrupt-only" operation in the vocabulary, and inventing one here would put a
@@ -31,6 +34,7 @@
 
 use xai_message_delivery_core::{Operation, OperationSet, Principal, authorize_operation};
 
+use crate::approvals::ApprovalStore;
 use crate::error::ApiError;
 
 /// Wire spellings of [`xai_grok_shell::agent::roster::RosterActivity`], which is what a
@@ -90,15 +94,23 @@ pub fn authorize(session_id: &str, activity: &str, operation: Operation) -> Resu
 
 /// The activity the policy actually evaluates.
 ///
-/// **C6 seam.** The roster is a cached projection and lags a turn boundary by up to one broadcast,
-/// so a session that has just raised a permission prompt can still read `working` here. C6 keeps a
-/// live pending-interaction map per session; when it lands, a session with a pending interaction
-/// reports [`activity::NEEDS_INPUT`] from this function regardless of what the roster says, which
-/// is what turns "interject into a blocked turn" from a silent no-op into a `409` that names the
-/// approval. Until then the roster is the only signal there is.
-pub fn effective_activity(session_id: &str, roster_activity: &str) -> String {
-    // C6: `if state.approvals.has_pending(session_id) { return NEEDS_INPUT.into() }`
-    let _ = session_id;
+/// The roster is a cached projection and lags a turn boundary by up to one broadcast, so a session
+/// that has just raised a permission prompt can still read `working` here. The approval store does
+/// not lag: it holds the reverse-request itself. So a session with a pending interaction is
+/// [`activity::NEEDS_INPUT`] whatever the roster says, which is what turns "interject into a
+/// blocked turn" from a silent no-op into a `409` that names the approval.
+///
+/// The override only ever moves a session *into* `needs_input`, never out of it: an empty store is
+/// no evidence that nothing is pending — the lane may simply not have attached — so the roster
+/// still speaks for every session this lane holds no interaction for.
+pub fn effective_activity(
+    approvals: &ApprovalStore,
+    session_id: &str,
+    roster_activity: &str,
+) -> String {
+    if approvals.has_pending(session_id) {
+        return activity::NEEDS_INPUT.to_string();
+    }
     roster_activity.to_string()
 }
 
@@ -238,9 +250,66 @@ mod tests {
         }
     }
 
+    /// A store holding one unanswered `session/request_permission` for `session_id`.
+    fn store_with_a_pending_approval(session_id: &str) -> ApprovalStore {
+        let attachments = std::sync::Arc::new(crate::state::Attachments::default());
+        attachments.mark_attached(session_id);
+        let store = ApprovalStore::new(attachments);
+        store
+            .intercept(
+                crate::approvals::REQUEST_PERMISSION,
+                &serde_json::json!(1),
+                &serde_json::json!({
+                    "sessionId": session_id,
+                    "toolCall": { "toolCallId": "tc-1" },
+                }),
+            )
+            .expect("the store must take custody of an attached session's interaction");
+        store
+    }
+
     #[test]
-    fn the_c6_seam_is_a_pass_through_until_the_approvals_map_exists() {
-        assert_eq!(effective_activity("s", activity::WORKING), "working");
-        assert_eq!(effective_activity("s", activity::IDLE), "idle");
+    fn a_pending_approval_outranks_whatever_the_roster_says() {
+        let store = store_with_a_pending_approval("sess-1");
+        for stale in [
+            activity::WORKING,
+            activity::IDLE,
+            activity::COMPLETED,
+            activity::DORMANT,
+        ] {
+            assert_eq!(
+                effective_activity(&store, "sess-1", stale),
+                activity::NEEDS_INPUT,
+                "the roster said {stale}, but the lane is holding the request itself"
+            );
+        }
+    }
+
+    #[test]
+    fn without_a_pending_approval_the_roster_still_speaks() {
+        let store = store_with_a_pending_approval("sess-1");
+        // An empty store is not evidence that nothing is pending — this lane may never have
+        // attached — so it must not pull a session *out* of needs_input.
+        assert_eq!(
+            effective_activity(&store, "sess-other", activity::NEEDS_INPUT),
+            activity::NEEDS_INPUT
+        );
+        assert_eq!(
+            effective_activity(&store, "sess-other", activity::WORKING),
+            activity::WORKING
+        );
+    }
+
+    #[test]
+    fn a_held_approval_is_what_denies_an_interject() {
+        // The end-to-end point of the override: a stale `working` row would have allowed this.
+        let store = store_with_a_pending_approval("sess-1");
+        let activity = effective_activity(&store, "sess-1", activity::WORKING);
+        let err = authorize("sess-1", &activity, Operation::Interject).unwrap_err();
+        assert_eq!(err.code(), "not_accepting");
+        assert!(err.to_string().contains("pending approval"), "{err}");
+        // Cancel is still allowed while an approval is pending.
+        assert!(authorize("sess-1", &activity, Operation::InterruptAndSend).is_ok());
+        assert!(authorize("sess-1", &activity, Operation::Queue).is_ok());
     }
 }

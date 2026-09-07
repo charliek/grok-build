@@ -35,8 +35,12 @@
 //! `POST /v1/sessions/{id}/messages` and `POST /v1/sessions/{id}/cancel` are the write verbs, each
 //! admitted by the session-state table in [`policy`].
 //!
-//! **C6** brings approvals: the reverse-request branch in [`acp_client`] and the seam in
-//! [`routes::events`] are where they land.
+//! **C6** brings approvals. An approval is an agent→client **reverse-request** that must be
+//! answered on a live connection, which is precisely what a phone does not have; [`approvals`]
+//! keeps the request and its JSON-RPC id as addressable state, `GET`/`POST
+//! /v1/sessions/{id}/approvals[/{toolCallId}]` read and answer it over whatever connection the
+//! client has now, and the change shows up as `event: approval` on the stream. A pending entry also
+//! overrides the roster's activity in [`policy`], because the roster lags and an approval does not.
 //!
 //! # Accepted risks
 //!
@@ -60,6 +64,7 @@
 //! [`ClientMode::Stdio`]: xai_grok_shell::leader::ClientMode::Stdio
 
 pub mod acp_client;
+pub mod approvals;
 pub mod auth;
 pub mod discovery;
 pub mod envelope;
@@ -84,6 +89,7 @@ use tracing::{info, warn};
 use xai_grok_shell::leader::{ClientCapabilities, ClientMode, LeaderClient};
 
 use crate::acp_client::{AcpClient, DEFAULT_REQUEST_TIMEOUT};
+use crate::approvals::ApprovalStore;
 use crate::link::ChannelLink;
 use crate::ring::EventRing;
 use crate::state::{AppState, Attachments, HealthInfo, SseSettings, spawn_event_pump};
@@ -199,12 +205,18 @@ pub async fn serve(config: Config, cancel: CancellationToken) -> anyhow::Result<
     let token = auth::load_or_create_token(&config.grok_home)?;
     let leader = connect_to_leader(&config.socket_path, &cancel).await?;
 
+    // Both exist before the link task does: an interaction reverse-request can arrive on the first
+    // millisecond of the connection, and the store is what decides whether to hold it or refuse it.
+    let attachments = Arc::new(Attachments::default());
+    let approvals = Arc::new(ApprovalStore::new(attachments.clone()));
+
     // Sharing (not cloning) the token means a closed link cancels the caller's token too, which is
     // how the hosting task learns the lane is finished.
     let acp = AcpClient::spawn(
         ChannelLink::from_leader_client(leader),
         cancel.clone(),
         config.request_timeout,
+        approvals.clone(),
     );
     // From here on, every return path — `?`, panic-unwind, or the normal one — takes the ACP task
     // down with it. See [`CancelOnDrop`].
@@ -227,7 +239,8 @@ pub async fn serve(config: Config, cancel: CancellationToken) -> anyhow::Result<
             leader_pid: config.leader_pid,
             instance_id: instance_id.clone(),
         },
-        attachments: Attachments::default(),
+        attachments,
+        approvals,
         ring: EventRing::new(),
         sse: config.sse.clone(),
     });
@@ -386,7 +399,12 @@ mod tests {
         // each must leave the ACP task cancelled rather than registered with the leader forever.
         let cancel = CancellationToken::new();
         let (link, _handle) = crate::link::FakeLink::new();
-        let acp = AcpClient::spawn(link, cancel.clone(), Duration::from_secs(5));
+        let acp = AcpClient::spawn(
+            link,
+            cancel.clone(),
+            Duration::from_secs(5),
+            Arc::new(ApprovalStore::new(Arc::new(Attachments::default()))),
+        );
 
         async fn fails_after_the_spawn(cancel: CancellationToken) -> anyhow::Result<()> {
             let _acp_task = CancelOnDrop(cancel);

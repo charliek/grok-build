@@ -6,7 +6,7 @@
 //! |---|---|---|---|
 //! | `update` | the full `eventId`, when the frame has one | [`NormalizedEnvelope`] | one session event, same shape `/history` returns |
 //! | `session` | never | the session's summary row | the roster changed; re-fetch `/v1/sessions/{id}` |
-//! | `approval` | never | the approval resource | **C6**; see [`approval_seam`] |
+//! | `approval` | never | the approval resource | an interaction opened, was answered, or resolved |
 //! | `reset` | never | `{"reason": …}` | the client's view is not resumable; re-fetch |
 //!
 //! Only `update` carries an `id:`, and it carries the **whole** opaque string (`01a0…-57`), never
@@ -43,11 +43,12 @@ use tracing::warn;
 use xai_grok_shell::agent::roster::{RosterChanged, RosterEntry};
 
 use crate::acp_client::Notification;
+use crate::approvals::Approval;
 use crate::envelope::NormalizedEnvelope;
 use crate::error::ApiError;
 use crate::ring::split_event_id;
 use crate::routes::history::fetch_updates;
-use crate::routes::sessions::{SessionSummary, ensure_attached, resolve_session, summarize_entry};
+use crate::routes::sessions::{SessionSummary, ensure_attached, resolve_session, summarize};
 use crate::state::AppState;
 
 /// The two reasons a stream tells its client to start over.
@@ -78,6 +79,7 @@ const NEWEST_PROBE_TAIL: i64 = -64;
 enum Frame {
     Update(Arc<NormalizedEnvelope>),
     Session(Value),
+    Approval(Arc<Approval>),
     Reset(&'static str),
 }
 
@@ -89,6 +91,7 @@ impl Frame {
                 json_event("update", id, &*envelope)
             }
             Self::Session(value) => json_event("session", None, &value),
+            Self::Approval(approval) => json_event("approval", None, &*approval),
             Self::Reset(reason) => json_event("reset", None, &json!({ "reason": reason })),
         }
     }
@@ -139,6 +142,9 @@ pub async fn get_events(
     // being computed is then either already in the replay or still in this receiver; the
     // `last_emitted` counter below decides which, so nothing is lost and nothing is duplicated.
     let live = state.acp.subscribe();
+    // Approvals are a separate stream because they are not notifications at all: a reverse-request
+    // never reaches the notification fan-out, and a POST that answers one happens on an HTTP task.
+    let approvals = state.approvals.subscribe();
 
     let cursor = headers
         .get("last-event-id")
@@ -161,6 +167,7 @@ pub async fn get_events(
         },
         opening,
         live,
+        approvals,
         tx,
     ));
 
@@ -201,8 +208,11 @@ async fn pump(
     mut streamer: Streamer,
     opening: Vec<Frame>,
     mut live: tokio::sync::broadcast::Receiver<Notification>,
+    mut approvals: tokio::sync::broadcast::Receiver<Approval>,
     tx: mpsc::Sender<Result<Event, Infallible>>,
 ) {
+    use tokio::sync::broadcast::error::RecvError;
+
     for frame in opening {
         if tx.send(Ok(frame.into_event())).await.is_err() {
             return; // client hung up mid-replay
@@ -227,35 +237,54 @@ async fn pump(
             continue;
         }
 
-        let received = tokio::select! {
+        let frame = tokio::select! {
             () = cancel.cancelled() => return,
             () = tx.closed() => return,
-            received = live.recv() => received,
+            received = live.recv() => match received {
+                Ok(notification) => streamer.frame_for(&notification),
+                // The shared broadcast ring wrapped past this connection: the client's view has a
+                // hole, which is the same condition as a full queue and gets the same answer.
+                Err(RecvError::Lagged(_)) => { overflowed = !told; continue }
+                Err(RecvError::Closed) => return,
+            },
+            received = approvals.recv() => match received {
+                Ok(approval) => streamer.approval_frame(approval),
+                // An approval this connection never saw open may already be answered; a re-fetch of
+                // `/approvals` is exactly what `reset` asks for.
+                Err(RecvError::Lagged(_)) => { overflowed = !told; continue }
+                // Unreachable while this task holds `state`, which owns the store and its sender.
+                Err(RecvError::Closed) => return,
+            },
         };
-        match received {
-            Ok(notification) => {
-                let Some(frame) = streamer.frame_for(&notification) else {
-                    continue;
-                };
-                match tx.try_send(Ok(frame.into_event())) {
-                    // Delivered: the client is current again, so the next drop is a new episode.
-                    Ok(()) => told = false,
-                    Err(mpsc::error::TrySendError::Full(_)) => overflowed = !told,
-                    Err(mpsc::error::TrySendError::Closed(_)) => return,
-                }
-            }
-            // The shared broadcast ring wrapped past this connection: same condition, same answer.
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => overflowed = !told,
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+        let Some(frame) = frame else {
+            continue;
+        };
+        match tx.try_send(Ok(frame.into_event())) {
+            // Delivered: the client is current again, so the next drop is a new episode.
+            Ok(()) => told = false,
+            Err(mpsc::error::TrySendError::Full(_)) => overflowed = !told,
+            Err(mpsc::error::TrySendError::Closed(_)) => return,
         }
     }
 }
 
 impl Streamer {
+    /// `event: approval` for this session's approvals, and nothing for anyone else's.
+    ///
+    /// A **state invalidation**, exactly like `event: session`: it carries the approval resource
+    /// the GET routes return and deliberately no `id:` line, because an approval is not a position
+    /// in the session's event history and a browser must never resume from one.
+    ///
+    /// Every create, submit and resolve produces one. `pending_interaction` /
+    /// `interaction_resolved` do *not* produce one from the notification path — they reach the
+    /// store through [`crate::state::spawn_event_pump`] and come back out here as approval changes,
+    /// so a client sees one frame per change rather than two views of it.
+    fn approval_frame(&self, approval: Approval) -> Option<Frame> {
+        (approval.session_id == self.session_id).then(|| Frame::Approval(Arc::new(approval)))
+    }
+
     /// The frame this notification produces for *this* session, if any.
     fn frame_for(&mut self, notification: &Notification) -> Option<Frame> {
-        approval_seam(notification);
-
         match notification.session_id.as_deref() {
             Some(session_id) if session_id == self.session_id => {
                 let envelope = NormalizedEnvelope::from_notification(notification);
@@ -288,8 +317,7 @@ impl Streamer {
                 .ok()?;
 
         if let Some(entry) = upserted_entry(&changed, &self.session_id) {
-            let summary =
-                summarize_entry(entry, self.state.attachments.is_attached(&self.session_id));
+            let summary = summarize(&self.state, entry);
             return Some(Frame::Session(serde_json::to_value(summary).ok()?));
         }
         if changed.removed.iter().any(|id| id == &self.session_id) {
@@ -308,13 +336,6 @@ fn upserted_entry<'a>(changed: &'a RosterChanged, session_id: &str) -> Option<&'
         .iter()
         .find(|entry| entry.session_id == session_id)
 }
-
-/// **C6 seam.** Reverse-requests (permission / question / plan / MCP elicitation) are *requests*,
-/// not notifications, so they never reach this broadcast; C6 captures them in `AcpClient` and
-/// raises them as approval resources. When it does, this is where the connection turns a change in
-/// that map into `event: approval` — a state invalidation with no `id:`, exactly like `session`.
-/// It is a no-op today so the shape of the seam is visible rather than merely described.
-fn approval_seam(_notification: &Notification) {}
 
 /// Work out what to send before going live. Returns an optional leading `reset` reason and the
 /// frames to replay.
