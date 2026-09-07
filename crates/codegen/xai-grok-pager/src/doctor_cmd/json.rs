@@ -28,6 +28,12 @@ struct JsonReport<'a> {
     findings: Vec<JsonFinding<'a>>,
     probe_notes: Vec<JsonProbeNote<'a>>,
     counts: JsonCounts,
+    // gx: one additive top-level object describing the gx leader and remote lane
+    // (`docs/gx/REMOTE_API.md`). `SCHEMA_VERSION` stays "1" on purpose: no existing key changes
+    // name, place or meaning, and the key is absent entirely on a stock build (`collect()` is
+    // `None` there), so a schema-1 consumer parses either report unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    gx: Option<super::gx_leader::GxJson>,
 }
 
 impl<'a> From<&'a DiagnosticReport> for JsonReport<'a> {
@@ -42,6 +48,10 @@ impl<'a> From<&'a DiagnosticReport> for JsonReport<'a> {
                 recommendations: report.recommendation_count(),
                 probe_notes: report.probe_notes.len(),
             },
+            // gx: see the field's comment above.
+            gx: super::gx_leader::collect()
+                .as_ref()
+                .map(super::gx_leader::json_section),
         }
     }
 }

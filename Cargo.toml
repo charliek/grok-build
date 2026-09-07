@@ -102,6 +102,8 @@ members = [
     "crates/common/xai-tool-runtime",
     "crates/common/xai-tool-types",
     "crates/common/xai-tracing",
+    # gx: fork-only crates live under crates/gx/ and never collide with an upstream member.
+    "crates/gx/gx-remote-api",
     "prod/mc/cli-chat-proxy-types",
     "third_party/dagre_rust",
     "third_party/graphlib_rust",

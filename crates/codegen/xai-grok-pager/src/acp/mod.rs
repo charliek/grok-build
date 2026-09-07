@@ -312,6 +312,7 @@ pub async fn connect_via_leader(
         fs_write: flags.fs_write,
         status_line: flags.status_line,
         user_message_echo: true,
+        observer: false, // gx: observer
     };
     startup::enter(StartupPhase::LeaderConnect);
     let conn = {
