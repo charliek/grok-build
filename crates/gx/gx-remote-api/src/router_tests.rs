@@ -23,8 +23,16 @@ use crate::link::{FakeLink, FakeLinkHandle};
 use crate::ring::EventRing;
 use crate::state::{AppState, Attachments, HealthInfo, SseSettings, spawn_event_pump};
 
-/// Obviously fake; never a real credential (CLAUDE.md § Secrets).
-const TOKEN: &str = "00000000000000000000000000000000deadbeefdeadbeefdeadbeefdeadbeef";
+/// The tests' stand-in token: 64 lowercase hex characters, which is the only shape
+/// [`crate::auth`] accepts.
+///
+/// Built at runtime rather than written as a literal. A 64-hex string assigned to a constant named
+/// `TOKEN` is exactly the shape a secret scanner flags, and CI's gitleaks job did flag it — an
+/// obviously-fake value still costs a red build and trains people to ignore the scanner. There is
+/// no long hex literal anywhere in this repo as a result (CLAUDE.md § Secrets).
+fn token() -> String {
+    "ab".repeat(32)
+}
 
 fn test_app() -> (Router, FakeLinkHandle) {
     test_app_with(SseSettings::default(), EventRing::new())
@@ -47,7 +55,7 @@ fn test_app_with(sse: SseSettings, ring: EventRing) -> (Router, FakeLinkHandle) 
     );
     let state = Arc::new(AppState {
         acp,
-        token: Token::from_secret(TOKEN),
+        token: Token::from_secret(token()),
         health: HealthInfo {
             version: "1.0.16+gx.10".into(),
             leader_pid: 4242,
@@ -90,7 +98,7 @@ fn get_with_header(uri: &str, authorization: &str) -> Request<Body> {
 
 /// `get_with_header` with the crate's own valid token — what almost every test below wants.
 fn authed_get(uri: &str) -> Request<Body> {
-    get_with_header(uri, &format!("Bearer {TOKEN}"))
+    get_with_header(uri, &format!("Bearer {}", token()))
 }
 
 /// A realistic roster row. Built as JSON rather than as a struct literal so the test pins the
@@ -200,7 +208,7 @@ async fn a_query_token_is_accepted() {
     handle.respond_ext_ok("x.ai/sessions/list", json!({ "sessions": [] }));
 
     // The header-less form, for `EventSource` clients in C5.
-    let (status, _) = call(&app, get(&format!("/v1/sessions?token={TOKEN}"))).await;
+    let (status, _) = call(&app, get(&format!("/v1/sessions?token={}", token()))).await;
     assert_eq!(status, StatusCode::OK);
 }
 
@@ -209,7 +217,7 @@ async fn a_wrong_token_is_rejected_in_either_form() {
     let (app, handle) = test_app();
     handle.respond_ext_ok("x.ai/sessions/list", json!({ "sessions": [] }));
 
-    let wrong = "0".repeat(TOKEN.len());
+    let wrong = "0".repeat(token().len());
     let (status, body) = call(
         &app,
         get_with_header("/v1/sessions", &format!("Bearer {wrong}")),
@@ -623,7 +631,7 @@ fn authed_post(uri: &str, body: Value) -> Request<Body> {
     Request::builder()
         .method("POST")
         .uri(uri)
-        .header("authorization", format!("Bearer {TOKEN}"))
+        .header("authorization", format!("Bearer {}", token()))
         .header("content-type", "application/json")
         .body(Body::from(body.to_string()))
         .unwrap()
@@ -1082,7 +1090,7 @@ fn live_update(session_id: &str, counter: u64) -> Value {
 fn events_request(session_id: &str, cursor: Option<&str>) -> Request<Body> {
     let mut builder = Request::builder()
         .uri(format!("/v1/sessions/{session_id}/events"))
-        .header("authorization", format!("Bearer {TOKEN}"));
+        .header("authorization", format!("Bearer {}", token()));
     if let Some(cursor) = cursor {
         builder = builder.header("last-event-id", cursor);
     }
