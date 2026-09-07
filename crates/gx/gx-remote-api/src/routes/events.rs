@@ -136,15 +136,22 @@ pub async fn get_events(
     // 404 before anything else, and attach exactly as the history route does: a stream for a
     // session the lane never loaded would be a stream of nothing.
     let session = resolve_session(&state, &id).await?;
-    ensure_attached(&state, &id, &session.cwd).await?;
 
-    // Subscribe *before* reading the ring or the disk. Anything that arrives while the replay is
-    // being computed is then either already in the replay or still in this receiver; the
-    // `last_emitted` counter below decides which, so nothing is lost and nothing is duplicated.
+    // Subscribe *before* the attach, not just before the replay. `ensure_attached` awaits a
+    // `session/load`, and the leader answers that by replaying every cached interaction request for
+    // the session — so an approval can be captured into the store during exactly that window. A
+    // receiver created afterwards never sees the announcement, and an approval frame carries no
+    // id, so nothing downstream can recover it: the phone would sit on a stream that never
+    // mentions the approval it connected to answer. Updates were already safe (the always-on pump
+    // feeds the ring, and `last_emitted` below drops anything the replay already covered); this
+    // makes approvals safe the same way, at the cost of a possible duplicate frame, which is
+    // harmless because an approval frame is a state invalidation the client re-fetches anyway.
     let live = state.acp.subscribe();
     // Approvals are a separate stream because they are not notifications at all: a reverse-request
     // never reaches the notification fan-out, and a POST that answers one happens on an HTTP task.
     let approvals = state.approvals.subscribe();
+
+    ensure_attached(&state, &id, &session.cwd).await?;
 
     let cursor = headers
         .get("last-event-id")

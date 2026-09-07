@@ -246,15 +246,25 @@ each value came from (`providers.toml` vs `config.toml` vs environment).
 ## Remote lane
 
 A gx build starts a **leader** by default (stock grok does not), and that leader hosts a
-loopback HTTP/SSE façade over your sessions on `127.0.0.1:2421` — the "remote lane". It
+loopback HTTP/SSE façade over your sessions on loopback — the "remote lane". It
 exists so a phone on an SSH port-forward can list sessions, follow a turn, send a prompt
 and answer an approval, while the TUI on your desk keeps working on the same session.
 
 ```bash
-gx remote status          # what is listening, and is it healthy
+gx remote status          # what is listening, on which port, and is it healthy
 gx remote up              # start a leader (and therefore a lane) if there is none
 gx doctor                 # the leader decision, the socket/lock, the token, the lanes
 ```
+
+The port defaults to **2421** but is not fixed: `GX_REMOTE_PORT` overrides it, a leader on a
+non-default relay always takes an ephemeral one, and a lane whose preferred port is busy falls
+back to an ephemeral port rather than failing to start. Read the real URL from `gx remote status`
+or from the `url` field of the discovery record — never assume the default when scripting.
+
+Note that a plain `gx` already starts both, so `gx remote up` is for the case where no gx is
+running and you want the lane anyway. To go the other way: `GX_REMOTE_DISABLE=1` keeps the leader
+but starts no lane and opens no port, while `gx --no-leader` or `[cli] use_leader = false` stops
+the detached leader from existing at all, and therefore the lane with it.
 
 Two things you need in order to talk to it, both under `$GROK_HOME`:
 `gx-remote.json` (the discovery record — URL, pid, instance id) and `gx-remote.token`
@@ -265,11 +275,16 @@ The lane is loopback-only and there is no TLS: reaching it from another machine 
 job.
 
 ```bash
-ssh -N -L 2421:127.0.0.1:2421 host &
+# Ask the far side which port it actually bound rather than assuming 2421.
+PORT=$(ssh host 'python3 -c "import json,glob;print(json.load(open(glob.glob(\"${GROK_HOME:-$HOME/.grok}/gx-remote*.json\")[0]))[\"url\"].rsplit(\":\",1)[1])"')
+ssh -N -L "$PORT:127.0.0.1:$PORT" host &
 TOKEN=$(ssh host 'cat "${GROK_HOME:-$HOME/.grok}/gx-remote.token"')
-curl -s http://127.0.0.1:2421/v1/healthz          # no token needed; check instanceId first
-curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:2421/v1/sessions
+curl -s "http://127.0.0.1:$PORT/v1/healthz"       # no token needed; match instanceId first
+curl -s -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:$PORT/v1/sessions"
 ```
+
+`ssh host gx remote status` is the readable version of that first line if a gx is on the far
+side's `PATH`.
 
 **Full reference — every endpoint, the SSE resume contract, the approval bodies, the
 error codes and the accepted risks: [`docs/gx/REMOTE_API.md`](REMOTE_API.md).**
@@ -291,8 +306,8 @@ session state. gx neutralizes the two places that would otherwise collide:
   exits 0 instead of touching stock grok's release channel. gx releases only ever come
   from this fork's own GitHub releases (above), never from xAI's update service.
 - **Leader on by default, and a loopback listener with it.** Unlike stock grok, a gx
-  build starts a leader when nothing says otherwise, and that leader binds
-  `127.0.0.1:2421` for the remote lane (above). Both are opt-out:
+  build starts a leader when nothing says otherwise, and that leader binds a loopback port
+  for the remote lane (2421 by default; see above for when it differs). Both are opt-out:
 
   | knob | effect |
   |---|---|
@@ -304,9 +319,11 @@ session state. gx neutralizes the two places that would otherwise collide:
 
   `gx doctor` prints which of these is in force, plus the socket, the lock's pid, and
   whether the token file exists with mode `0600`.
-- **Stock grok is unaffected.** It never reads `providers.toml`, never sees the gx
-  leader socket, never starts a lane, and its own updater behaves exactly as upstream
-  ships it.
+- **What stock grok does and does not share.** It never reads `providers.toml`, never
+  binds the gx leader socket (the stem differs), never starts a lane or opens a port, and
+  its own updater behaves exactly as upstream ships it. `config.toml` *is* shared, though:
+  gx only changes the built-in **default** for `[cli] use_leader`, so if you write that key
+  yourself, stock grok reads the same value out of the same file.
 - **Splash mark.** A gx binary paints the StrideLabs owl on the welcome screen (and
   the compact minimal-mode card). Stock `grok` still shows the Grok `g`. Copy next to
   the mark ("Grok Build", version badge) is unchanged.
