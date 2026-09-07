@@ -1,4 +1,5 @@
-//! gx: tests for the `ClientCapabilities::observer` capability.
+//! gx: tests for the leader server's gx-only behaviour — the `ClientCapabilities::observer`
+//! capability, the per-client `hook_env` identity, and the `ControlCommand::Shutdown` control.
 //!
 //! An observer is the in-process ACP client the gx remote lane (HTTP/SSE) attaches to the leader
 //! with. It lives for the leader's whole life and must be invisible to the TUI's routing: it never
@@ -45,6 +46,23 @@ async fn spawn_server(
     Arc<AtomicUsize>,
     tokio::task::JoinHandle<Result<(), ServerError>>,
 ) {
+    spawn_server_with(temp, no_exit_on_disconnect, AgentActivity::default()).await
+}
+
+/// [`spawn_server`] with a caller-supplied [`AgentActivity`], so a test can register a fake session
+/// actor and observe what the shutdown drain does to it.
+async fn spawn_server_with(
+    temp: &TempDir,
+    no_exit_on_disconnect: bool,
+    agent_activity: AgentActivity,
+) -> (
+    PathBuf,
+    CancellationToken,
+    mpsc::UnboundedSender<String>,
+    mpsc::UnboundedReceiver<String>,
+    Arc<AtomicUsize>,
+    tokio::task::JoinHandle<Result<(), ServerError>>,
+) {
     let sock_path = temp.path().join("gx-observer.sock");
     let (acp_tx, acp_rx) = mpsc::unbounded_channel();
     let (response_tx, response_rx) = mpsc::unbounded_channel();
@@ -64,7 +82,7 @@ async fn spawn_server(
             no_exit_on_disconnect,
             client_count_clone,
             Arc::new(AtomicBool::new(false)),
-            AgentActivity::default(),
+            agent_activity,
             watch::channel(true).1,
             watch::channel(false).0,
             watch::channel(super::super::protocol::ShutdownReason::Manual).0,
@@ -585,6 +603,9 @@ async fn driver_reassignment_on_disconnect_skips_observers() {
 /// remaining registered client is an observer".
 #[tokio::test]
 async fn exit_on_disconnect_ignores_observers() {
+    // The exit predicate also reads the process-global flush flag, which another test in this
+    // binary could otherwise be holding up; see `gx_flush_lock`.
+    let _serialized = gx_flush_lock().await;
     let temp = TempDir::new().unwrap();
     let (sock_path, _cancel, _response_tx, _acp_rx, client_count, server) =
         spawn_server(&temp, false).await;
@@ -1179,4 +1200,453 @@ fn client_capabilities_without_hook_env_deserializes_to_empty() {
         with_env,
         "ClientCapabilities must round-trip through the wire with `hook_env` set"
     );
+}
+
+// ---------------------------------------------------------------------------
+// 4. `ControlCommand::Shutdown`: a graceful stop that runs SessionEnd hooks
+// ---------------------------------------------------------------------------
+
+/// Bound on a control round trip and on the leader's own exit; both are local and immediate here.
+const GX_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Serialize the tests that set — or depend on the absence of — the process-global flush flag
+/// `agent::gx_leader_shutdown::is_flushing()`. `cargo test` runs this crate's tests in parallel
+/// threads of one binary, so a flush started here is visible to `exit_on_disconnect_ignores_observers`
+/// (which needs the leader to actually exit) and to the flag's own unit tests.
+async fn gx_flush_lock() -> tokio::sync::MutexGuard<'static, ()> {
+    crate::agent::gx_leader_shutdown::flush_flag_test_lock()
+        .lock()
+        .await
+}
+
+/// A version strictly newer than the one `default_test_control_state` gives the leader, so
+/// `decide_relaunch_for_update`'s directional guard accepts it and the *other* guard is what a
+/// declined relaunch proves.
+fn newer_than_test_leader_version() -> String {
+    let mut v: semver::Version = env!("CARGO_PKG_VERSION")
+        .parse()
+        .expect("the crate version parses as semver");
+    v.pre = semver::Prerelease::EMPTY;
+    v.build = semver::BuildMetadata::EMPTY;
+    v.patch += 1;
+    v.to_string()
+}
+
+async fn send_relaunch(
+    writer: &mut tokio::io::WriteHalf<LeaderStream>,
+    request_id: &str,
+    to_version: &str,
+) {
+    write_message(
+        writer,
+        &ClientMessage::Control {
+            request_id: request_id.to_string(),
+            command: ControlCommand::RelaunchForUpdate {
+                to_version: to_version.to_string(),
+            },
+        },
+    )
+    .await
+    .unwrap();
+}
+
+async fn send_shutdown(writer: &mut tokio::io::WriteHalf<LeaderStream>, request_id: &str) {
+    write_message(
+        writer,
+        &ClientMessage::Control {
+            request_id: request_id.to_string(),
+            command: ControlCommand::Shutdown,
+        },
+    )
+    .await
+    .unwrap();
+}
+
+/// Read frames until the `ControlResult` for `request_id` arrives, then return its payload.
+async fn next_control_payload(
+    reader: &mut tokio::io::ReadHalf<LeaderStream>,
+    request_id: &str,
+) -> ControlPayload {
+    let deadline = tokio::time::Instant::now() + GX_SHUTDOWN_TIMEOUT;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "timed out waiting for the ControlResult of request {request_id}"
+        );
+        match tokio::time::timeout(remaining, read_message::<_, ServerMessage>(reader)).await {
+            Ok(Ok(ServerMessage::ControlResult {
+                request_id: id,
+                result,
+            })) if id == request_id => {
+                return result.expect("the control request must be answered, not refused");
+            }
+            Ok(Ok(_)) => continue,
+            Ok(Err(e)) => panic!("connection ended before the control ack: {e}"),
+            Err(_) => panic!("timed out waiting for the ControlResult of request {request_id}"),
+        }
+    }
+}
+
+/// Read frames until the planned-shutdown notice arrives, returning its reason.
+async fn next_shutting_down_reason(
+    reader: &mut tokio::io::ReadHalf<LeaderStream>,
+) -> super::super::protocol::ShutdownReason {
+    let deadline = tokio::time::Instant::now() + GX_SHUTDOWN_TIMEOUT;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(!remaining.is_zero(), "timed out waiting for ShuttingDown");
+        match tokio::time::timeout(remaining, read_message::<_, ServerMessage>(reader)).await {
+            Ok(Ok(ServerMessage::ShuttingDown { reason, .. })) => return reason,
+            Ok(Ok(_)) => continue,
+            Ok(Err(e)) => panic!("connection ended before ShuttingDown: {e}"),
+            Err(_) => panic!("timed out waiting for ShuttingDown"),
+        }
+    }
+}
+
+/// `gx leader kill`'s replacement for a bare SIGTERM: the leader acks the request and then exits.
+///
+/// The ack must arrive first — the drain is spawned only after it has been queued — and the exit is
+/// asserted through the server task's own `Result`, so a leader that merely dropped the connection
+/// would not pass.
+#[tokio::test]
+async fn gx_shutdown_control_is_acked_and_stops_the_leader() {
+    let _serialized = gx_flush_lock().await;
+    let temp = TempDir::new().unwrap();
+    // `no_exit_on_disconnect = true`: nothing but the Shutdown control may end this leader.
+    let (sock_path, _cancel, _response_tx, _acp_rx, _count, srv) = spawn_server(&temp, true).await;
+
+    let (mut reader, mut writer) = register_with(&sock_path, "gx-leader-kill", tui_caps()).await;
+    send_shutdown(&mut writer, "kill-1").await;
+
+    match next_control_payload(&mut reader, "kill-1").await {
+        ControlPayload::ShuttingDown {
+            grace_ms,
+            already_shutting_down,
+        } => {
+            assert!(
+                !already_shutting_down,
+                "the first request must arm the drain"
+            );
+            assert_eq!(
+                grace_ms,
+                crate::agent::activity::SESSION_FLUSH_GRACE.as_millis() as u64,
+                "the ack advertises the session-flush budget the leader will actually spend"
+            );
+        }
+        other => panic!("expected a ShuttingDown ack, got {other:?}"),
+    }
+
+    let exit = tokio::time::timeout(GX_SHUTDOWN_TIMEOUT, srv)
+        .await
+        .expect("the leader must exit after an acked Shutdown")
+        .expect("the server task must not panic");
+    assert!(exit.is_ok(), "the leader must exit cleanly: {exit:?}");
+}
+
+/// A TUI that did not ask for the shutdown still gets its advance notice.
+///
+/// This is what a client reconnects on, so a graceful stop must not be quieter than the SIGTERM it
+/// replaces. The reason is `Manual`: this is an operator-driven stop, not an auto-update relaunch.
+#[tokio::test]
+async fn gx_shutdown_still_notifies_a_connected_tui() {
+    let _serialized = gx_flush_lock().await;
+    let temp = TempDir::new().unwrap();
+    let (sock_path, _cancel, _response_tx, _acp_rx, count, srv) = spawn_server(&temp, true).await;
+
+    let (mut tui_reader, _tui_writer) = register_with(&sock_path, "grok-tui", tui_caps()).await;
+    let (mut killer_reader, mut killer_writer) =
+        register_with(&sock_path, "gx-leader-kill", ClientCapabilities::default()).await;
+    // Both registrations have been through the main loop, so both are in `clients` when the
+    // broadcast runs; without this barrier a missed notice could just be a late registration.
+    wait_for_client_count(&count, 2).await;
+
+    send_shutdown(&mut killer_writer, "kill-1").await;
+    let _ = next_control_payload(&mut killer_reader, "kill-1").await;
+
+    assert_eq!(
+        next_shutting_down_reason(&mut tui_reader).await,
+        super::super::protocol::ShutdownReason::Manual,
+        "a bystander TUI must still be told the leader is going away"
+    );
+    let _ = tokio::time::timeout(GX_SHUTDOWN_TIMEOUT, srv).await;
+}
+
+/// Idempotence, and the ordering that makes the whole feature work.
+///
+/// A wedged fake session actor holds the flush open. While it is held: the leader is still serving
+/// control traffic (so the drain cannot be blocking the event loop), a second `Shutdown` is acked
+/// as a no-op rather than starting a second flush, and the leader has NOT exited. Releasing the
+/// actor completes the flush, and only then does the leader stop — which is exactly the order
+/// `SessionEnd` hooks need, since the cancel that follows stops the `LocalSet` they run on.
+#[tokio::test]
+async fn gx_shutdown_flushes_sessions_before_exiting_and_is_idempotent() {
+    let _serialized = gx_flush_lock().await;
+    let temp = TempDir::new().unwrap();
+    let activity = AgentActivity::default();
+    let (mut session_rx, _prompt_id, _pending) = activity.register_for_test("sess-1");
+    let (sock_path, _cancel, _response_tx, _acp_rx, _count, srv) =
+        spawn_server_with(&temp, true, activity).await;
+
+    // The fake session actor: report the Shutdown, then stay alive until released.
+    let (got_shutdown_tx, got_shutdown_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let actor = tokio::spawn(async move {
+        let cmd = session_rx
+            .recv()
+            .await
+            .expect("the flush must reach the actor");
+        assert!(matches!(cmd, crate::session::SessionCommand::Shutdown(_)));
+        got_shutdown_tx.send(()).unwrap();
+        release_rx.await.unwrap();
+        // `session_rx` drops here: that is what tells the flush this actor has finished.
+    });
+
+    let (mut reader, mut writer) =
+        register_with(&sock_path, "gx-leader-kill", ClientCapabilities::default()).await;
+    send_shutdown(&mut writer, "kill-1").await;
+    assert!(
+        matches!(
+            next_control_payload(&mut reader, "kill-1").await,
+            ControlPayload::ShuttingDown {
+                already_shutting_down: false,
+                ..
+            }
+        ),
+        "the first request must arm the drain"
+    );
+
+    // Barrier: the flush is now provably in flight and waiting on the actor.
+    tokio::time::timeout(GX_SHUTDOWN_TIMEOUT, got_shutdown_rx)
+        .await
+        .expect("the drain must flush live sessions")
+        .unwrap();
+
+    // The leader is still serving control requests mid-flush, and a second request is a no-op.
+    send_shutdown(&mut writer, "kill-2").await;
+    assert!(
+        matches!(
+            next_control_payload(&mut reader, "kill-2").await,
+            ControlPayload::ShuttingDown {
+                already_shutting_down: true,
+                ..
+            }
+        ),
+        "a Shutdown during a shutdown must be acked without starting a second flush"
+    );
+    assert!(
+        !srv.is_finished(),
+        "the leader must not exit while a session actor is still running its SessionEnd hooks"
+    );
+
+    release_tx.send(()).unwrap();
+    actor.await.unwrap();
+    let exit = tokio::time::timeout(GX_SHUTDOWN_TIMEOUT, srv)
+        .await
+        .expect("the leader must exit once the flush completes")
+        .expect("the server task must not panic");
+    assert!(exit.is_ok(), "the leader must exit cleanly: {exit:?}");
+}
+
+/// The last client can leave *during* the flush, and the leader must still finish it.
+///
+/// `gx leader kill` holds its connection open across the wait, and an auto-spawned leader runs with
+/// `--no-exit-on-disconnect`, so neither of those hits this. A manually started `gx agent leader`
+/// does: it exits with its last client, and the client that asked it to stop is usually that last
+/// client. Exiting here returns from `run_leader_server`, which drops `run_leader`'s cancellation
+/// guard and cancels the root token — the `LocalSet` the session actors are running their
+/// `SessionEnd` hooks on stops being polled, and the flush this test wedges open runs nothing.
+///
+/// The positive control is the second half: once the actor is released, the same leader — with no
+/// clients at all — does exit.
+#[tokio::test]
+async fn gx_shutdown_outlives_the_last_client_disconnecting_mid_flush() {
+    let _serialized = gx_flush_lock().await;
+    let temp = TempDir::new().unwrap();
+    let activity = AgentActivity::default();
+    let (mut session_rx, _prompt_id, _pending) = activity.register_for_test("sess-1");
+    // `no_exit_on_disconnect = false` is the whole point: this is a leader that exits with its last
+    // client, i.e. the one configuration in which the disconnect can cancel the token mid-flush.
+    let (sock_path, _cancel, _response_tx, _acp_rx, count, srv) =
+        spawn_server_with(&temp, false, activity).await;
+
+    let (got_shutdown_tx, got_shutdown_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let actor = tokio::spawn(async move {
+        let cmd = session_rx
+            .recv()
+            .await
+            .expect("the flush must reach the actor");
+        assert!(matches!(cmd, crate::session::SessionCommand::Shutdown(_)));
+        got_shutdown_tx.send(()).unwrap();
+        release_rx.await.unwrap();
+        // `session_rx` drops here: that is what tells the flush this actor has finished.
+    });
+
+    let (mut reader, mut writer) =
+        register_with(&sock_path, "gx-leader-kill", ClientCapabilities::default()).await;
+    wait_for_client_count(&count, 1).await;
+    send_shutdown(&mut writer, "kill-1").await;
+    assert!(
+        matches!(
+            next_control_payload(&mut reader, "kill-1").await,
+            ControlPayload::ShuttingDown {
+                already_shutting_down: false,
+                ..
+            }
+        ),
+        "the first request must arm the drain"
+    );
+
+    // Barrier: the flush is provably in flight and parked on the actor before the client leaves.
+    tokio::time::timeout(GX_SHUTDOWN_TIMEOUT, got_shutdown_rx)
+        .await
+        .expect("the drain must flush live sessions")
+        .unwrap();
+
+    // The only client goes away mid-flush.
+    write_message(&mut writer, &ClientMessage::Disconnect)
+        .await
+        .unwrap();
+    drop(reader);
+    drop(writer);
+    // Barrier: the main loop has run its `Disconnected` arm, so the exit check has been evaluated.
+    wait_for_client_count(&count, 0).await;
+
+    assert!(
+        !srv.is_finished(),
+        "the leader exited on its last client's disconnect while a shutdown flush was still \
+         running: that cancels the root token and abandons the SessionEnd hooks mid-flight"
+    );
+
+    release_tx.send(()).unwrap();
+    actor.await.unwrap();
+    let exit = tokio::time::timeout(GX_SHUTDOWN_TIMEOUT, srv)
+        .await
+        .expect("the leader must exit once the flush completes")
+        .expect("the server task must not panic");
+    assert!(exit.is_ok(), "the leader must exit cleanly: {exit:?}");
+}
+
+/// A relaunch and a graceful shutdown must never both be armed.
+///
+/// Both end in `flush_all_sessions` followed by cancelling the root token, so a second drain's
+/// cancel would land in the middle of the first's flush and kill the `LocalSet` its `SessionEnd`
+/// hooks run on. The version guard is satisfied deliberately (`newer_than_test_leader_version`), so
+/// the decline can only come from the shutdown-already-armed check.
+#[tokio::test]
+async fn relaunch_during_a_gx_shutdown_is_declined() {
+    let _serialized = gx_flush_lock().await;
+    let temp = TempDir::new().unwrap();
+    let activity = AgentActivity::default();
+    let (mut session_rx, _prompt_id, _pending) = activity.register_for_test("sess-1");
+    let (sock_path, _cancel, _response_tx, _acp_rx, _count, srv) =
+        spawn_server_with(&temp, true, activity).await;
+
+    let (got_shutdown_tx, got_shutdown_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let actor = tokio::spawn(async move {
+        let cmd = session_rx
+            .recv()
+            .await
+            .expect("the flush must reach the actor");
+        assert!(matches!(cmd, crate::session::SessionCommand::Shutdown(_)));
+        got_shutdown_tx.send(()).unwrap();
+        release_rx.await.unwrap();
+    });
+
+    let (mut reader, mut writer) =
+        register_with(&sock_path, "gx-leader-kill", ClientCapabilities::default()).await;
+    send_shutdown(&mut writer, "kill-1").await;
+    assert!(
+        matches!(
+            next_control_payload(&mut reader, "kill-1").await,
+            ControlPayload::ShuttingDown {
+                already_shutting_down: false,
+                ..
+            }
+        ),
+        "the shutdown must be the one that arms"
+    );
+    tokio::time::timeout(GX_SHUTDOWN_TIMEOUT, got_shutdown_rx)
+        .await
+        .expect("the drain must flush live sessions")
+        .unwrap();
+
+    send_relaunch(&mut writer, "relaunch-1", &newer_than_test_leader_version()).await;
+    match next_control_payload(&mut reader, "relaunch-1").await {
+        ControlPayload::RelaunchDeclined { reason } => assert!(
+            reason.contains("shutdown"),
+            "the decline must name the shutdown that owns this leader's exit, got {reason:?}"
+        ),
+        other => panic!(
+            "a relaunch accepted during a shutdown would race the shutdown's flush; got {other:?}"
+        ),
+    }
+
+    release_tx.send(()).unwrap();
+    actor.await.unwrap();
+    let _ = tokio::time::timeout(GX_SHUTDOWN_TIMEOUT, srv).await;
+}
+
+/// The mirror image: a shutdown asked for during an armed relaunch is acked as a no-op, never a
+/// second drain. `already_shutting_down: true` is honest — the relaunch drain also ends in a cancel,
+/// so the leader really is on its way out and `gx leader kill`'s wait-for-exit will see it go.
+#[tokio::test]
+async fn gx_shutdown_during_a_relaunch_is_declined() {
+    let _serialized = gx_flush_lock().await;
+    let temp = TempDir::new().unwrap();
+    let activity = AgentActivity::default();
+    let (mut session_rx, _prompt_id, _pending) = activity.register_for_test("sess-1");
+    let (sock_path, _cancel, _response_tx, _acp_rx, _count, srv) =
+        spawn_server_with(&temp, true, activity).await;
+
+    let (got_shutdown_tx, got_shutdown_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let actor = tokio::spawn(async move {
+        let cmd = session_rx
+            .recv()
+            .await
+            .expect("the relaunch drain must flush the session too");
+        assert!(matches!(cmd, crate::session::SessionCommand::Shutdown(_)));
+        got_shutdown_tx.send(()).unwrap();
+        release_rx.await.unwrap();
+    });
+
+    let (mut reader, mut writer) =
+        register_with(&sock_path, "grok-tui", ClientCapabilities::default()).await;
+    send_relaunch(&mut writer, "relaunch-1", &newer_than_test_leader_version()).await;
+    assert!(
+        matches!(
+            next_control_payload(&mut reader, "relaunch-1").await,
+            ControlPayload::Relaunching { .. }
+        ),
+        "the relaunch must be the one that arms"
+    );
+    // Barrier: the relaunch drain is past its idle grace and parked in its own session flush.
+    tokio::time::timeout(GX_SHUTDOWN_TIMEOUT, got_shutdown_rx)
+        .await
+        .expect("the relaunch drain must flush live sessions")
+        .unwrap();
+
+    send_shutdown(&mut writer, "kill-1").await;
+    match next_control_payload(&mut reader, "kill-1").await {
+        ControlPayload::ShuttingDown {
+            already_shutting_down,
+            ..
+        } => assert!(
+            already_shutting_down,
+            "a shutdown asked for during a relaunch must be a no-op ack, not a second drain"
+        ),
+        other => panic!("expected a ShuttingDown ack, got {other:?}"),
+    }
+    assert!(
+        !srv.is_finished(),
+        "neither drain may cancel while the session actor is still running its SessionEnd hooks"
+    );
+
+    release_tx.send(()).unwrap();
+    actor.await.unwrap();
+    let _ = tokio::time::timeout(GX_SHUTDOWN_TIMEOUT, srv).await;
 }

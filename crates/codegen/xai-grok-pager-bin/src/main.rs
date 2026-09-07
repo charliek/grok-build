@@ -368,6 +368,87 @@ async fn run_leader_mgmt(args: LeaderMgmtArgs) -> Result<()> {
         }
     }
 }
+/// gx: how long `grok leader kill` waits for a leader to actually exit after asking it to stop.
+/// The leader's own session flush is bounded by `SESSION_FLUSH_GRACE` (10s); this covers that plus
+/// the process teardown that follows. Deliberately no SIGKILL escalation — the point of the
+/// graceful path is to let `SessionEnd` hooks finish, so an overrun is reported, not papered over.
+const GX_KILL_EXIT_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+/// gx: poll cadence for [`GX_KILL_EXIT_WAIT`].
+const GX_KILL_EXIT_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+/// gx: bound on each phase of the `Shutdown` control request — the socket connect, then the round
+/// trip. The leader acks *before* it starts flushing, so the round trip only has to cover the ack; a
+/// leader too old to know the command drops the connection instead, and we fall back to a signal.
+/// The connect gets the same bound because a wedged socket accepts and then never answers the
+/// handshake, which would otherwise hang the CLI with no deadline at all.
+const GX_KILL_CONTROL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// gx: ask one leader to shut down gracefully over its control socket.
+///
+/// A bare SIGTERM makes the leader's signal task `std::process::exit` without ever asking its
+/// session actors to shut down, so no `SessionEnd` hook runs and roost never releases the tabs those
+/// sessions own (issue #14). [`ControlCommand::Shutdown`] flushes the sessions first.
+///
+/// Returns the connected client, which the caller MUST hold until the leader is gone: a leader whose
+/// last client disconnects stops its IPC server, which ends the `LocalSet` the session actors are
+/// still flushing on.
+async fn gx_request_leader_shutdown(d: &LeaderDescriptor) -> Result<LeaderClient> {
+    let socket_path = d
+        .socket_path
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("leader has no socket path"))?;
+    // gx: bounded, because `connect` performs the register handshake and a wedged leader can accept
+    // the socket and then never answer it. A timeout here is just a connect failure: the caller
+    // falls back to SIGTERM and says so.
+    let client = tokio::time::timeout(
+        GX_KILL_CONTROL_TIMEOUT,
+        LeaderClient::connect(
+            socket_path,
+            "grok-pager-leader-kill",
+            ClientMode::Stdio,
+            ClientCapabilities::default(),
+        ),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("timed out connecting to the leader socket"))??;
+    let sent = tokio::time::timeout(
+        GX_KILL_CONTROL_TIMEOUT,
+        client.send_control(ControlCommand::Shutdown),
+    )
+    .await;
+    match sent {
+        Ok(Ok(Ok(ControlPayload::ShuttingDown { .. }))) => Ok(client),
+        Ok(Ok(Ok(other))) => {
+            client.cancel();
+            Err(anyhow::anyhow!(
+                "leader answered {other:?} instead of a shutdown ack"
+            ))
+        }
+        Ok(Ok(Err(e))) => {
+            client.cancel();
+            Err(anyhow::anyhow!("{}", e.message))
+        }
+        Ok(Err(e)) => {
+            client.cancel();
+            Err(anyhow::anyhow!("{e}"))
+        }
+        Err(_) => {
+            client.cancel();
+            Err(anyhow::anyhow!("timed out waiting for the shutdown ack"))
+        }
+    }
+}
+/// gx: poll until `pid` is gone, or `wait` elapses. Never escalates to a stronger signal.
+async fn gx_wait_for_leader_exit(pid: u32, wait: std::time::Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        if !xai_grok_shell::util::is_process_alive(pid) {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(GX_KILL_EXIT_POLL).await;
+    }
+}
 #[tracing::instrument(level = "debug", skip_all)]
 async fn kill_leaders() -> Result<()> {
     let leaders = xai_grok_shell::leader::discover_leaders().await;
@@ -377,6 +458,11 @@ async fn kill_leaders() -> Result<()> {
     }
     let mut killed = 0u32;
     let mut cleaned = 0u32;
+    // gx: leaders asked to stop that were still alive when the wait ran out.
+    let mut still_running = 0u32;
+    // gx: leaders we could neither ask gracefully nor signal. They are still running, so they must
+    // not be silently dropped from the tally — see the summary and the bail below.
+    let mut unsignalled = 0u32;
     for d in &leaders {
         let Some(pid) = leader_pid(d) else {
             continue;
@@ -392,19 +478,67 @@ async fn kill_leaders() -> Result<()> {
             }
             continue;
         }
-        eprintln!("  Killing leader PID {pid}");
-        if let Err(e) = xai_grok_shell::util::kill_process_by_pid(pid) {
-            eprintln!("  warning: failed to terminate PID {pid}: {e}");
-            continue;
-        }
+        // gx: prefer the graceful control-socket stop (which runs the sessions' `SessionEnd` hooks)
+        // and keep upstream's bare SIGTERM only as the fallback. See `gx_request_leader_shutdown`.
+        let client = match gx_request_leader_shutdown(d).await {
+            Ok(client) => {
+                eprintln!("  Asked leader PID {pid} to shut down (flushing sessions)");
+                Some(client)
+            }
+            Err(e) => {
+                eprintln!(
+                    "  warning: graceful shutdown unavailable for PID {pid} ({e:#}); \
+                     sending SIGTERM instead (SessionEnd hooks will not run)"
+                );
+                if let Err(e) = xai_grok_shell::util::kill_process_by_pid(pid) {
+                    // gx: a signal that did not land leaves the leader running. Upstream just
+                    // `continue`d, so the pid vanished from every count and the command could report
+                    // a complete stop — or "No live leader processes found" — and exit zero.
+                    eprintln!("  error: failed to terminate PID {pid}: {e}");
+                    unsignalled += 1;
+                    continue;
+                }
+                None
+            }
+        };
         killed += 1;
+        // gx: the connection stays open across the wait, then closes; see the doc comment above.
+        let exited = gx_wait_for_leader_exit(pid, GX_KILL_EXIT_WAIT).await;
+        if let Some(client) = client {
+            client.cancel();
+        }
+        if exited {
+            eprintln!("  PID {pid} exited");
+        } else {
+            still_running += 1;
+            eprintln!(
+                "  PID {pid} still running after {}s",
+                GX_KILL_EXIT_WAIT.as_secs()
+            );
+        }
     }
-    if killed > 0 {
-        eprintln!("Killed {killed} leader process(es).");
+    // gx: report what actually exited, not just what was asked, and count a leader we failed to
+    // signal as attempted-but-not-stopped rather than as no leader at all.
+    let attempted = killed + unsignalled;
+    if attempted > 0 {
+        eprintln!(
+            "Stopped {} of {attempted} leader process(es).",
+            killed - still_running
+        );
     } else if cleaned > 0 {
         eprintln!("No live leader processes found (cleaned up {cleaned} stale lock(s)).");
     } else {
         eprintln!("No live leader processes found.");
+    }
+    // gx: a leader that outlived the wait — or that we could not even signal — is a failure to
+    // report, not a reason to escalate.
+    let unstopped = still_running + unsignalled;
+    if unstopped > 0 {
+        anyhow::bail!(
+            "{unstopped} leader process(es) could not be stopped ({still_running} did not exit \
+             within {}s, {unsignalled} could not be signalled)",
+            GX_KILL_EXIT_WAIT.as_secs()
+        );
     }
     Ok(())
 }
@@ -1159,6 +1293,33 @@ async fn forward_stdio_line_to_leader(
 /// Emitted by both leader guards (server mode and leader-connect) so the two sites can't drift.
 const PLUGIN_DIR_LEADER_WARNING: &str = "grok: --plugin-dir is ignored in leader mode; run with --no-leader to \
      load per-process plugins";
+/// gx: margin on top of `SESSION_FLUSH_GRACE` for the signal-path flush. The flush bounds itself at
+/// the grace; this only covers getting there and back, so a wedged actor can never hold the signal.
+const GX_SIGNAL_FLUSH_MARGIN: std::time::Duration = std::time::Duration::from_secs(5);
+/// gx: brief pause after the flush, so the leader server — which the flush's cancel has just woken —
+/// gets its `ShuttingDown` broadcast onto the wire before this process exits.
+const GX_SIGNAL_SHUTDOWN_BROADCAST: std::time::Duration = std::time::Duration::from_millis(250);
+/// gx: run a leader's sessions' `SessionEnd` hooks before a signal takes the process down.
+///
+/// [`shutdown_and_flush_telemetry`] ends in `std::process::exit`, so anything that has not happened
+/// by the time it is called never happens. Before this, a SIGTERM'd or SIGHUP'd leader never asked a
+/// single session actor to shut down: no `SessionEnd` hook ran, and roost — which releases a tab's
+/// ownership only on `SessionEnd` — kept every tab those sessions owned (issue #14).
+///
+/// Every non-leader mode returns immediately: nothing is registered with
+/// [`xai_grok_shell::agent::gx_leader_shutdown`], so nothing else pays a deadline on the way out.
+async fn gx_flush_leader_sessions_on_signal(is_leader: bool) {
+    if !is_leader {
+        return;
+    }
+    let budget = xai_grok_shell::agent::activity::SESSION_FLUSH_GRACE + GX_SIGNAL_FLUSH_MARGIN;
+    match tokio::time::timeout(budget, xai_grok_shell::agent::gx_leader_shutdown::request()).await {
+        Ok(true) => tokio::time::sleep(GX_SIGNAL_SHUTDOWN_BROADCAST).await,
+        // Not a leader after all, or the signal beat `run_leader`'s registration: exit as before.
+        Ok(false) => {}
+        Err(_) => tracing::warn!("gx: leader session flush overran its budget; exiting anyway"),
+    }
+}
 /// Run the `agent` subcommand, dispatching to the appropriate mode.
 #[tracing::instrument(level = "debug", skip_all)]
 async fn run_agent_command(
@@ -1169,7 +1330,11 @@ async fn run_agent_command(
     disable_web_search: bool,
     update_config: &UpdateConfig,
 ) -> Result<()> {
-    let _signal_flush = tokio::spawn(async {
+    // gx: hoisted from below (upstream computes it after this task is spawned) so the signal task
+    // can capture it: only a leader has session actors whose `SessionEnd` hooks must run before the
+    // process exits. See `gx_flush_leader_sessions_on_signal`.
+    let is_leader = matches!(agent_args.mode, Some(AgentCmd::Leader(_)));
+    let _signal_flush = tokio::spawn(async move {
         #[cfg(unix)]
         {
             use tokio::signal::unix::{SignalKind, signal};
@@ -1177,11 +1342,15 @@ async fn run_agent_command(
             let mut term = signal(SignalKind::terminate()).ok();
             let mut hup = signal(SignalKind::hangup()).ok();
             let code = next_signal_code(&mut term, &mut hup).await;
+            // gx: end the leader's sessions before `shutdown_and_flush_telemetry` exits the process.
+            gx_flush_leader_sessions_on_signal(is_leader).await;
             shutdown_and_flush_telemetry(code);
         }
         #[cfg(not(unix))]
         {
             if tokio::signal::ctrl_c().await.is_ok() {
+                // gx: same as the unix arm above.
+                gx_flush_leader_sessions_on_signal(is_leader).await;
                 shutdown_and_flush_telemetry(130);
             }
         }
@@ -1206,7 +1375,7 @@ async fn run_agent_command(
     let had_prefetch = xai_grok_shell::agent::models::startup_prefetch::begin(None);
     xai_grok_shell::agent::mvp_agent::warm_async_http_client();
     let is_stdio = matches!(agent_args.mode, Some(AgentCmd::Stdio));
-    let is_leader = matches!(agent_args.mode, Some(AgentCmd::Leader(_)));
+    // gx: `is_leader` is computed at the top of this function now; see the signal task there.
     if !is_stdio && !is_leader {
         eprintln!(
             "Grok Build (pager) - v{}",

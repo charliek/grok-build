@@ -345,7 +345,7 @@ session state. gx neutralizes the two places that would otherwise collide:
   | `[cli] use_leader = false` in `config.toml` | no leader by default — note this is the **shared** config, so it turns leader mode off for stock grok too |
   | `GX_REMOTE_DISABLE=1` | leader as usual, **no lane** |
   | `GX_REMOTE_PORT=<n>` | a different loopback port (busy ports fall back to an ephemeral one; an unparseable value warns and falls back to the default port) |
-  | `gx leader kill` | stop the running leaders, and their lanes, now |
+  | `gx leader kill` | stop the running leaders, and their lanes, now — gracefully: each leader flushes its sessions (running their `SessionEnd` hooks) before exiting, and the command waits up to 15s per leader and exits non-zero if one is still running |
 
   `gx doctor` prints which of these is in force, plus the socket, the lock's pid, and
   whether the token file exists with mode `0600`.

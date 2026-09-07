@@ -236,6 +236,18 @@ pub enum ControlCommand {
     RelaunchForUpdate {
         to_version: String,
     },
+
+    /// gx: ask the leader to flush every live session — which runs their `SessionEnd` hooks — and
+    /// then exit with [`ShutdownReason::Manual`].
+    ///
+    /// It exists because a bare SIGTERM cannot: the pager's signal task exits the process directly,
+    /// so no session actor is ever asked to shut down and no `SessionEnd` hook runs. roost releases
+    /// a tab's ownership only on `SessionEnd`, so a killed leader left its tabs owned forever
+    /// (issue #14). `gx leader kill` sends this instead of signalling.
+    ///
+    /// Idempotent: a second request while a shutdown is already in progress is acked but starts no
+    /// second flush.
+    Shutdown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -297,6 +309,15 @@ pub enum ControlPayload {
     /// Response to [`ControlCommand::RelaunchForUpdate`] when the leader will not relaunch.
     /// E.g. it is already running `to_version` or newer, or a relaunch is already in progress.
     RelaunchDeclined { reason: String },
+
+    /// gx: ack for [`ControlCommand::Shutdown`], sent before the leader starts flushing.
+    /// `grace_ms` is the bounded budget the session flush may spend running `SessionEnd` hooks.
+    /// `already_shutting_down` is true when a shutdown was already in progress: the request changed
+    /// nothing (no second flush was started) and the leader is still on its way out.
+    ShuttingDown {
+        grace_ms: u64,
+        already_shutting_down: bool,
+    },
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
