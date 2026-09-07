@@ -516,3 +516,54 @@ gx doctor --json          # the same under an additive top-level `gx` key
 
 `gx remote status` exits 1 when no lane is reachable, so `gx remote status >/dev/null || gx remote
 up` is a reasonable one-liner. Neither command ever prints the token.
+
+---
+
+## Verified
+
+Run against the real binary on 2026-09-07, not against a mock: `gx 1.0.16+gx.11` built from this
+branch at `32140f4a`, driven through `tmux` with `curl` on the other side. Every cell below was
+executed; the model was `glm-5.3-flash` throughout. The lane ran under a scratch `$GROK_HOME`
+seeded with a copy of the real config at mode `0600`, a scratch project directory, and
+`GROK_LEADER_SOCKET` pointed at a short `/tmp` path — a socket path under a long scratch directory
+overruns the ~108-byte `SUN_LEN` cap, which is a real failure we hit while building the earlier
+handoff harness.
+
+| # | What was checked | Result |
+|---|---|---|
+| 1 | A plain `gx` with no flags starts a leader | pass — socket and lock appeared |
+| 2 | The leader starts the lane beside it | pass — discovery record and token written |
+| 3 | `GET /v1/healthz` needs no token | pass — 200, `instanceId` matching the record |
+| 4 | Every other route needs one | pass — 401 without, 200 with |
+| 5 | A TUI-owned session is listed over HTTP | pass — with title, cwd, activity and `modelId` |
+| 6 | Its transcript reads back | pass — prompt, thought, answer, `turn_completed` |
+| 7 | Lazy attach | pass — `attached` flipped only on the first content request |
+| 8 | **Interject from HTTP renders in the running TUI** | pass — the token appeared mid-turn and the agent answered it |
+| 9 | A queued prompt from HTTP | pass — 202 while the turn ran |
+| 10 | **A session created over HTTP opens in the TUI** | pass — `gx --resume` showed the remote turn |
+| 11 | SSE frame shape | pass — `id:` only on persisted updates; `session` frames carry none |
+| 12 | **SSE resume** | pass — resuming at `…-418` replayed `-420`, `-421`, `-424`: every frame after the cursor, in order, no duplicate, no `reset` |
+| 13 | **A TUI approval is visible over HTTP** | pass — full request and all three options while the TUI showed its modal |
+| 14 | **Answering it from HTTP unblocks the agent** | pass — `allow-once` by `curl`, the file was written, the TUI printed Done, status went pending → submitted → resolved |
+| 15 | Answering twice | pass — 409 `already_resolved` |
+| 16 | Unknown approval / session | pass — 404 `unknown_approval`, 404 `unknown_session` |
+| 17 | A non-object `response` | pass — 400 `bad_request` |
+| 18 | Cancel on an idle session | pass — 409 `not_accepting`, naming what is allowed |
+| 19 | `gx remote status` against a live lane | pass — pid liveness, healthz, record and token paths, no token value |
+| 20 | `gx doctor` | pass — the leader decision, socket and lock labelled as the default relay, lock pid liveness, the lane and its token's mode |
+| 21 | A stale record after the leader is killed | pass — reported not running and unreachable, exit 1, with recovery advice |
+
+Two things worth knowing, both found here rather than in review:
+
+- A hint-only approval is real. When the permission classifier auto-approves, the lane still sees
+  the `pending_interaction` and `interaction_resolved` pair and records an entry whose `method` and
+  `request` are `null` and whose `createdAt` equals its `resolvedAt`. That is the placeholder path
+  working, not a defect.
+- Reaching cell 13 needs a permission the classifier will not wave through. `permission_mode = "ask"`
+  is necessary but not sufficient: a `sleep` was auto-approved, while a write outside the workspace
+  prompted. Use the latter shape to reproduce.
+
+Not exercised: TLS and non-loopback binds (out of scope by design), a phone client over a real SSH
+forward (the transport is ordinary TCP on loopback and was driven locally), a stock-flavoured build
+at runtime (`is_gx_build()` is compiled in, so it is covered by unit tests only), and concurrent
+multi-client contention on one approval beyond the two-answer race above.
