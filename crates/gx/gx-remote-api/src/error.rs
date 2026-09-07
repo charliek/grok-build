@@ -4,8 +4,8 @@
 //! gx errors with the code it already has. `error` is a stable machine code; `message` is prose and
 //! may change.
 //!
-//! C4 raises four of the plan's codes; `unknown_approval`, `already_submitted`, `already_resolved`
-//! and `not_accepting` arrive with the approval and messaging routes in C5/C6.
+//! C4 raised four of the plan's codes and C5 adds `not_accepting`; `unknown_approval`,
+//! `already_submitted` and `already_resolved` arrive with the approval routes in C6.
 
 use axum::Json;
 use axum::http::StatusCode;
@@ -23,6 +23,10 @@ pub enum ApiError {
     BadRequest(String),
     #[error("no session {0}")]
     UnknownSession(String),
+    /// The session's current state does not admit this verb. Not a permission failure — the caller
+    /// is authorized; the *session* is not accepting. See [`crate::policy`].
+    #[error("{0}")]
+    NotAccepting(String),
     /// The leader did not answer, answered an error, or is gone. From a client's point of view
     /// these are one condition: retry later.
     #[error("{0}")]
@@ -36,6 +40,7 @@ impl ApiError {
             Self::Unauthorized => "unauthorized",
             Self::BadRequest(_) => "bad_request",
             Self::UnknownSession(_) => "unknown_session",
+            Self::NotAccepting(_) => "not_accepting",
             Self::LeaderUnavailable(_) => "leader_unavailable",
         }
     }
@@ -45,6 +50,7 @@ impl ApiError {
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::UnknownSession(_) => StatusCode::NOT_FOUND,
+            Self::NotAccepting(_) => StatusCode::CONFLICT,
             Self::LeaderUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
         }
     }
@@ -83,6 +89,7 @@ mod tests {
             (ApiError::Unauthorized, "unauthorized", 401),
             (ApiError::BadRequest("x".into()), "bad_request", 400),
             (ApiError::UnknownSession("s".into()), "unknown_session", 404),
+            (ApiError::NotAccepting("x".into()), "not_accepting", 409),
             (
                 ApiError::LeaderUnavailable("x".into()),
                 "leader_unavailable",

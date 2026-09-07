@@ -2,11 +2,16 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tokio::sync::OnceCell;
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, warn};
 
 use crate::acp_client::AcpClient;
 use crate::auth::Token;
+use crate::envelope::NormalizedEnvelope;
+use crate::ring::EventRing;
 
 /// What `GET /v1/healthz` reports. Fixed for the life of the lane.
 #[derive(Debug, Clone)]
@@ -17,12 +22,97 @@ pub struct HealthInfo {
     pub instance_id: String,
 }
 
+/// Tunables for the SSE lane.
+///
+/// Both are fields rather than constants for one reason each. The keepalive interval is 15 s in
+/// production, which no test can afford to wait for; the per-connection queue is 256 frames, which
+/// a test would have to overflow with 257 real frames to exercise the slow-consumer path. Making
+/// them settings keeps both behaviours reachable without a `sleep` or a synthetic flood.
+#[derive(Debug, Clone)]
+pub struct SseSettings {
+    /// Gap after which a `: keepalive` comment is emitted. Reset by every real frame.
+    pub keepalive: Duration,
+    /// Frames a single connection may fall behind by before it is told to re-sync.
+    pub queue_capacity: usize,
+}
+
+impl Default for SseSettings {
+    fn default() -> Self {
+        Self {
+            keepalive: Duration::from_secs(15),
+            queue_capacity: 256,
+        }
+    }
+}
+
 /// Everything a handler needs. Held behind an `Arc` as axum's router state.
 pub struct AppState {
     pub acp: AcpClient,
     pub token: Token,
     pub health: HealthInfo,
     pub attachments: Attachments,
+    /// Recent live frames, per session. Filled by [`spawn_event_pump`], read by the SSE resume.
+    pub ring: EventRing,
+    pub sse: SseSettings,
+}
+
+/// Keep [`AppState::ring`] filled from the leader's notification fan-out.
+///
+/// One task for the whole lane, not one per SSE connection: the ring is what makes a *reconnect*
+/// cheap, so it has to be filling while nobody is connected at all. Live delivery to a connected
+/// client is a separate subscription — see [`crate::routes::events`] — because a client that is
+/// only ever fed from the ring would have to poll it.
+///
+/// Only sessions this lane has attached are stored. The leader fans out on subscription, so in
+/// practice nothing else arrives; the check is what keeps a stray broadcast from spending the
+/// global cap on a session no client can ask about.
+///
+/// The task ends with `cancel`, or when the link closes and the broadcast sender drops with it.
+pub fn spawn_event_pump(state: Arc<AppState>, cancel: CancellationToken) {
+    let mut notifications = state.acp.subscribe();
+    tokio::spawn(async move {
+        loop {
+            let notification = tokio::select! {
+                () = cancel.cancelled() => break,
+                received = notifications.recv() => received,
+            };
+            match notification {
+                Ok(notification) => {
+                    let Some(session_id) = notification.session_id.clone() else {
+                        // Machine-wide broadcasts (`x.ai/sessions/changed` and friends) are not
+                        // session frames; SSE renders them as `event: session` from its own
+                        // subscription instead of storing them.
+                        continue;
+                    };
+                    if !state.attachments.is_attached(&session_id) {
+                        continue;
+                    }
+                    state.ring.push(
+                        &session_id,
+                        NormalizedEnvelope::from_notification(&notification),
+                    );
+                }
+                // The pump fell behind and the broadcast dropped `missed` events, so the ring
+                // now has a hole. It is NOT harmless: `bounds` still reports one contiguous span,
+                // so a resume whose cursor sits before the hole passes the in-ring check and is
+                // replayed straight across the gap, silently skipping every dropped event. Empty
+                // the ring instead — every resume then takes the persisted path, which has the
+                // dropped events (they are the same `session/update` notifications the agent
+                // writes to `updates.jsonl`) or answers `cursor_unresolvable`.
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
+                    state.ring.clear();
+                    warn!(
+                        missed,
+                        "gx-remote-api: event ring lagged the leader's fan-out; cleared the ring so no resume replays across the hole"
+                    );
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    debug!("gx-remote-api: event ring stopping, leader link closed");
+                    break;
+                }
+            }
+        }
+    });
 }
 
 /// Which sessions this lane has `session/load`-ed, and the machinery that guarantees it loads each
@@ -47,6 +137,16 @@ impl Attachments {
             .entry(session_id.to_string())
             .or_insert_with(|| Arc::new(OnceCell::new()))
             .clone()
+    }
+
+    /// Record `session_id` as attached without sending a `session/load`.
+    ///
+    /// For `POST /v1/sessions`: `session/new` already subscribes this client to the session it
+    /// created, so a `session/load` on the phone's next touch would be a redundant round trip that
+    /// makes the agent flush and replay a session that has not said anything yet.
+    pub fn mark_attached(&self, session_id: &str) {
+        // `set` fails only when the cell is already initialized, which is the same end state.
+        let _ = self.slot(session_id).set(());
     }
 
     /// Has a `session/load` for `session_id` completed successfully?

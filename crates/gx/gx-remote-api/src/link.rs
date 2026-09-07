@@ -7,7 +7,7 @@
 //!
 //! [`LeaderClient`]: xai_grok_shell::leader::LeaderClient
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 
@@ -71,6 +71,8 @@ struct FakeShared {
     outbound: Mutex<Vec<String>>,
     /// Logical method (leading `_` stripped) -> canned answer.
     responders: Mutex<HashMap<String, Responder>>,
+    /// Logical methods that are recorded and then deliberately left unanswered.
+    silent: Mutex<HashSet<String>>,
     inbound_tx: mpsc::UnboundedSender<String>,
 }
 
@@ -99,6 +101,7 @@ impl FakeLink {
         let shared = Arc::new(FakeShared {
             outbound: Mutex::new(Vec::new()),
             responders: Mutex::new(HashMap::new()),
+            silent: Mutex::new(HashSet::new()),
             inbound_tx,
         });
         let handle = FakeLinkHandle {
@@ -127,6 +130,10 @@ impl LeaderLink for FakeLink {
         let params = msg.get("params").cloned().unwrap_or(Value::Null);
 
         let logical = crate::acp_client::logical_method(method);
+        if self.shared.silent.lock().unwrap().contains(logical) {
+            // Recorded, never answered: an in-flight turn, as far as the lane can tell.
+            return Ok(());
+        }
         let answer = {
             let responders = self.shared.responders.lock().unwrap();
             responders.get(logical).map(|r| r(&params))
@@ -184,6 +191,20 @@ impl FakeLinkHandle {
         });
     }
 
+    /// Record `method` and never answer it.
+    ///
+    /// This is what a `session/prompt` looks like from the lane's side for the whole of a turn: the
+    /// request is on the wire, the response is minutes away. Any test asserting that a handler does
+    /// **not** block on the turn has to have one of these, because every other stub here answers
+    /// synchronously inside `send`.
+    pub fn never_respond(&self, method: &str) {
+        self.shared
+            .silent
+            .lock()
+            .unwrap()
+            .insert(method.to_string());
+    }
+
     /// Answer `method` with a closure over the request params.
     pub fn respond_with<F>(&self, method: &str, f: F)
     where
@@ -226,6 +247,34 @@ impl FakeLinkHandle {
         self.outbound()
             .into_iter()
             .find(|v| v.get("method").and_then(Value::as_str) == Some(method))
+    }
+
+    /// Wait until the lane has actually sent `method`, and return that payload.
+    ///
+    /// "The handler returned" and "the leader saw it" are two different instants: a payload is
+    /// queued for the task that owns the link, and that task writes it. A handler that *awaits* a
+    /// response has necessarily flushed by the time it returns, but a fire-and-forget send
+    /// (`session/prompt`) and a notification (`session/cancel`) have not — so every assertion about
+    /// those has to wait here instead of reading `outbound()` the instant the response arrives.
+    ///
+    /// Bounded, and panics with the traffic it did see, so a genuine regression fails fast and
+    /// legibly instead of hanging the suite.
+    pub async fn wait_for_outbound(&self, method: &str, timeout: std::time::Duration) -> Value {
+        tokio::time::timeout(timeout, async {
+            loop {
+                if let Some(payload) = self.first_outbound(method) {
+                    return payload;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "the lane never sent {method}; it sent {:?}",
+                self.outbound_methods()
+            )
+        })
     }
 }
 

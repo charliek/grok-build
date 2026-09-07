@@ -60,7 +60,7 @@ pub async fn list_sessions(
         .into_iter()
         .map(|entry| {
             let attached = attached.contains(&entry.session_id);
-            summarize_roster_entry(&entry, attached)
+            summarize_entry(&entry, attached)
         })
         .collect();
     Ok(Json(SessionList { sessions }))
@@ -87,7 +87,7 @@ pub async fn resolve_session(state: &Arc<AppState>, id: &str) -> Result<SessionS
         .into_iter()
         .find(|e| e.session_id == id)
     {
-        return Ok(summarize_roster_entry(&entry, attached));
+        return Ok(summarize_entry(&entry, attached));
     }
 
     if let Some(summary) = unified_list_fallback(state, id, attached).await? {
@@ -162,7 +162,11 @@ async fn fetch_roster(state: &Arc<AppState>) -> Result<Vec<RosterEntry>, ApiErro
         .collect())
 }
 
-fn summarize_roster_entry(entry: &RosterEntry, attached: bool) -> SessionSummary {
+/// One roster row as this API renders it.
+///
+/// Shared with the SSE lane, which renders an `x.ai/sessions/changed` upsert as an `event: session`
+/// frame — the same summary the roster GET returns, so a client parses one shape.
+pub fn summarize_entry(entry: &RosterEntry, attached: bool) -> SessionSummary {
     SessionSummary {
         session_id: entry.session_id.clone(),
         title: entry.title.clone(),
@@ -286,11 +290,11 @@ mod tests {
             RosterActivity::Completed,
             RosterActivity::Dead,
         ] {
-            let summary = summarize_roster_entry(&roster_entry(activity), false);
+            let summary = summarize_entry(&roster_entry(activity), false);
             assert_eq!(summary.pending_approvals, 0, "{activity:?}");
             assert!(summary.approximate);
         }
-        let summary = summarize_roster_entry(&roster_entry(RosterActivity::NeedsInput), true);
+        let summary = summarize_entry(&roster_entry(RosterActivity::NeedsInput), true);
         assert_eq!(summary.pending_approvals, 1);
         assert!(summary.approximate);
         assert!(summary.attached);

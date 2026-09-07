@@ -1,7 +1,9 @@
 //! Route table and the bearer-token gate.
 
+pub mod events;
 pub mod health;
 pub mod history;
+pub mod messages;
 pub mod sessions;
 
 use std::sync::Arc;
@@ -9,13 +11,13 @@ use std::sync::Arc;
 use axum::extract::{Request, State};
 use axum::middleware::{self, Next};
 use axum::response::Response;
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Router, http};
 
 use crate::error::ApiError;
 use crate::state::AppState;
 
-/// Every route the lane serves in C4.
+/// Every route the lane serves through C5.
 ///
 /// `/v1/healthz` is registered on a separate router and merged in, so the token layer — attached
 /// with `route_layer`, which only runs on a matched route — cannot reach it. That is the plan's
@@ -23,9 +25,15 @@ use crate::state::AppState;
 /// uses it to tell "bound" from "stale record").
 pub fn router(state: Arc<AppState>) -> Router {
     let guarded = Router::new()
-        .route("/v1/sessions", get(sessions::list_sessions))
+        .route(
+            "/v1/sessions",
+            get(sessions::list_sessions).post(messages::create_session),
+        )
         .route("/v1/sessions/{id}", get(sessions::get_session))
         .route("/v1/sessions/{id}/history", get(history::get_history))
+        .route("/v1/sessions/{id}/events", get(events::get_events))
+        .route("/v1/sessions/{id}/messages", post(messages::post_message))
+        .route("/v1/sessions/{id}/cancel", post(messages::post_cancel))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_token));
 
     Router::new()

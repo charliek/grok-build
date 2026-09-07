@@ -163,6 +163,11 @@ pub struct Notification {
     pub method: String,
     pub params: Value,
     /// `params.sessionId` when present; the key the leader itself fans out on.
+    ///
+    /// Read through [`crate::envelope::inner_params`], because the gateway forwards some ext
+    /// notifications wrapped — exactly what `leader/server.rs::extract_session_id` does, and for
+    /// the same reason: a wrapped frame with the outer object read literally looks session-less and
+    /// would never reach the session's SSE subscribers.
     pub session_id: Option<String>,
 }
 
@@ -222,27 +227,7 @@ impl AcpClient {
     /// The JSON-RPC `result` is then run through [`unwrap_ext_envelope`], so every caller in this
     /// crate sees the method's own payload whether or not the leader wrapped it.
     pub async fn request(&self, method: &str, params: Value) -> Result<Value, AcpError> {
-        // The task has already gone; skip the round trip and the timeout it would burn.
-        if self.cancel.is_cancelled() {
-            return Err(AcpError::Closed);
-        }
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let (tx, rx) = oneshot::channel();
-        self.pending.lock().await.insert(id, tx);
-
-        let wire = wire_method(method);
-        let payload = json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": wire,
-            "params": params,
-        })
-        .to_string();
-
-        if self.outbound.send(payload).is_err() {
-            self.pending.lock().await.remove(&id);
-            return Err(AcpError::Closed);
-        }
+        let (id, rx) = self.dispatch(method, params).await?;
 
         match tokio::time::timeout(self.timeout, rx).await {
             Ok(Ok(Ok(result))) => unwrap_ext_envelope(result).map_err(|detail| AcpError::Ext {
@@ -261,6 +246,76 @@ impl AcpClient {
                 Err(AcpError::Timeout(self.timeout, method.to_string()))
             }
         }
+    }
+
+    /// Send a request, queue it for the link before returning, and consume its response on a task.
+    ///
+    /// `session/prompt` is why this exists. Its JSON-RPC response does not arrive until the **turn
+    /// ends**, which can be many minutes away, so [`Self::request`] would either park the HTTP
+    /// handler for the whole turn or blow its 30 s timeout and report a queued prompt as a failure.
+    /// The plan's answer is to return `202 accepted` the moment the prompt is on the wire and let
+    /// the turn play out over the event stream.
+    ///
+    /// The response is still *consumed*: without a waiter the correlation map would keep the entry
+    /// and the eventual reply would be logged as an unknown id. The wait is deliberately **not**
+    /// timed out — a turn has no bound — and cannot leak past the link, because `run_link` clears
+    /// the pending map on close, which drops the sender and wakes this task.
+    ///
+    /// Errors here are the *send* failing, never the turn failing: the payload is enqueued for the
+    /// link task in call order — so a prompt cannot overtake the `session/load` that preceded it —
+    /// and a turn that errors is reported on the event stream, which is the only place a client is
+    /// still listening by then.
+    pub async fn request_detached(&self, method: &str, params: Value) -> Result<(), AcpError> {
+        let (id, rx) = self.dispatch(method, params).await?;
+        let method = method.to_string();
+        tokio::spawn(async move {
+            match rx.await {
+                Ok(Ok(_)) => debug!(id, method, "gx-remote-api: detached request completed"),
+                Ok(Err((code, message))) => {
+                    warn!(
+                        id,
+                        method, code, message, "gx-remote-api: detached request failed"
+                    )
+                }
+                Err(_) => debug!(
+                    id,
+                    method, "gx-remote-api: link closed before the detached request answered"
+                ),
+            }
+        });
+        Ok(())
+    }
+
+    /// Assign an id, register the waiter, and put the payload on the wire.
+    ///
+    /// Shared by [`Self::request`] and [`Self::request_detached`] so the two cannot drift on the
+    /// one thing that matters: the payload is queued for the leader **before** either returns.
+    async fn dispatch(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> Result<(i64, oneshot::Receiver<Result<Value, (i64, String)>>), AcpError> {
+        // The task has already gone; skip the round trip and the timeout it would burn.
+        if self.cancel.is_cancelled() {
+            return Err(AcpError::Closed);
+        }
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = oneshot::channel();
+        self.pending.lock().await.insert(id, tx);
+
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": wire_method(method),
+            "params": params,
+        })
+        .to_string();
+
+        if self.outbound.send(payload).is_err() {
+            self.pending.lock().await.remove(&id);
+            return Err(AcpError::Closed);
+        }
+        Ok((id, rx))
     }
 
     /// Send a JSON-RPC notification (no id, no response).
@@ -387,7 +442,7 @@ async fn handle_inbound(
         // Notification.
         (Some(method), None) => {
             let params = msg.get("params").cloned().unwrap_or(Value::Null);
-            let session_id = params
+            let session_id = crate::envelope::inner_params(&params)
                 .get("sessionId")
                 .and_then(Value::as_str)
                 .map(String::from);
@@ -644,6 +699,64 @@ mod tests {
             .unwrap();
         assert_eq!(note.method, "x.ai/session_notification");
         assert_eq!(note.session_id.as_deref(), Some("sess-1"));
+    }
+
+    #[tokio::test]
+    async fn a_wrapped_notification_is_still_filed_under_its_session() {
+        // The gateway's wrapped ext form: the sessionId is one level down. Reading only the outer
+        // object would drop this frame out of its session's fan-out entirely.
+        let (client, handle) = spawn_over_fake();
+        let mut rx = client.subscribe();
+        client.initialize().await.unwrap();
+
+        handle.push(json!({
+            "jsonrpc": "2.0",
+            "method": "_x.ai/session_notification",
+            "params": {
+                "method": "x.ai/session_notification",
+                "params": { "sessionId": "sess-1", "update": {} }
+            },
+        }));
+
+        let note = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(note.session_id.as_deref(), Some("sess-1"));
+    }
+
+    #[tokio::test]
+    async fn a_detached_request_returns_without_waiting_for_the_answer() {
+        let (client, handle) = spawn_over_fake();
+        // No responder: the turn's response never comes, exactly like a `session/prompt` mid-turn.
+        handle.never_respond("session/prompt");
+
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            client.request_detached("session/prompt", json!({ "sessionId": "s" })),
+        )
+        .await
+        .expect("a detached request must not park the caller for the whole turn")
+        .unwrap();
+
+        // It is still sent — the link task writes what the call enqueued.
+        handle
+            .wait_for_outbound("session/prompt", Duration::from_secs(5))
+            .await;
+        assert_eq!(handle.outbound_methods(), vec!["session/prompt"]);
+    }
+
+    #[tokio::test]
+    async fn a_detached_request_on_a_dead_link_reports_the_send_failure() {
+        let (link, _handle) = FakeLink::new();
+        let cancel = CancellationToken::new();
+        let client = AcpClient::spawn(link, cancel.clone(), Duration::from_secs(5));
+        cancel.cancel();
+
+        assert!(matches!(
+            client.request_detached("session/prompt", json!({})).await,
+            Err(AcpError::Closed)
+        ));
     }
 
     #[tokio::test]

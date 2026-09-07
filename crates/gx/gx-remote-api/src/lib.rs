@@ -23,13 +23,20 @@
 //!                    LeaderClient ── framed IPC ──> $GROK_HOME/gx-leader.sock
 //! ```
 //!
-//! # What C4 covers
+//! # What is here
 //!
-//! The core plus the read-only routes: `/v1/healthz`, `/v1/sessions`, `/v1/sessions/{id}`,
-//! `/v1/sessions/{id}/history`, lazy attach, the token and the discovery record. Live SSE
-//! (`/v1/sessions/{id}/events`) lands in C5; approvals and prompts in C6. The seams they need —
-//! [`envelope::NormalizedEnvelope`], [`acp_client::AcpClient::subscribe`], the reverse-request
-//! branch — are in place and documented at their definitions.
+//! **C4** built the core and the read-only half: `/v1/healthz`, `/v1/sessions`,
+//! `/v1/sessions/{id}`, `/v1/sessions/{id}/history`, lazy attach, the token and the discovery
+//! record.
+//!
+//! **C5** adds the live half. `GET /v1/sessions/{id}/events` streams normalized frames over SSE and
+//! resumes from a `Last-Event-ID` cursor against a bounded in-memory [`ring`] (falling back to the
+//! persisted transcript when the cursor predates it); `POST /v1/sessions`,
+//! `POST /v1/sessions/{id}/messages` and `POST /v1/sessions/{id}/cancel` are the write verbs, each
+//! admitted by the session-state table in [`policy`].
+//!
+//! **C6** brings approvals: the reverse-request branch in [`acp_client`] and the seam in
+//! [`routes::events`] are where they land.
 //!
 //! # Accepted risks
 //!
@@ -58,6 +65,8 @@ pub mod discovery;
 pub mod envelope;
 pub mod error;
 pub mod link;
+pub mod policy;
+pub mod ring;
 pub mod routes;
 pub mod state;
 
@@ -76,7 +85,8 @@ use xai_grok_shell::leader::{ClientCapabilities, ClientMode, LeaderClient};
 
 use crate::acp_client::{AcpClient, DEFAULT_REQUEST_TIMEOUT};
 use crate::link::ChannelLink;
-use crate::state::{AppState, Attachments, HealthInfo};
+use crate::ring::EventRing;
+use crate::state::{AppState, Attachments, HealthInfo, SseSettings, spawn_event_pump};
 
 /// How the leader labels this client in `gx leader info` and in its logs.
 pub const CLIENT_TYPE: &str = "gx-remote-api";
@@ -125,6 +135,8 @@ pub struct Config {
     pub version: String,
     /// Per-request ceiling on the leader round trip.
     pub request_timeout: Duration,
+    /// Keepalive gap and per-connection queue bound for `/v1/sessions/{id}/events`.
+    pub sse: SseSettings,
 }
 
 impl Config {
@@ -141,6 +153,7 @@ impl Config {
             leader_pid: std::process::id(),
             version: xai_grok_version::VERSION.to_string(),
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            sse: SseSettings::default(),
         }
     }
 }
@@ -215,7 +228,12 @@ pub async fn serve(config: Config, cancel: CancellationToken) -> anyhow::Result<
             instance_id: instance_id.clone(),
         },
         attachments: Attachments::default(),
+        ring: EventRing::new(),
+        sse: config.sse.clone(),
     });
+    // Start filling the ring now, not on the first SSE connection: what makes a reconnect cheap is
+    // the frames that arrived while nobody was connected.
+    spawn_event_pump(state.clone(), cancel.clone());
 
     let record_path = discovery::record_path(&config.grok_home, &config.socket_path);
     discovery::write_record(

@@ -19,12 +19,22 @@ use tower::ServiceExt;
 use crate::acp_client::AcpClient;
 use crate::auth::Token;
 use crate::link::{FakeLink, FakeLinkHandle};
-use crate::state::{AppState, Attachments, HealthInfo};
+use crate::ring::EventRing;
+use crate::state::{AppState, Attachments, HealthInfo, SseSettings, spawn_event_pump};
 
 /// Obviously fake; never a real credential (CLAUDE.md § Secrets).
 const TOKEN: &str = "00000000000000000000000000000000deadbeefdeadbeefdeadbeefdeadbeef";
 
 fn test_app() -> (Router, FakeLinkHandle) {
+    test_app_with(SseSettings::default(), EventRing::new())
+}
+
+/// The router the production `serve` builds, over a scripted link and with the SSE lane's two
+/// bounds under the test's control.
+///
+/// `spawn_event_pump` is started here for the same reason `serve` starts it: the ring has to be
+/// filling before any connection exists, because that is exactly the window a resume is for.
+fn test_app_with(sse: SseSettings, ring: EventRing) -> (Router, FakeLinkHandle) {
     let (link, handle) = FakeLink::new();
     let acp = AcpClient::spawn(link, CancellationToken::new(), Duration::from_secs(5));
     let state = Arc::new(AppState {
@@ -36,7 +46,10 @@ fn test_app() -> (Router, FakeLinkHandle) {
             instance_id: "inst-abc".into(),
         },
         attachments: Attachments::default(),
+        ring,
+        sse,
     });
+    spawn_event_pump(state.clone(), state.acp.cancel_token());
     (crate::routes::router(state), handle)
 }
 
@@ -589,5 +602,866 @@ async fn a_malformed_pagination_bound_is_a_bad_request() {
     assert!(
         handle.outbound_methods().is_empty(),
         "a bad request must be rejected before the leader is touched"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// POST verbs — authorization, and the four shapes a write takes
+// ---------------------------------------------------------------------------
+
+/// A `POST` with the crate's valid token and a JSON body.
+fn authed_post(uri: &str, body: Value) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("authorization", format!("Bearer {TOKEN}"))
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+/// `session_id` in `activity`, attachable, with every write verb scripted.
+///
+/// `session/prompt` is deliberately answered by nothing: its real response does not arrive until
+/// the turn ends, and a handler that waited for it would hang here exactly as it would in
+/// production. `session/cancel` is a notification and needs no responder at all.
+fn stub_writable_session(handle: &FakeLinkHandle, session_id: &str, activity: &str) {
+    handle.respond_ext_ok(
+        "x.ai/sessions/list",
+        json!({ "sessions": [roster_row(session_id, activity)] }),
+    );
+    handle.respond_ok("session/load", json!({}));
+    handle.never_respond("session/prompt");
+    handle.respond_ext_ok("x.ai/interject", json!({ "status": "queued" }));
+}
+
+/// Every cell of the plan's admission table, over the real router.
+///
+/// `queue` is allowed everywhere, `interject` only into a running turn, `cancel` only when there is
+/// something to interrupt. A denial is `409 not_accepting` — not `403`: the caller's credential is
+/// fine, the session's state is what refuses.
+#[tokio::test]
+async fn the_authorization_matrix_holds_for_every_activity_and_verb() {
+    // activity, queue, interject, cancel
+    let matrix = [
+        ("working", true, true, true),
+        ("needs_input", true, false, true),
+        ("idle", true, false, false),
+        ("completed", true, false, false),
+        ("dormant", true, false, false),
+        ("dead", true, false, false),
+    ];
+
+    for (activity, queue, interject, cancel) in matrix {
+        for (verb, allowed) in [
+            ("queue", queue),
+            ("interject", interject),
+            ("cancel", cancel),
+        ] {
+            let (app, handle) = test_app();
+            stub_writable_session(&handle, "sess-1", activity);
+
+            let request = if verb == "cancel" {
+                authed_post("/v1/sessions/sess-1/cancel", json!({}))
+            } else {
+                authed_post(
+                    "/v1/sessions/sess-1/messages",
+                    json!({ "text": "hello", "mode": verb }),
+                )
+            };
+            let (status, body) = call(&app, request).await;
+
+            if allowed {
+                assert_eq!(status, StatusCode::ACCEPTED, "{activity} / {verb}: {body}");
+                assert_eq!(body["accepted"], true, "{activity} / {verb}");
+            } else {
+                assert_eq!(status, StatusCode::CONFLICT, "{activity} / {verb}: {body}");
+                assert_eq!(body["error"], "not_accepting", "{activity} / {verb}");
+                let message = body["message"].as_str().unwrap();
+                assert!(message.contains(activity), "{activity} / {verb}: {message}");
+                assert!(message.contains("queue"), "{activity} / {verb}: {message}");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_denied_verb_never_reaches_the_leader() {
+    let (app, handle) = test_app();
+    stub_writable_session(&handle, "sess-1", "idle");
+
+    let (status, _) = call(
+        &app,
+        authed_post(
+            "/v1/sessions/sess-1/messages",
+            json!({ "text": "hi", "mode": "interject" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    // Attaching is fine — it precedes the decision by design — but the verb itself must not go out.
+    let sent = handle.outbound_methods();
+    assert!(!sent.contains(&"_x.ai/interject".to_string()), "{sent:?}");
+    assert!(!sent.contains(&"session/prompt".to_string()), "{sent:?}");
+}
+
+#[tokio::test]
+async fn a_queued_message_answers_while_the_turn_is_still_running() {
+    let (app, handle) = test_app();
+    stub_writable_session(&handle, "sess-1", "working");
+
+    // `session/prompt` is scripted to never answer. A handler that awaited the turn would hang here
+    // until the test's own timeout, not return 202.
+    let (status, body) = tokio::time::timeout(
+        Duration::from_secs(5),
+        call(
+            &app,
+            authed_post("/v1/sessions/sess-1/messages", json!({ "text": "hello" })),
+        ),
+    )
+    .await
+    .expect("a queued prompt must not block on the turn it starts");
+
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(body["accepted"], true);
+    assert_eq!(body["mode"], "queue", "queue is the default mode");
+
+    // Attach first, then the prompt — and the prompt is really on the wire, in ACP's content-block
+    // shape, not merely accepted and dropped.
+    let prompt = handle
+        .wait_for_outbound("session/prompt", Duration::from_secs(5))
+        .await;
+    assert_eq!(
+        handle.outbound_methods(),
+        vec!["_x.ai/sessions/list", "session/load", "session/prompt"]
+    );
+    assert_eq!(prompt["params"]["sessionId"], "sess-1");
+    assert_eq!(prompt["params"]["prompt"][0]["type"], "text");
+    assert_eq!(prompt["params"]["prompt"][0]["text"], "hello");
+}
+
+#[tokio::test]
+async fn an_interjection_returns_the_status_the_leader_reported() {
+    let (app, handle) = test_app();
+    stub_writable_session(&handle, "sess-1", "working");
+    // The live shape: `_x.ai/interject` wraps `{status}` in an `ExtMethodResult` envelope.
+    handle.respond_ext_ok("x.ai/interject", json!({ "status": "queued" }));
+
+    let (status, body) = call(
+        &app,
+        authed_post(
+            "/v1/sessions/sess-1/messages",
+            json!({ "text": "stop that", "mode": "interject" }),
+        ),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(body["mode"], "interject");
+    assert_eq!(
+        body["status"], "queued",
+        "the envelope must be unwrapped before the status is read: {body}"
+    );
+    let interject = handle.first_outbound("_x.ai/interject").unwrap();
+    assert_eq!(interject["params"]["sessionId"], "sess-1");
+    assert_eq!(interject["params"]["text"], "stop that");
+}
+
+#[tokio::test]
+async fn cancel_sends_a_notification_with_no_id() {
+    let (app, handle) = test_app();
+    stub_writable_session(&handle, "sess-1", "working");
+
+    let (status, body) = call(&app, authed_post("/v1/sessions/sess-1/cancel", json!({}))).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(body["accepted"], true);
+
+    let cancel = handle
+        .wait_for_outbound("session/cancel", Duration::from_secs(5))
+        .await;
+    assert_eq!(cancel["params"]["sessionId"], "sess-1");
+    assert!(
+        cancel.get("id").is_none(),
+        "session/cancel is a notification; an id would make the leader owe us a response it never \
+         sends: {cancel}"
+    );
+}
+
+#[tokio::test]
+async fn a_bad_message_body_is_a_bad_request_before_the_leader_is_touched() {
+    for body in [
+        json!({}),                                // no text
+        json!({ "text": "   " }),                 // blank text
+        json!({ "text": "hi", "mode": "steer" }), // a mode this API has no verb for
+    ] {
+        let (app, handle) = test_app();
+        stub_writable_session(&handle, "sess-1", "working");
+
+        let (status, response) = call(
+            &app,
+            authed_post("/v1/sessions/sess-1/messages", body.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(response["error"], "bad_request", "{body}");
+        assert!(
+            handle.outbound_methods().is_empty(),
+            "{body} reached the leader: {:?}",
+            handle.outbound_methods()
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_write_to_an_unknown_session_is_404() {
+    let (app, handle) = test_app();
+    stub_no_such_session(&handle);
+
+    for request in [
+        authed_post("/v1/sessions/nope/messages", json!({ "text": "hi" })),
+        authed_post("/v1/sessions/nope/cancel", json!({})),
+    ] {
+        let (status, body) = call(&app, request).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"], "unknown_session");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// POST /v1/sessions
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn creating_a_session_returns_its_id_and_does_not_load_it_again() {
+    let (app, handle) = test_app();
+    handle.respond_ok("session/new", json!({ "sessionId": "sess-new" }));
+    handle.respond_ext_ok(
+        "x.ai/sessions/list",
+        json!({ "sessions": [roster_row("sess-new", "idle")] }),
+    );
+
+    let (status, body) = call(&app, authed_post("/v1/sessions", json!({ "cwd": "/repo" }))).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body["sessionId"], "sess-new");
+
+    let new = handle.first_outbound("session/new").unwrap();
+    assert_eq!(new["params"]["cwd"], "/repo");
+    assert_eq!(new["params"]["mcpServers"], json!([]));
+    assert_eq!(
+        handle.outbound_methods(),
+        vec!["session/new"],
+        "no prompt was asked for, and `session/new` already subscribed us"
+    );
+
+    // The lane counts itself attached, so the next touch does not send a redundant `session/load`.
+    let (_, roster) = call(&app, authed_get("/v1/sessions")).await;
+    assert_eq!(roster["sessions"][0]["attached"], true);
+}
+
+#[tokio::test]
+async fn creating_a_session_with_text_sends_the_first_prompt() {
+    let (app, handle) = test_app();
+    handle.respond_ok("session/new", json!({ "sessionId": "sess-new" }));
+    handle.never_respond("session/prompt");
+
+    let (status, body) = call(
+        &app,
+        authed_post(
+            "/v1/sessions",
+            json!({ "cwd": "/repo", "text": "start here" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body["sessionId"], "sess-new");
+
+    let prompt = handle
+        .wait_for_outbound("session/prompt", Duration::from_secs(5))
+        .await;
+    assert_eq!(
+        handle.outbound_methods(),
+        vec!["session/new", "session/prompt"],
+        "the session has to exist before it can be prompted"
+    );
+    assert_eq!(prompt["params"]["sessionId"], "sess-new");
+    assert_eq!(prompt["params"]["prompt"][0]["text"], "start here");
+}
+
+#[tokio::test]
+async fn creating_a_session_reports_a_leader_that_answers_without_an_id() {
+    let (app, handle) = test_app();
+    handle.respond_ok("session/new", json!({}));
+
+    let (status, body) = call(&app, authed_post("/v1/sessions", json!({ "cwd": "/repo" }))).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["error"], "leader_unavailable");
+}
+
+#[tokio::test]
+async fn creating_a_session_without_a_cwd_is_a_bad_request() {
+    let (app, handle) = test_app();
+    handle.respond_ok("session/new", json!({ "sessionId": "sess-new" }));
+
+    for body in [json!({}), json!({ "cwd": "" })] {
+        let (status, response) = call(&app, authed_post("/v1/sessions", body.clone())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(response["error"], "bad_request", "{body}");
+    }
+    assert!(handle.outbound_methods().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// GET /v1/sessions/{id}/events — the SSE lane
+// ---------------------------------------------------------------------------
+
+/// How long a test waits for a frame that should already be on its way.
+const FRAME_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long a test waits to conclude that **no** further frame is coming. Short on purpose: this is
+/// the only wall-clock cost in the SSE tests, and it is bounded rather than slept through.
+const QUIET_TIMEOUT: Duration = Duration::from_millis(150);
+
+/// One SSE frame, parsed off the wire.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct SseFrame {
+    event: Option<String>,
+    id: Option<String>,
+    data: String,
+    comments: Vec<String>,
+}
+
+impl SseFrame {
+    fn parse(block: &str) -> Self {
+        let mut frame = Self::default();
+        for line in block.lines().filter(|line| !line.is_empty()) {
+            if let Some(comment) = line.strip_prefix(':') {
+                frame.comments.push(comment.to_string());
+                continue;
+            }
+            let Some((field, value)) = line.split_once(':') else {
+                continue;
+            };
+            let value = value.strip_prefix(' ').unwrap_or(value);
+            match field {
+                "event" => frame.event = Some(value.to_string()),
+                "id" => frame.id = Some(value.to_string()),
+                "data" => {
+                    if !frame.data.is_empty() {
+                        frame.data.push('\n');
+                    }
+                    frame.data.push_str(value);
+                }
+                _ => {}
+            }
+        }
+        frame
+    }
+
+    fn json(&self) -> Value {
+        serde_json::from_str(&self.data)
+            .unwrap_or_else(|err| panic!("frame data is not JSON ({err}): {:?}", self.data))
+    }
+
+    fn is(&self, event: &str) -> bool {
+        self.event.as_deref() == Some(event)
+    }
+}
+
+/// A live SSE response body, read frame by frame.
+///
+/// The stream never ends on its own, so every read is bounded: [`Self::next_frame`] for a frame that
+/// must arrive, [`Self::expect_quiet`] for the assertion that nothing more will.
+struct SseStream {
+    body: std::pin::Pin<Box<axum::body::BodyDataStream>>,
+    buffer: String,
+}
+
+impl SseStream {
+    async fn open(
+        app: &Router,
+        request: Request<Body>,
+    ) -> (StatusCode, axum::http::HeaderMap, Self) {
+        let response = app.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let headers = response.headers().clone();
+        (
+            status,
+            headers,
+            Self {
+                body: Box::pin(response.into_body().into_data_stream()),
+                buffer: String::new(),
+            },
+        )
+    }
+
+    async fn try_next_frame(&mut self, timeout: Duration) -> Option<SseFrame> {
+        use tokio_stream::StreamExt as _;
+        loop {
+            if let Some(end) = self.buffer.find("\n\n") {
+                let block: String = self.buffer.drain(..end + 2).collect();
+                return Some(SseFrame::parse(&block));
+            }
+            let chunk = tokio::time::timeout(timeout, self.body.next())
+                .await
+                .ok()??;
+            self.buffer
+                .push_str(std::str::from_utf8(&chunk.expect("stream error")).unwrap());
+        }
+    }
+
+    async fn next_frame(&mut self) -> SseFrame {
+        self.try_next_frame(FRAME_TIMEOUT)
+            .await
+            .expect("the stream ended or stalled while a frame was still expected")
+    }
+
+    async fn next_frames(&mut self, count: usize) -> Vec<SseFrame> {
+        let mut frames = Vec::with_capacity(count);
+        for _ in 0..count {
+            frames.push(self.next_frame().await);
+        }
+        frames
+    }
+
+    /// Assert nothing more arrives. The keepalive is set to an hour in these tests, so a frame here
+    /// is a real one.
+    async fn expect_quiet(&mut self) {
+        if let Some(frame) = self.try_next_frame(QUIET_TIMEOUT).await {
+            panic!("expected no further frame, got {frame:?}");
+        }
+    }
+}
+
+/// SSE settings a test can reason about: a keepalive far beyond any test's life, so no comment
+/// frame can be mistaken for a real one, and the production queue bound unless a test says
+/// otherwise.
+fn test_sse(queue_capacity: usize) -> SseSettings {
+    SseSettings {
+        keepalive: Duration::from_secs(3600),
+        queue_capacity,
+    }
+}
+
+/// One stored/live frame for `session_id` at `counter`.
+fn ring_frame(session_id: &str, counter: u64) -> crate::envelope::NormalizedEnvelope {
+    crate::envelope::NormalizedEnvelope::from_stored(&stored_update(session_id, counter))
+}
+
+/// The `updates.jsonl` envelope for `session_id` at `counter`, as `x.ai/session/updates` returns it.
+fn stored_update(session_id: &str, counter: u64) -> Value {
+    json!({
+        "timestamp": 1_700_000_000_000_i64 + counter as i64,
+        "method": "session/update",
+        "params": {
+            "sessionId": session_id,
+            "update": { "sessionUpdate": "agent_message_chunk" },
+            "_meta": { "eventId": format!("{session_id}-{counter}") }
+        }
+    })
+}
+
+/// The live notification for the same event, in the form the leader broadcasts it.
+fn live_update(session_id: &str, counter: u64) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": stored_update(session_id, counter)["params"].clone(),
+    })
+}
+
+fn events_request(session_id: &str, cursor: Option<&str>) -> Request<Body> {
+    let mut builder = Request::builder()
+        .uri(format!("/v1/sessions/{session_id}/events"))
+        .header("authorization", format!("Bearer {TOKEN}"));
+    if let Some(cursor) = cursor {
+        builder = builder.header("last-event-id", cursor);
+    }
+    builder.body(Body::empty()).unwrap()
+}
+
+fn ids(frames: &[SseFrame]) -> Vec<Option<String>> {
+    frames.iter().map(|frame| frame.id.clone()).collect()
+}
+
+/// A ring holding `counters` for `session_id`, in that order.
+fn ring_with(session_id: &str, counters: &[u64]) -> EventRing {
+    let ring = EventRing::new();
+    for counter in counters {
+        ring.push(session_id, ring_frame(session_id, *counter));
+    }
+    ring
+}
+
+#[tokio::test]
+async fn a_cursor_inside_the_ring_replays_exactly_the_frames_after_it_in_order() {
+    let (app, handle) = test_app_with(test_sse(256), ring_with("sess-1", &[10, 11, 12]));
+    stub_attachable_session(&handle, "sess-1");
+
+    let (status, headers, mut stream) =
+        SseStream::open(&app, events_request("sess-1", Some("sess-1-10"))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers["content-type"], "text/event-stream",
+        "an SSE client dispatches on this"
+    );
+
+    let frames = stream.next_frames(2).await;
+    assert!(frames.iter().all(|f| f.is("update")), "{frames:?}");
+    assert_eq!(
+        ids(&frames),
+        vec![Some("sess-1-11".into()), Some("sess-1-12".into())],
+        "exactly the frames after the cursor, in order, and nothing already seen"
+    );
+    // The replay is from memory: no `x.ai/session/updates` was needed at all.
+    assert!(
+        !handle
+            .outbound_methods()
+            .contains(&"_x.ai/session/updates".to_string()),
+        "{:?}",
+        handle.outbound_methods()
+    );
+    stream.expect_quiet().await;
+}
+
+#[tokio::test]
+async fn interleaved_counters_from_another_session_do_not_break_the_replay() {
+    // The counter is process-global, so a session's own ids are sparse. A client must get its own
+    // events, in order, and must not see another session's — gaps included.
+    let ring = EventRing::new();
+    for (session, counter) in [
+        ("sess-1", 10),
+        ("sess-2", 11),
+        ("sess-1", 12),
+        ("sess-2", 13),
+        ("sess-1", 14),
+    ] {
+        ring.push(session, ring_frame(session, counter));
+    }
+    let (app, handle) = test_app_with(test_sse(256), ring);
+    stub_attachable_session(&handle, "sess-1");
+
+    let (status, _, mut stream) =
+        SseStream::open(&app, events_request("sess-1", Some("sess-1-10"))).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let frames = stream.next_frames(2).await;
+    assert_eq!(
+        ids(&frames),
+        vec![Some("sess-1-12".into()), Some("sess-1-14".into())],
+        "order and exact set are the promise; contiguity is not"
+    );
+    stream.expect_quiet().await;
+}
+
+#[tokio::test]
+async fn a_cursor_older_than_the_ring_reads_the_disk_and_does_not_repeat_the_overlap() {
+    // The ring holds 20..22; the disk holds 6, 20 and 21 (22 has not been flushed). The client
+    // resumes from 5, so it needs 6 from disk, 20 and 21 exactly once, and 22 from the ring.
+    let (app, handle) = test_app_with(test_sse(256), ring_with("sess-1", &[20, 21, 22]));
+    stub_attachable_session(&handle, "sess-1");
+    handle.respond_ok(
+        "x.ai/session/updates",
+        json!({
+            "updates": [
+                stored_update("sess-1", 5),
+                stored_update("sess-1", 6),
+                stored_update("sess-1", 20),
+                stored_update("sess-1", 21),
+            ],
+            "totalCount": 4,
+            "hasMore": false,
+            "lastEventId": "sess-1-21"
+        }),
+    );
+
+    let (status, _, mut stream) =
+        SseStream::open(&app, events_request("sess-1", Some("sess-1-5"))).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let frames = stream.next_frames(3).await;
+    assert_eq!(
+        ids(&frames),
+        vec![
+            Some("sess-1-6".into()),
+            Some("sess-1-20".into()),
+            Some("sess-1-21".into())
+        ],
+        "the cursor's own event is not replayed, and the disk covers the gap"
+    );
+
+    let tail = stream.next_frame().await;
+    assert_eq!(
+        tail.id.as_deref(),
+        Some("sess-1-22"),
+        "the ring supplies what the disk had not flushed yet"
+    );
+    stream.expect_quiet().await;
+
+    assert!(
+        handle
+            .outbound_methods()
+            .contains(&"_x.ai/session/updates".to_string()),
+        "a cursor older than the ring has to reach the store"
+    );
+}
+
+#[tokio::test]
+async fn a_cursor_newer_than_anything_known_resets_the_client() {
+    let (app, handle) = test_app_with(test_sse(256), ring_with("sess-1", &[10, 11]));
+    stub_attachable_session(&handle, "sess-1");
+
+    let (status, _, mut stream) =
+        SseStream::open(&app, events_request("sess-1", Some("sess-1-99"))).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let frame = stream.next_frame().await;
+    assert!(frame.is("reset"), "{frame:?}");
+    assert_eq!(frame.json()["reason"], "cursor_unresolvable");
+    assert_eq!(frame.id, None, "a reset is not a resume point");
+    stream.expect_quiet().await;
+}
+
+#[tokio::test]
+async fn an_empty_ring_falls_back_to_the_persisted_tail_to_place_a_cursor() {
+    // Nothing in memory, so "is this cursor from the future?" can only be answered by the store.
+    let (app, handle) = test_app_with(test_sse(256), EventRing::new());
+    stub_attachable_session(&handle, "sess-1");
+    handle.respond_ok(
+        "x.ai/session/updates",
+        json!({
+            "updates": [stored_update("sess-1", 8)],
+            "totalCount": 1,
+            "hasMore": false,
+            "lastEventId": "sess-1-8"
+        }),
+    );
+
+    let (_, _, mut stream) =
+        SseStream::open(&app, events_request("sess-1", Some("sess-1-9"))).await;
+    let frame = stream.next_frame().await;
+    assert!(frame.is("reset"), "{frame:?}");
+    assert_eq!(frame.json()["reason"], "cursor_unresolvable");
+
+    let probe = handle.first_outbound("_x.ai/session/updates").unwrap();
+    assert_eq!(
+        probe["params"]["offset"], -64,
+        "`lastEventId` is per-page, so the probe has to ask for the tail: {probe}"
+    );
+}
+
+#[tokio::test]
+async fn a_malformed_or_foreign_cursor_resets_the_client() {
+    for cursor in ["garbage", "sess-1-", "sess-1-abc", "sess-2-5", "-5"] {
+        let (app, handle) = test_app_with(test_sse(256), ring_with("sess-1", &[10, 11]));
+        stub_attachable_session(&handle, "sess-1");
+
+        let (status, _, mut stream) =
+            SseStream::open(&app, events_request("sess-1", Some(cursor))).await;
+        assert_eq!(status, StatusCode::OK, "{cursor}");
+
+        let frame = stream.next_frame().await;
+        assert!(frame.is("reset"), "{cursor}: {frame:?}");
+        assert_eq!(frame.json()["reason"], "cursor_unresolvable", "{cursor}");
+        // Not one frame of somebody else's session, and not a replay of ours either.
+        stream.expect_quiet().await;
+    }
+}
+
+#[tokio::test]
+async fn no_cursor_at_all_is_not_a_reset() {
+    let (app, handle) = test_app_with(test_sse(256), ring_with("sess-1", &[10, 11]));
+    stub_attachable_session(&handle, "sess-1");
+
+    let (status, _, mut stream) = SseStream::open(&app, events_request("sess-1", None)).await;
+    assert_eq!(status, StatusCode::OK);
+    // A fresh `EventSource` just starts live; the ring is not replayed to it.
+    stream.expect_quiet().await;
+}
+
+#[tokio::test]
+async fn live_update_frames_carry_an_id_and_roster_frames_do_not() {
+    let (app, handle) = test_app_with(test_sse(256), EventRing::new());
+    stub_attachable_session(&handle, "sess-1");
+
+    let (status, _, mut stream) = SseStream::open(&app, events_request("sess-1", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    handle.push(live_update("sess-1", 7));
+    // A machine-wide roster broadcast: no `sessionId` anywhere, so the stream has to match on the
+    // entries it carries.
+    handle.push(json!({
+        "jsonrpc": "2.0",
+        "method": "_x.ai/sessions/changed",
+        "params": {
+            "upserted": [roster_row("sess-1", "working")],
+            "removed": []
+        }
+    }));
+
+    let update = stream.next_frame().await;
+    assert!(update.is("update"), "{update:?}");
+    assert_eq!(update.id.as_deref(), Some("sess-1-7"));
+    assert_eq!(update.json()["eventId"], "sess-1-7");
+    assert_eq!(update.json()["method"], "session/update");
+    assert_eq!(
+        update.json()["params"]["update"]["sessionUpdate"],
+        "agent_message_chunk"
+    );
+
+    let session = stream.next_frame().await;
+    assert!(session.is("session"), "{session:?}");
+    assert_eq!(
+        session.id, None,
+        "an invalidation is not a resume point; giving it an id would let a browser resume from it"
+    );
+    assert_eq!(session.json()["sessionId"], "sess-1");
+    assert_eq!(session.json()["activity"], "working");
+    stream.expect_quiet().await;
+}
+
+#[tokio::test]
+async fn a_roster_change_for_another_session_is_not_this_streams_business() {
+    let (app, handle) = test_app_with(test_sse(256), EventRing::new());
+    stub_attachable_session(&handle, "sess-1");
+
+    let (_, _, mut stream) = SseStream::open(&app, events_request("sess-1", None)).await;
+    handle.push(json!({
+        "jsonrpc": "2.0",
+        "method": "_x.ai/sessions/changed",
+        "params": { "upserted": [roster_row("sess-2", "working")], "removed": [] }
+    }));
+    handle.push(live_update("sess-2", 3));
+
+    stream.expect_quiet().await;
+}
+
+#[tokio::test]
+async fn a_slow_consumer_is_told_once_and_then_continues_from_live() {
+    // Queue of one, so a second frame that arrives before the client reads the first is dropped.
+    // Production is 256; the behaviour under test is identical and this makes it reachable without
+    // flooding 257 frames past a reader that is not reading.
+    let (app, handle) = test_app_with(test_sse(1), EventRing::new());
+    stub_attachable_session(&handle, "sess-1");
+
+    let (status, _, mut stream) = SseStream::open(&app, events_request("sess-1", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    for counter in [1, 2, 3] {
+        handle.push(live_update("sess-1", counter));
+    }
+    // Let the link and the connection's producer drain the broadcast before anything reads the
+    // body. Nothing polls the response body until `next_frame` below — the stream lives in this
+    // test, not in a task — so the producer cannot be rescued by a reader here: it has to overflow.
+    for _ in 0..200 {
+        tokio::task::yield_now().await;
+    }
+
+    let first = stream.next_frame().await;
+    assert!(first.is("update"), "{first:?}");
+    assert_eq!(first.id.as_deref(), Some("sess-1-1"));
+
+    let reset = stream.next_frame().await;
+    assert!(reset.is("reset"), "{reset:?}");
+    assert_eq!(reset.json()["reason"], "slow_consumer");
+    assert_eq!(reset.id, None, "a reset is not a resume point");
+
+    // Frames 2 and 3 are gone, and the client is told once — not once per dropped frame.
+    stream.expect_quiet().await;
+
+    // …and the connection is still live: the next real event still arrives.
+    handle.push(live_update("sess-1", 4));
+    let resumed = stream.next_frame().await;
+    assert!(resumed.is("update"), "{resumed:?}");
+    assert_eq!(
+        resumed.id.as_deref(),
+        Some("sess-1-4"),
+        "a slow consumer is re-synced, not disconnected"
+    );
+    stream.expect_quiet().await;
+}
+
+#[tokio::test]
+async fn a_stream_attaches_before_it_streams_and_404s_an_unknown_session() {
+    let (app, handle) = test_app_with(test_sse(256), EventRing::new());
+    stub_attachable_session(&handle, "sess-1");
+
+    let (status, _, _stream) = SseStream::open(&app, events_request("sess-1", None)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        handle.outbound_methods(),
+        vec!["_x.ai/sessions/list", "session/load"],
+        "resolve, attach, then stream — a stream for a session the lane never loaded is a stream \
+         of nothing"
+    );
+
+    let (app, handle) = test_app_with(test_sse(256), EventRing::new());
+    stub_no_such_session(&handle);
+    let (status, body) = call(&app, events_request("nope", None)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["error"], "unknown_session");
+}
+
+#[tokio::test]
+async fn the_event_stream_needs_a_token_like_everything_else() {
+    let (app, handle) = test_app_with(test_sse(256), EventRing::new());
+    stub_attachable_session(&handle, "sess-1");
+
+    let (status, body) = call(&app, get("/v1/sessions/sess-1/events")).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body["error"], "unauthorized");
+    assert!(handle.outbound_methods().is_empty());
+}
+
+#[tokio::test]
+async fn the_ring_is_filled_from_the_live_fan_out_so_a_reconnect_resumes_from_memory() {
+    // The end-to-end shape of a dropped tunnel: a phone streams, the connection dies, the leader
+    // keeps talking, the phone comes back with the last id it saw. Nothing here pre-loads the ring
+    // — `spawn_event_pump` fills it from the same broadcast the connection reads.
+    let (app, handle) = test_app_with(test_sse(256), EventRing::new());
+    stub_attachable_session(&handle, "sess-1");
+
+    let (status, _, mut first) = SseStream::open(&app, events_request("sess-1", None)).await;
+    assert_eq!(status, StatusCode::OK);
+    for counter in [10, 11, 12] {
+        handle.push(live_update("sess-1", counter));
+    }
+    // Read them on the live connection, which also gives the pump time to file the same frames.
+    assert_eq!(
+        ids(&first.next_frames(3).await),
+        vec![
+            Some("sess-1-10".into()),
+            Some("sess-1-11".into()),
+            Some("sess-1-12".into())
+        ]
+    );
+    drop(first);
+
+    let (status, _, mut resumed) =
+        SseStream::open(&app, events_request("sess-1", Some("sess-1-10"))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        ids(&resumed.next_frames(2).await),
+        vec![Some("sess-1-11".into()), Some("sess-1-12".into())],
+        "the frames that arrived while nobody was connected are exactly what a resume is for"
+    );
+    resumed.expect_quiet().await;
+
+    // Purely from memory: the session was never re-read off disk.
+    assert!(
+        !handle
+            .outbound_methods()
+            .contains(&"_x.ai/session/updates".to_string()),
+        "{:?}",
+        handle.outbound_methods()
+    );
+    // And it attached exactly once across both connections.
+    assert_eq!(
+        handle
+            .outbound_methods()
+            .iter()
+            .filter(|m| *m == "session/load")
+            .count(),
+        1
     );
 }

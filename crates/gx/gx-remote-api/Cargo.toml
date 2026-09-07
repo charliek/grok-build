@@ -17,6 +17,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+# `wrappers::ReceiverStream` turns the SSE lane's per-connection queue into the `Stream`
+# `axum::response::sse::Sse` wants, and `StreamExt` reads a response body back in the tests.
+tokio-stream = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 xai-dirs = { workspace = true }

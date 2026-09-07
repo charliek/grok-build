@@ -25,8 +25,10 @@ pub struct History {
     pub updates: Vec<NormalizedEnvelope>,
     pub total_count: u64,
     pub has_more: bool,
-    /// The newest `eventId` in the *whole* session, not just this page; `null` when no line in the
-    /// page carried one. C5 resumes an SSE stream from it.
+    /// The newest `eventId` **in this page**, found by reverse-scanning it
+    /// (`extensions/session_updates.rs::extract_last_event_id`); `null` when no line in the page
+    /// carried one. The SSE lane's "what is the newest event in this session" probe therefore has
+    /// to ask for the *tail* — see `routes::events::newest_persisted`.
     pub last_event_id: Option<String>,
 }
 
@@ -49,16 +51,35 @@ pub async fn get_history(
     let session = resolve_session(&state, &id).await?;
     ensure_attached(&state, &id, &session.cwd).await?;
 
-    let mut params = json!({ "sessionId": id, "cwd": session.cwd });
-    if let Some(offset) = query.offset {
+    Ok(Json(
+        fetch_updates(&state, &id, &session.cwd, query.offset, query.limit).await?,
+    ))
+}
+
+/// One `x.ai/session/updates` page, normalized.
+///
+/// Shared with the SSE lane, which reads the same store when a resume cursor predates its in-memory
+/// ring — one caller for the transcript a client asks for and one for the transcript it missed,
+/// over exactly one wire shape.
+///
+/// Attaching is the **caller's** job: this is a read, and the two callers attach at different
+/// points in their own flow.
+pub async fn fetch_updates(
+    state: &Arc<AppState>,
+    session_id: &str,
+    cwd: &str,
+    offset: Option<i64>,
+    limit: Option<u64>,
+) -> Result<History, ApiError> {
+    let mut params = json!({ "sessionId": session_id, "cwd": cwd });
+    if let Some(offset) = offset {
         params["offset"] = json!(offset);
     }
-    if let Some(limit) = query.limit {
+    if let Some(limit) = limit {
         params["limit"] = json!(limit);
     }
-
     let response = state.acp.request(SESSION_UPDATES, params).await?;
-    Ok(Json(normalize_response(&response)))
+    Ok(normalize_response(&response))
 }
 
 /// Turn the leader's `{ updates, totalCount, hasMore, lastEventId }` into ours.
