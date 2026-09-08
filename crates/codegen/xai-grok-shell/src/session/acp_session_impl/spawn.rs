@@ -617,6 +617,8 @@ pub(crate) async fn spawn_session_actor(
         reasoning_summary: sampling_config.reasoning_summary,
         stream_tool_calls: Some(sampling_config.stream_tool_calls),
         codex_compat: Some(sampling_config.codex_compat),
+        // gx: see `SamplingConfig::hoist_tool_images`.
+        hoist_tool_images: Some(sampling_config.hoist_tool_images),
     };
     let actor_pruning_config = xai_chat_state::PruningConfig {
         enabled: session_pruning_config.enabled,
@@ -1838,6 +1840,8 @@ pub(crate) async fn spawn_session_actor(
         pending_interactions: pending_interactions.clone(),
         telemetry_enabled,
         supports_backend_search: std::cell::Cell::new(sampling_config.supports_backend_search),
+        // gx: see `SessionActor::supports_vision`.
+        supports_vision: std::cell::Cell::new(sampling_config.supports_vision),
         tool_overrides: std::cell::RefCell::new(None),
         resolved_tool_overrides: resolved_tool_overrides.clone(),
         compactions_remaining: std::cell::Cell::new(sampling_config.compactions_remaining),
@@ -2056,6 +2060,7 @@ pub(crate) async fn spawn_session_actor(
         last_api_request_at: std::sync::atomic::AtomicI64::new(0),
         hook_registry: std::cell::RefCell::new(built_hook_registry),
         hook_disabled: std::cell::RefCell::new(Arc::new(hook_disabled)),
+        gx_hook_env: Default::default(), // gx: roost hook identity (issue #14)
         turn_report: Default::default(),
         turn_abort: Default::default(),
         turn_end_tx: Default::default(),
@@ -2087,6 +2092,8 @@ pub(crate) async fn spawn_session_actor(
         turn_stream_drained: parking_lot::Mutex::new(std::collections::HashMap::new()),
         pending_image_strip: parking_lot::Mutex::new(std::collections::HashMap::new()),
         image_strip_rewrite_barrier: ImageStripRewriteBarrier::new(),
+        // gx: see `SessionActor::told_model_text_only_image_notice`.
+        told_model_text_only_image_notice: std::sync::atomic::AtomicBool::new(false),
         sampler_handle,
         sampling_gate,
         rebuild_spec: rebuild_spec.clone(),
@@ -2476,6 +2483,7 @@ pub(crate) async fn spawn_session_actor(
         session_default_agent_profile,
         allowed_subagent_types: allowed_subagent_types_for_handle,
         hook_registry: hook_registry_for_handle,
+        gx_hook_env: Default::default(), // gx: roost hook identity (issue #14)
         workspace_ops: workspace_ops_for_handle,
         terminal_backend: Some(terminal_backend.clone()),
         tools_notification_handle: Some(tools_notification_handle.clone()),

@@ -97,6 +97,10 @@ jobs:
       - name: Test xai-grok-shell (lib subset)
         run: |
           cargo test -p xai-grok-shell --lib --locked -- \
+            gx_hook_env \
+            gx_leader_shutdown \
+            gx_tool_images \
+            tool_result_images \
             leader:: \
             agent::model_providers::tests:: \
             agent::reasoning_family \
@@ -118,6 +122,12 @@ jobs:
       # runs -- it is fork code, so there is no upstream breakage to skip past.
       - name: Test gx-remote-api
         run: cargo test -p gx-remote-api --locked
+
+      # Upstream crate, but gx adds fields to the `SamplingConfig` it owns
+      # (`codex_compat`, `hoist_tool_images`) and stamps them onto every
+      # request it builds, so its suite is part of the gate.
+      - name: Test xai-chat-state
+        run: cargo test -p xai-chat-state --locked
 
       # Upstream crate, but gx adds `OperationSet::with` to it (the vocabulary
       # the remote lane's authorization matrix is built from), so its suite is

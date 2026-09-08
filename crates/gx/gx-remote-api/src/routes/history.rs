@@ -14,7 +14,9 @@ use serde_json::{Value, json};
 
 use crate::envelope::NormalizedEnvelope;
 use crate::error::ApiError;
-use crate::routes::sessions::{ensure_attached, resolve_session};
+use crate::routes::sessions::{
+    SessionSummary, ensure_attached, resolve_session, session_scoped_request,
+};
 use crate::state::AppState;
 
 const SESSION_UPDATES: &str = "x.ai/session/updates";
@@ -49,10 +51,10 @@ pub async fn get_history(
 
     // 404s before anything is sent to the leader if the session does not exist at all.
     let session = resolve_session(&state, &id).await?;
-    ensure_attached(&state, &id, &session.cwd).await?;
+    ensure_attached(&state, &session).await?;
 
     Ok(Json(
-        fetch_updates(&state, &id, &session.cwd, query.offset, query.limit).await?,
+        fetch_updates(&state, &session, query.offset, query.limit).await?,
     ))
 }
 
@@ -63,22 +65,23 @@ pub async fn get_history(
 /// over exactly one wire shape.
 ///
 /// Attaching is the **caller's** job: this is a read, and the two callers attach at different
-/// points in their own flow.
+/// points in their own flow. It goes out through [`session_scoped_request`], though, so a session
+/// the agent unloaded between the attach and here is reloaded and the page re-read once rather than
+/// answered `503`.
 pub async fn fetch_updates(
     state: &Arc<AppState>,
-    session_id: &str,
-    cwd: &str,
+    session: &SessionSummary,
     offset: Option<i64>,
     limit: Option<u64>,
 ) -> Result<History, ApiError> {
-    let mut params = json!({ "sessionId": session_id, "cwd": cwd });
+    let mut params = json!({ "sessionId": session.session_id, "cwd": session.cwd });
     if let Some(offset) = offset {
         params["offset"] = json!(offset);
     }
     if let Some(limit) = limit {
         params["limit"] = json!(limit);
     }
-    let response = state.acp.request(SESSION_UPDATES, params).await?;
+    let response = session_scoped_request(state, session, SESSION_UPDATES, params).await?;
     Ok(normalize_response(&response))
 }
 

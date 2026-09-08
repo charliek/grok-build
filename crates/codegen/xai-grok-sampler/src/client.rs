@@ -350,6 +350,8 @@ struct ClientDefaults {
     reasoning_summary: Option<xai_grok_sampling_types::ReasoningSummary>,
     // gx: see `SamplerConfig::codex_compat`.
     codex_compat: bool,
+    // gx: see `SamplerConfig::hoist_tool_images`.
+    hoist_tool_images: bool,
     extra_response_includes: Vec<String>,
     doom_loop_recovery: Option<xai_grok_sampling_types::DoomLoopRecoveryPolicy>,
 }
@@ -658,6 +660,7 @@ impl SamplingClient {
             stream_tool_calls: config.stream_tool_calls,
             reasoning_summary: config.reasoning_summary,
             codex_compat: config.codex_compat,
+            hoist_tool_images: config.hoist_tool_images,
             extra_response_includes: config.extra_response_includes,
             doom_loop_recovery: config.doom_loop_recovery,
         };
@@ -1977,6 +1980,7 @@ impl SamplingClient {
         // so the flag reaches side calls, compaction, and recap requests too --
         // not just the ones built by the chat-state actor.
         request.codex_compat = self.defaults.codex_compat;
+        request.hoist_tool_images = self.defaults.hoist_tool_images;
 
         Ok(())
     }
@@ -3490,6 +3494,41 @@ mod tests {
             "a request built anywhere -- side call, compaction, recap -- must \
              still be shaped for the endpoint it is going to"
         );
+    }
+
+    // gx: same two seams for the tool-image hoist. The message shaping itself
+    // is asserted in `xai-grok-sampling-types`; what matters here is that a
+    // request built anywhere -- side call, compaction, recap -- carries it.
+    #[test]
+    fn hoist_tool_images_reaches_every_conversation_request() {
+        let client = SamplingClient::new(SamplerConfig {
+            hoist_tool_images: true,
+            api_backend: ApiBackend::ChatCompletions,
+            ..minimal_config()
+        })
+        .expect("client should build");
+
+        let mut request = xai_grok_sampling_types::ConversationRequest::default();
+        client
+            .apply_conversation_defaults(&mut request)
+            .expect("defaults");
+        assert!(
+            request.hoist_tool_images,
+            "a request built anywhere must carry the tool-image hoist, or a \
+             provider that rejects images in tool messages 400s on it"
+        );
+
+        // The default is off, so xAI and every other provider are unchanged.
+        let plain = SamplingClient::new(SamplerConfig {
+            api_backend: ApiBackend::ChatCompletions,
+            ..minimal_config()
+        })
+        .expect("client should build");
+        let mut request = xai_grok_sampling_types::ConversationRequest::default();
+        plain
+            .apply_conversation_defaults(&mut request)
+            .expect("defaults");
+        assert!(!request.hoist_tool_images);
     }
 
     #[test]

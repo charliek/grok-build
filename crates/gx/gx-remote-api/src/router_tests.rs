@@ -2070,3 +2070,308 @@ async fn another_sessions_approval_is_not_this_streams_business() {
         "tc-1"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Re-attach: surviving a session being unloaded underneath the lane
+// ---------------------------------------------------------------------------
+//
+// The lane stays subscribed to a session after the leader detaches it (the leader detaches on the
+// last non-observer, and the agent then unloads an idle one), so its cached attachment can outlive
+// the agent's copy of the session. Two things repair that: the roster's `resident` bit, checked
+// before every content request, and — for the window the roster cannot see — the agent's own
+// `invalid_params` / `unknown session id` refusal, which buys exactly one retry.
+
+/// The same row as [`roster_row`], but for a session the agent no longer holds.
+fn unloaded_roster_row(session_id: &str) -> Value {
+    let mut row = roster_row(session_id, "dormant");
+    row["resident"] = json!(false);
+    row
+}
+
+/// How many times the lane has sent `method`, by its wire name.
+fn count_outbound(handle: &FakeLinkHandle, wire_method: &str) -> usize {
+    handle
+        .outbound_methods()
+        .into_iter()
+        .filter(|m| m == wire_method)
+        .count()
+}
+
+/// Answer `method` with the agent's unknown-session refusal for the first `failures` calls, then
+/// with `then`. The counter is the point: "retried once" and "retried forever" are the same test
+/// until you can see how many attempts there were.
+fn fail_unknown_session_times(handle: &FakeLinkHandle, method: &str, failures: usize, then: Value) {
+    let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    handle.respond_with(method, move |_| {
+        if seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < failures {
+            // `acp_agent.rs`: `acp::Error::invalid_params().data("unknown session id")`.
+            Err(json!({
+                "code": -32602,
+                "message": "Invalid params",
+                "data": "unknown session id",
+            }))
+        } else {
+            Ok(then.clone())
+        }
+    });
+}
+
+/// An empty `x.ai/session/updates` page — what the history route's `method` answers with once it
+/// stops being refused.
+fn empty_updates_page() -> Value {
+    json!({ "updates": [], "totalCount": 0, "hasMore": false })
+}
+
+/// Wait until the lane has sent `wire_method` at least `n` times.
+///
+/// [`FakeLinkHandle::wait_for_outbound`] one step further along, and for the same reason: a queued
+/// prompt's recovery runs on a background task, so "the route answered 202" and "the replay is on
+/// the wire" are two different instants. Panics with the traffic it did see.
+async fn wait_for_outbound_count(handle: &FakeLinkHandle, wire_method: &str, n: usize) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while count_outbound(handle, wire_method) < n {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "the lane sent {wire_method} {} times, expected {n}; it sent {:?}",
+            count_outbound(handle, wire_method),
+            handle.outbound_methods()
+        )
+    });
+}
+
+/// Give every already-spawned task a generous chance to run, so "it did not happen" is an
+/// observation and not a race the test happened to win.
+async fn settle() {
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+}
+
+#[tokio::test]
+async fn a_session_the_roster_says_is_not_resident_is_loaded_again() {
+    let (app, handle) = test_app();
+    handle.respond_ext_ok(
+        "x.ai/sessions/list",
+        json!({ "sessions": [unloaded_roster_row("sess-1")] }),
+    );
+    handle.respond_ok("session/load", json!({}));
+    handle.respond_ok(
+        "x.ai/session/updates",
+        json!({ "updates": [], "totalCount": 0, "hasMore": false }),
+    );
+
+    for _ in 0..2 {
+        let (status, _) = call(&app, authed_get("/v1/sessions/sess-1/history")).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    assert_eq!(
+        count_outbound(&handle, "session/load"),
+        2,
+        "a cached attachment to a session the agent has unloaded is a lie; each touch must reload"
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_session_refusal_reattaches_and_retries_the_request_once() {
+    let (app, handle) = test_app();
+    // The roster still says resident: this is the window `ensure_attached` cannot see.
+    handle.respond_ext_ok(
+        "x.ai/sessions/list",
+        json!({ "sessions": [roster_row("sess-1", "idle")] }),
+    );
+    handle.respond_ok("session/load", json!({}));
+    fail_unknown_session_times(&handle, "x.ai/session/updates", 1, empty_updates_page());
+
+    let (status, body) = call(&app, authed_get("/v1/sessions/sess-1/history")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    assert_eq!(
+        handle.outbound_methods(),
+        vec![
+            "_x.ai/sessions/list",
+            "session/load",
+            "_x.ai/session/updates",
+            // The refusal drops the cached attachment, so this load really goes out again…
+            "session/load",
+            // …and only then is the read replayed.
+            "_x.ai/session/updates",
+        ],
+        "re-attach, then retry — retrying without the reload would just be refused again"
+    );
+}
+
+#[tokio::test]
+async fn a_second_unknown_session_refusal_is_a_503_and_is_not_retried_again() {
+    let (app, handle) = test_app();
+    handle.respond_ext_ok(
+        "x.ai/sessions/list",
+        json!({ "sessions": [roster_row("sess-1", "idle")] }),
+    );
+    handle.respond_ok("session/load", json!({}));
+    // `acp_agent.rs`: `acp::Error::invalid_params().data("unknown session id")`, every time.
+    handle.respond_err_with_data(
+        "x.ai/session/updates",
+        -32602,
+        "Invalid params",
+        json!("unknown session id"),
+    );
+
+    let (status, body) = call(&app, authed_get("/v1/sessions/sess-1/history")).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["error"], "leader_unavailable");
+
+    assert_eq!(
+        count_outbound(&handle, "_x.ai/session/updates"),
+        2,
+        "exactly one retry: a session that is genuinely gone must not become a retry loop"
+    );
+    assert_eq!(count_outbound(&handle, "session/load"), 2);
+}
+
+#[tokio::test]
+async fn an_ordinary_invalid_params_is_not_retried() {
+    let (app, handle) = test_app();
+    handle.respond_ext_ok(
+        "x.ai/sessions/list",
+        json!({ "sessions": [roster_row("sess-1", "idle")] }),
+    );
+    handle.respond_ok("session/load", json!({}));
+    // Same code, different cause. `invalid_params` on its own says nothing about residency, and
+    // reloading the session would not make a malformed request valid.
+    handle.respond_err("x.ai/session/updates", -32602, "Invalid params");
+
+    let (status, body) = call(&app, authed_get("/v1/sessions/sess-1/history")).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["error"], "leader_unavailable");
+
+    assert_eq!(count_outbound(&handle, "_x.ai/session/updates"), 1);
+    assert_eq!(
+        count_outbound(&handle, "session/load"),
+        1,
+        "nothing about a malformed request says the session moved"
+    );
+}
+
+// The same recovery, on the path that answers before the agent does.
+//
+// A queued `session/prompt` is sent detached — its response is a whole turn away — so the refusal
+// arrives long after the route has already answered `202`. That is precisely the case where a
+// dropped prompt is invisible: the phone was told it was accepted. The retry therefore has to
+// happen on the background task, and these tests read the *outbound sequence* rather than the HTTP
+// status, because the status can no longer tell the two outcomes apart.
+
+/// A resident, idle `sess-1` that attaches cleanly, with `session/prompt` left to the caller.
+fn stub_promptable_session(handle: &FakeLinkHandle) {
+    handle.respond_ext_ok(
+        "x.ai/sessions/list",
+        json!({ "sessions": [roster_row("sess-1", "idle")] }),
+    );
+    handle.respond_ok("session/load", json!({}));
+}
+
+fn queue_message(text: &str) -> Request<Body> {
+    authed_post("/v1/sessions/sess-1/messages", json!({ "text": text }))
+}
+
+#[tokio::test]
+async fn a_queued_prompt_the_agent_refuses_is_re_attached_and_replayed_once() {
+    let (app, handle) = test_app();
+    stub_promptable_session(&handle);
+
+    // Refused once, and the replay is then scripted to never answer — which is what a prompt that
+    // really was accepted looks like for the length of the turn. So this test only completes if the
+    // route answered without waiting for the prompt, on the recovery path as well as the happy one.
+    let arm_the_turn = handle.clone();
+    handle.respond_with("session/prompt", move |_| {
+        arm_the_turn.never_respond("session/prompt");
+        // `acp_agent.rs`: `acp::Error::invalid_params().data("unknown session id")`.
+        Err(json!({
+            "code": -32602,
+            "message": "Invalid params",
+            "data": "unknown session id",
+        }))
+    });
+
+    let (status, body) =
+        tokio::time::timeout(Duration::from_secs(5), call(&app, queue_message("hello")))
+            .await
+            .expect("a queued prompt must not block on the turn it starts, refusal or not");
+
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert_eq!(body["accepted"], true);
+    assert_eq!(body["mode"], "queue");
+
+    wait_for_outbound_count(&handle, "session/prompt", 2).await;
+    assert_eq!(
+        handle.outbound_methods(),
+        vec![
+            "_x.ai/sessions/list",
+            "session/load",
+            "session/prompt",
+            // The refusal drops the cached attachment, so this load really goes out again…
+            "session/load",
+            // …and only then is the prompt replayed. Without this the prompt was lost silently.
+            "session/prompt",
+        ],
+        "re-attach, then replay — the same order the awaited paths use"
+    );
+}
+
+#[tokio::test]
+async fn a_replayed_prompt_that_is_refused_again_is_not_retried_a_third_time() {
+    let (app, handle) = test_app();
+    stub_promptable_session(&handle);
+    // Refused every time: a session that is genuinely gone, not one that merely moved.
+    handle.respond_err_with_data(
+        "session/prompt",
+        -32602,
+        "Invalid params",
+        json!("unknown session id"),
+    );
+
+    // Still a 202: the route answered before the first refusal existed, and there is no HTTP
+    // request left to fail by the time the replay is refused. The event stream is where a turn that
+    // never happens is visible.
+    let (status, body) = call(&app, queue_message("hello")).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+
+    wait_for_outbound_count(&handle, "session/prompt", 2).await;
+    settle().await;
+    assert_eq!(
+        count_outbound(&handle, "session/prompt"),
+        2,
+        "exactly one replay: the detached path must not become a retry loop either"
+    );
+    assert_eq!(count_outbound(&handle, "session/load"), 2);
+}
+
+#[tokio::test]
+async fn a_queued_prompt_refused_for_any_other_reason_is_not_replayed() {
+    let (app, handle) = test_app();
+    stub_promptable_session(&handle);
+    // Same code, different cause — reloading the session cannot make this prompt valid.
+    handle.respond_err("session/prompt", -32602, "Invalid params");
+
+    let (status, _) = call(&app, queue_message("hello")).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+
+    handle
+        .wait_for_outbound("session/prompt", Duration::from_secs(5))
+        .await;
+    settle().await;
+    assert_eq!(count_outbound(&handle, "session/prompt"), 1);
+    assert_eq!(
+        count_outbound(&handle, "session/load"),
+        1,
+        "nothing about a malformed prompt says the session moved"
+    );
+}
