@@ -191,6 +191,18 @@ impl FakeLinkHandle {
         });
     }
 
+    /// Answer `method` with a JSON-RPC error object carrying a `data` member.
+    ///
+    /// `data` is not decoration on this wire: the agent's refusal of a request naming a session it
+    /// has unloaded is an ordinary `invalid_params` whose *data* is the only thing that says which
+    /// invalid parameter (`acp_agent.rs`). See [`crate::acp_client::AcpError::is_unknown_session`].
+    pub fn respond_err_with_data(&self, method: &str, code: i64, message: &str, data: Value) {
+        let message = message.to_string();
+        self.respond_with(method, move |_| {
+            Err(serde_json::json!({ "code": code, "message": message, "data": data }))
+        });
+    }
+
     /// Record `method` and never answer it.
     ///
     /// This is what a `session/prompt` looks like from the lane's side for the whole of a turn: the

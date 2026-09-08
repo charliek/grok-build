@@ -516,6 +516,21 @@ mod tests {
         ));
     }
 
+    // gx: third-party ChatCompletions providers (Meta/Muse here) reject
+    // image-bearing tool messages with a 400 the classifier now recognizes;
+    // confirm the strip-and-retry path actually engages end to end.
+    #[test]
+    fn gx_provider_image_rejection_400_strips_and_retries() {
+        let err = api_err(
+            StatusCode::BAD_REQUEST,
+            "`messages[5].content` did not match any supported type",
+        );
+        assert!(matches!(
+            classify_error(&err, 0, 5, RATE_LIMIT_RETRY_THRESHOLD),
+            RetryDecision::RetryWithImageStrip
+        ));
+    }
+
     #[test]
     fn classify_image_processing_error_takes_priority_over_5xx_retry() {
         let err = api_err(

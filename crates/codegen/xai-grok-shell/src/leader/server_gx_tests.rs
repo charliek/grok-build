@@ -1,4 +1,5 @@
-//! gx: tests for the `ClientCapabilities::observer` capability.
+//! gx: tests for the leader server's gx-only behaviour — the `ClientCapabilities::observer`
+//! capability, the per-client `hook_env` identity, and the `ControlCommand::Shutdown` control.
 //!
 //! An observer is the in-process ACP client the gx remote lane (HTTP/SSE) attaches to the leader
 //! with. It lives for the leader's whole life and must be invisible to the TUI's routing: it never
@@ -45,6 +46,23 @@ async fn spawn_server(
     Arc<AtomicUsize>,
     tokio::task::JoinHandle<Result<(), ServerError>>,
 ) {
+    spawn_server_with(temp, no_exit_on_disconnect, AgentActivity::default()).await
+}
+
+/// [`spawn_server`] with a caller-supplied [`AgentActivity`], so a test can register a fake session
+/// actor and observe what the shutdown drain does to it.
+async fn spawn_server_with(
+    temp: &TempDir,
+    no_exit_on_disconnect: bool,
+    agent_activity: AgentActivity,
+) -> (
+    PathBuf,
+    CancellationToken,
+    mpsc::UnboundedSender<String>,
+    mpsc::UnboundedReceiver<String>,
+    Arc<AtomicUsize>,
+    tokio::task::JoinHandle<Result<(), ServerError>>,
+) {
     let sock_path = temp.path().join("gx-observer.sock");
     let (acp_tx, acp_rx) = mpsc::unbounded_channel();
     let (response_tx, response_rx) = mpsc::unbounded_channel();
@@ -64,7 +82,7 @@ async fn spawn_server(
             no_exit_on_disconnect,
             client_count_clone,
             Arc::new(AtomicBool::new(false)),
-            AgentActivity::default(),
+            agent_activity,
             watch::channel(true).1,
             watch::channel(false).0,
             watch::channel(super::super::protocol::ShutdownReason::Manual).0,
@@ -501,9 +519,13 @@ async fn observer_traffic_does_not_steal_last_active_client() {
 // ---------------------------------------------------------------------------
 
 /// When the driver disconnects and only an observer is left subscribed, the driver slot is CLEARED
-/// rather than handed to the observer. The session stays subscribed (no `EvictSessions`), so it
-/// stays resident for the handoff, but driver-only reverse-requests drop instead of reaching the
+/// rather than handed to the observer: driver-only reverse-requests drop instead of reaching the
 /// phone with a modal the TUI owns.
+///
+/// The observer's subscription SURVIVES the disconnect — that is what keeps a busy session's
+/// notifications and approvals flowing to the phone — but it does not make the session resident:
+/// the leader detaches on the last non-observer, so an `EvictSessions` names it and the agent
+/// unloads it if it is idle (issue #14). Everything else about the routing is unchanged.
 #[tokio::test]
 async fn driver_reassignment_on_disconnect_skips_observers() {
     let temp = TempDir::new().unwrap();
@@ -557,9 +579,10 @@ async fn driver_reassignment_on_disconnect_skips_observers() {
         "the observer must remain a subscriber after the driver leaves"
     );
 
+    let evicted = next_evicted_sessions(&mut acp_rx).await.unwrap_or_default();
     assert!(
-        acp_rx.try_recv().is_err(),
-        "the session must NOT be evicted while the observer is still subscribed (residency)"
+        evicted.iter().any(|sid| sid == "sess-xfer"),
+        "an observer-only session must be detached when its last TUI leaves, got: {evicted:?}"
     );
 
     // But the driver slot was cleared, not transferred to the observer.
@@ -585,6 +608,9 @@ async fn driver_reassignment_on_disconnect_skips_observers() {
 /// remaining registered client is an observer".
 #[tokio::test]
 async fn exit_on_disconnect_ignores_observers() {
+    // The exit predicate also reads the process-global flush flag, which another test in this
+    // binary could otherwise be holding up; see `gx_flush_lock`.
+    let _serialized = gx_flush_lock().await;
     let temp = TempDir::new().unwrap();
     let (sock_path, _cancel, _response_tx, _acp_rx, client_count, server) =
         spawn_server(&temp, false).await;
@@ -843,4 +869,983 @@ fn leader_capabilities_without_observer_v1_deserializes_to_false() {
         caps.control_v1,
         "sanity: the rest of the payload still parses"
     );
+}
+
+// ---------------------------------------------------------------------------
+// 8. Roost hook identity (`gx/hookEnv`, issue #14)
+// ---------------------------------------------------------------------------
+//
+// The leader runs every session's hooks, and inherits the environment of whichever TUI spawned it,
+// so the identity has to travel per client: registered as a capability, stamped by the leader into
+// that client's session requests. These tests pin the properties that make the stamp safe - it
+// comes from the registration and only the registration, and the PRESENT/ABSENT distinction the
+// agent reads off it:
+//
+//   - a non-observer's session request carries the key even when the client registered no identity
+//     (an empty object, which tells the agent to CLEAR the session's identity);
+//   - an observer's never carries it, which tells the agent to leave the session's identity
+//     exactly as it is. Stamping an empty object for an observer would be the bug in reverse:
+//     merely opening a session from the phone would unhook the owning TUI's session from its tab.
+
+/// A tab identity as a TUI would register it.
+fn hook_env_of(tab: &str) -> std::collections::BTreeMap<String, String> {
+    [
+        ("ROOST_AGENT_HOOK", "/usr/local/bin/roost"),
+        ("ROOST_SOCKET", "/run/roost.sock"),
+        ("ROOST_TAB_ID", tab),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect()
+}
+
+fn caps_with_hook_env(observer: bool, tab: &str) -> ClientCapabilities {
+    ClientCapabilities {
+        observer,
+        hook_env: hook_env_of(tab),
+        ..Default::default()
+    }
+}
+
+/// The stamped `_meta` key, read back as a plain map.
+fn hook_env_meta(
+    request: &serde_json::Value,
+) -> Option<std::collections::BTreeMap<String, String>> {
+    let value = meta_of(request).get(crate::agent::gx_hook_env::META_KEY)?;
+    Some(
+        value
+            .as_object()
+            .expect("gx/hookEnv must be stamped as an object")
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.clone(),
+                    v.as_str()
+                        .expect("every value must be a string")
+                        .to_string(),
+                )
+            })
+            .collect(),
+    )
+}
+
+/// A `session/load` that supplies a `gx/hookEnv` in its own body.
+async fn load_session_claiming(
+    writer: &mut tokio::io::WriteHalf<LeaderStream>,
+    session_id: &str,
+    tab: &str,
+) {
+    let forged = serde_json::json!({
+        "ROOST_TAB_ID": tab,
+        "ROOST_SOCKET": "/tmp/forged.sock",
+        "ROOST_AGENT_HOOK": "/tmp/forged",
+    });
+    send_acp(
+        writer,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/load",
+            "id": 1,
+            "params": {
+                "sessionId": session_id,
+                "_meta": { crate::agent::gx_hook_env::META_KEY: forged },
+            },
+        })
+        .to_string(),
+    )
+    .await;
+}
+
+/// (c) A non-observer TUI that registered an identity gets it stamped: the agent SETS it on the
+/// session.
+#[tokio::test]
+async fn tui_session_load_gets_hook_env_stamped_from_its_registration() {
+    let temp = TempDir::new().unwrap();
+    let (sock_path, cancel, response_tx, mut acp_rx, _count, _srv) =
+        spawn_server(&temp, true).await;
+
+    let (_reader, mut writer) =
+        register_with(&sock_path, "grok-tui", caps_with_hook_env(false, "5")).await;
+    load_session(&mut writer, "sess-hookenv").await;
+    let load = complete_load(&mut acp_rx, &response_tx, None).await;
+
+    assert_eq!(
+        hook_env_meta(&load),
+        Some(hook_env_of("5")),
+        "the session must carry the identity the client registered: {:?}",
+        meta_of(&load)
+    );
+
+    cancel.cancel();
+}
+
+/// (a) An observer's `session/load` carries NO key at all, even when it asks for one in the
+/// request body - so the agent leaves the resident session's identity intact.
+///
+/// Both halves matter. `ROOST_AGENT_HOOK` names an executable every hook of the session then runs,
+/// and the remote lane attaches to sessions other clients are driving, so it must not choose that
+/// executable (no stamp from its own registration). And the key must be ABSENT rather than empty,
+/// because an empty object is the agent's instruction to clear: stamping one here would mean that
+/// merely opening a session from the phone wipes the owning TUI's roost identity and the session
+/// silently stops reporting to its tab.
+#[tokio::test]
+async fn observer_session_load_never_gets_hook_env() {
+    let temp = TempDir::new().unwrap();
+    let (sock_path, cancel, response_tx, mut acp_rx, _count, _srv) =
+        spawn_server(&temp, true).await;
+
+    // The observer registers WITH an identity and asks for another in the body: both must go.
+    let (_obs_reader, mut obs_writer) =
+        register_with(&sock_path, "gx-remote-api", caps_with_hook_env(true, "9")).await;
+    load_session_claiming(&mut obs_writer, "sess-hookenv-obs", "9").await;
+    let obs_load = complete_load(&mut acp_rx, &response_tx, None).await;
+
+    assert_eq!(
+        hook_env_meta(&obs_load),
+        None,
+        "an observer must neither set nor CLEAR a shared session's roost identity, so the key has \
+         to be absent rather than empty: {:?}",
+        meta_of(&obs_load)
+    );
+
+    // Positive control: the identical request from a non-observer IS stamped, so the assertion
+    // above cannot be passing because the stamp is broken for everyone.
+    let (_tui_reader, mut tui_writer) =
+        register_with(&sock_path, "grok-tui", caps_with_hook_env(false, "5")).await;
+    load_session(&mut tui_writer, "sess-hookenv-obs-control").await;
+    let tui_load = complete_load(&mut acp_rx, &response_tx, None).await;
+    assert_eq!(hook_env_meta(&tui_load), Some(hook_env_of("5")));
+
+    cancel.cancel();
+}
+
+/// (c) A client's own `gx/hookEnv` is replaced by its registration's, never trusted.
+#[tokio::test]
+async fn a_request_body_hook_env_is_replaced_by_the_registration() {
+    let temp = TempDir::new().unwrap();
+    let (sock_path, cancel, response_tx, mut acp_rx, _count, _srv) =
+        spawn_server(&temp, true).await;
+
+    let (_reader, mut writer) =
+        register_with(&sock_path, "grok-tui", caps_with_hook_env(false, "5")).await;
+    load_session_claiming(&mut writer, "sess-hookenv-forged", "99").await;
+    let load = complete_load(&mut acp_rx, &response_tx, None).await;
+
+    assert_eq!(
+        hook_env_meta(&load),
+        Some(hook_env_of("5")),
+        "the body's claim must be discarded in favour of the registration's: {:?}",
+        meta_of(&load)
+    );
+
+    cancel.cancel();
+}
+
+/// (b) A non-observer TUI that registered NO identity still gets the key, stamped as an empty
+/// object - the agent's instruction to CLEAR whatever the session was carrying.
+///
+/// Present-but-empty is the whole point: a TUI launched outside a roost tab, attaching to a
+/// session another tab used to own, must stop that session reporting to the old tab. Absent would
+/// mean "leave it alone", which is the observer's contract, not this one.
+///
+/// Paired with the forged-body case, so the client is shown unable to supply the value both on a
+/// bare request and on one that tried to fill the key in itself.
+#[tokio::test]
+async fn a_non_observer_with_no_identity_stamps_an_empty_object() {
+    let temp = TempDir::new().unwrap();
+    let (sock_path, cancel, response_tx, mut acp_rx, _count, _srv) =
+        spawn_server(&temp, true).await;
+
+    let (_reader, mut writer) =
+        register_with(&sock_path, "grok-tui", ClientCapabilities::default()).await;
+    load_session(&mut writer, "sess-hookenv-none").await;
+    let load = complete_load(&mut acp_rx, &response_tx, None).await;
+    assert_eq!(
+        hook_env_meta(&load),
+        Some(std::collections::BTreeMap::new()),
+        "a non-observer with no identity must stamp an EMPTY object, which clears - not nothing, \
+         which would leave the previous tab claimed: {:?}",
+        meta_of(&load)
+    );
+
+    load_session_claiming(&mut writer, "sess-hookenv-none-forged", "99").await;
+    let forged_load = complete_load(&mut acp_rx, &response_tx, None).await;
+    assert_eq!(
+        hook_env_meta(&forged_load),
+        Some(std::collections::BTreeMap::new()),
+        "a client with no registered identity must not be able to supply one: {:?}",
+        meta_of(&forged_load)
+    );
+
+    cancel.cancel();
+}
+
+/// The strip must beat `inject_session_request_context`'s capability early-return, which a client
+/// reaches deliberately by registering with no capabilities AND an empty client type. Without the
+/// pre-guard strip this is the shape that smuggles a forged identity straight through.
+///
+/// That path deliberately strips without stamping, so a request upstream would forward untouched
+/// still is; no real client reaches it (every one registers a non-empty client type), and for the
+/// anonymous shape that can, an absent key is the conservative reading.
+#[tokio::test]
+async fn a_client_with_no_capabilities_at_all_cannot_smuggle_a_hook_env() {
+    let temp = TempDir::new().unwrap();
+    let (sock_path, cancel, response_tx, mut acp_rx, _count, _srv) =
+        spawn_server(&temp, true).await;
+
+    let (_reader, mut writer) = register_with(&sock_path, "", ClientCapabilities::default()).await;
+    load_session_claiming(&mut writer, "sess-hookenv-bare", "99").await;
+    let load = complete_load(&mut acp_rx, &response_tx, None).await;
+
+    assert_eq!(
+        hook_env_meta(&load),
+        None,
+        "the early-return path is strip-only, so the forged identity is gone and no key is left \
+         behind: this anonymous shape can neither set a session's identity nor clear one: {:?}",
+        meta_of(&load)
+    );
+
+    cancel.cancel();
+}
+
+/// Registration-time validation: a forged map never reaches a session at all, so the leader holds
+/// nothing it would have to re-check later.
+#[tokio::test]
+async fn an_invalid_registered_hook_env_is_dropped_at_registration() {
+    let temp = TempDir::new().unwrap();
+    let (sock_path, cancel, response_tx, mut acp_rx, _count, _srv) =
+        spawn_server(&temp, true).await;
+
+    let mut forged = hook_env_of("5");
+    forged.insert("PATH".to_string(), "/tmp/evil".to_string());
+    let (_reader, mut writer) = register_with(
+        &sock_path,
+        "grok-tui",
+        ClientCapabilities {
+            hook_env: forged,
+            ..Default::default()
+        },
+    )
+    .await;
+    load_session(&mut writer, "sess-hookenv-invalid").await;
+    let load = complete_load(&mut acp_rx, &response_tx, None).await;
+
+    assert_eq!(
+        hook_env_meta(&load),
+        Some(std::collections::BTreeMap::new()),
+        "a registration carrying a key outside the carried set must be dropped whole, leaving the \
+         client indistinguishable from one that registered no identity: {:?}",
+        meta_of(&load)
+    );
+
+    cancel.cancel();
+}
+
+/// Registration-time validation, the incomplete case (finding 2): a client carrying only
+/// `ROOST_AGENT_HOOK` - the executable a hook runs - must not register an identity out of it.
+/// Registration calls `validate` directly, so the all-or-none rule has to live there.
+#[tokio::test]
+async fn an_incomplete_registered_hook_env_is_dropped_at_registration() {
+    let temp = TempDir::new().unwrap();
+    let (sock_path, cancel, response_tx, mut acp_rx, _count, _srv) =
+        spawn_server(&temp, true).await;
+
+    let partial = [("ROOST_AGENT_HOOK", "/tmp/attacker")]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    let (_reader, mut writer) = register_with(
+        &sock_path,
+        "grok-tui",
+        ClientCapabilities {
+            hook_env: partial,
+            ..Default::default()
+        },
+    )
+    .await;
+    load_session(&mut writer, "sess-hookenv-partial").await;
+    let load = complete_load(&mut acp_rx, &response_tx, None).await;
+
+    assert_eq!(
+        hook_env_meta(&load),
+        Some(std::collections::BTreeMap::new()),
+        "a hook executable with no tab and no socket is not an identity; the whole map must go: \
+         {:?}",
+        meta_of(&load)
+    );
+
+    cancel.cancel();
+}
+
+/// Wire compatibility, same shape as `observer`: an older client never sends `hook_env`, and its
+/// registration must still decode - as "no identity", which stamps nothing.
+#[test]
+fn client_capabilities_without_hook_env_deserializes_to_empty() {
+    let caps: ClientCapabilities = serde_json::from_str(
+        r#"{"yolo_mode":true,"observer":false,"terminal":true,"fs_read":true,"fs_write":true,"status_line":true,"code_nav_enabled":true}"#,
+    )
+    .expect("a payload with no `hook_env` key must still deserialize");
+    assert!(
+        caps.hook_env.is_empty(),
+        "a client that never heard of `hook_env` must carry no identity"
+    );
+    assert!(
+        caps.yolo_mode,
+        "sanity: the rest of the payload still parses"
+    );
+    assert!(ClientCapabilities::default().hook_env.is_empty());
+
+    let with_env = ClientCapabilities {
+        hook_env: hook_env_of("5"),
+        ..Default::default()
+    };
+    assert_eq!(
+        serde_json::from_str::<ClientCapabilities>(&serde_json::to_string(&with_env).unwrap())
+            .unwrap(),
+        with_env,
+        "ClientCapabilities must round-trip through the wire with `hook_env` set"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 4. `ControlCommand::Shutdown`: a graceful stop that runs SessionEnd hooks
+// ---------------------------------------------------------------------------
+
+/// Bound on a control round trip and on the leader's own exit; both are local and immediate here.
+const GX_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Serialize the tests that set — or depend on the absence of — the process-global flush flag
+/// `agent::gx_leader_shutdown::is_flushing()`. `cargo test` runs this crate's tests in parallel
+/// threads of one binary, so a flush started here is visible to `exit_on_disconnect_ignores_observers`
+/// (which needs the leader to actually exit) and to the flag's own unit tests.
+async fn gx_flush_lock() -> tokio::sync::MutexGuard<'static, ()> {
+    crate::agent::gx_leader_shutdown::flush_flag_test_lock()
+        .lock()
+        .await
+}
+
+/// A version strictly newer than the one `default_test_control_state` gives the leader, so
+/// `decide_relaunch_for_update`'s directional guard accepts it and the *other* guard is what a
+/// declined relaunch proves.
+fn newer_than_test_leader_version() -> String {
+    let mut v: semver::Version = env!("CARGO_PKG_VERSION")
+        .parse()
+        .expect("the crate version parses as semver");
+    v.pre = semver::Prerelease::EMPTY;
+    v.build = semver::BuildMetadata::EMPTY;
+    v.patch += 1;
+    v.to_string()
+}
+
+async fn send_relaunch(
+    writer: &mut tokio::io::WriteHalf<LeaderStream>,
+    request_id: &str,
+    to_version: &str,
+) {
+    write_message(
+        writer,
+        &ClientMessage::Control {
+            request_id: request_id.to_string(),
+            command: ControlCommand::RelaunchForUpdate {
+                to_version: to_version.to_string(),
+            },
+        },
+    )
+    .await
+    .unwrap();
+}
+
+async fn send_shutdown(writer: &mut tokio::io::WriteHalf<LeaderStream>, request_id: &str) {
+    write_message(
+        writer,
+        &ClientMessage::Control {
+            request_id: request_id.to_string(),
+            command: ControlCommand::Shutdown,
+        },
+    )
+    .await
+    .unwrap();
+}
+
+/// Read frames until the `ControlResult` for `request_id` arrives, then return its payload.
+async fn next_control_payload(
+    reader: &mut tokio::io::ReadHalf<LeaderStream>,
+    request_id: &str,
+) -> ControlPayload {
+    let deadline = tokio::time::Instant::now() + GX_SHUTDOWN_TIMEOUT;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "timed out waiting for the ControlResult of request {request_id}"
+        );
+        match tokio::time::timeout(remaining, read_message::<_, ServerMessage>(reader)).await {
+            Ok(Ok(ServerMessage::ControlResult {
+                request_id: id,
+                result,
+            })) if id == request_id => {
+                return result.expect("the control request must be answered, not refused");
+            }
+            Ok(Ok(_)) => continue,
+            Ok(Err(e)) => panic!("connection ended before the control ack: {e}"),
+            Err(_) => panic!("timed out waiting for the ControlResult of request {request_id}"),
+        }
+    }
+}
+
+/// Read frames until the planned-shutdown notice arrives, returning its reason.
+async fn next_shutting_down_reason(
+    reader: &mut tokio::io::ReadHalf<LeaderStream>,
+) -> super::super::protocol::ShutdownReason {
+    let deadline = tokio::time::Instant::now() + GX_SHUTDOWN_TIMEOUT;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(!remaining.is_zero(), "timed out waiting for ShuttingDown");
+        match tokio::time::timeout(remaining, read_message::<_, ServerMessage>(reader)).await {
+            Ok(Ok(ServerMessage::ShuttingDown { reason, .. })) => return reason,
+            Ok(Ok(_)) => continue,
+            Ok(Err(e)) => panic!("connection ended before ShuttingDown: {e}"),
+            Err(_) => panic!("timed out waiting for ShuttingDown"),
+        }
+    }
+}
+
+/// `gx leader kill`'s replacement for a bare SIGTERM: the leader acks the request and then exits.
+///
+/// The ack must arrive first — the drain is spawned only after it has been queued — and the exit is
+/// asserted through the server task's own `Result`, so a leader that merely dropped the connection
+/// would not pass.
+#[tokio::test]
+async fn gx_shutdown_control_is_acked_and_stops_the_leader() {
+    let _serialized = gx_flush_lock().await;
+    let temp = TempDir::new().unwrap();
+    // `no_exit_on_disconnect = true`: nothing but the Shutdown control may end this leader.
+    let (sock_path, _cancel, _response_tx, _acp_rx, _count, srv) = spawn_server(&temp, true).await;
+
+    let (mut reader, mut writer) = register_with(&sock_path, "gx-leader-kill", tui_caps()).await;
+    send_shutdown(&mut writer, "kill-1").await;
+
+    match next_control_payload(&mut reader, "kill-1").await {
+        ControlPayload::ShuttingDown {
+            grace_ms,
+            already_shutting_down,
+        } => {
+            assert!(
+                !already_shutting_down,
+                "the first request must arm the drain"
+            );
+            assert_eq!(
+                grace_ms,
+                crate::agent::activity::SESSION_FLUSH_GRACE.as_millis() as u64,
+                "the ack advertises the session-flush budget the leader will actually spend"
+            );
+        }
+        other => panic!("expected a ShuttingDown ack, got {other:?}"),
+    }
+
+    let exit = tokio::time::timeout(GX_SHUTDOWN_TIMEOUT, srv)
+        .await
+        .expect("the leader must exit after an acked Shutdown")
+        .expect("the server task must not panic");
+    assert!(exit.is_ok(), "the leader must exit cleanly: {exit:?}");
+}
+
+/// A TUI that did not ask for the shutdown still gets its advance notice.
+///
+/// This is what a client reconnects on, so a graceful stop must not be quieter than the SIGTERM it
+/// replaces. The reason is `Manual`: this is an operator-driven stop, not an auto-update relaunch.
+#[tokio::test]
+async fn gx_shutdown_still_notifies_a_connected_tui() {
+    let _serialized = gx_flush_lock().await;
+    let temp = TempDir::new().unwrap();
+    let (sock_path, _cancel, _response_tx, _acp_rx, count, srv) = spawn_server(&temp, true).await;
+
+    let (mut tui_reader, _tui_writer) = register_with(&sock_path, "grok-tui", tui_caps()).await;
+    let (mut killer_reader, mut killer_writer) =
+        register_with(&sock_path, "gx-leader-kill", ClientCapabilities::default()).await;
+    // Both registrations have been through the main loop, so both are in `clients` when the
+    // broadcast runs; without this barrier a missed notice could just be a late registration.
+    wait_for_client_count(&count, 2).await;
+
+    send_shutdown(&mut killer_writer, "kill-1").await;
+    let _ = next_control_payload(&mut killer_reader, "kill-1").await;
+
+    assert_eq!(
+        next_shutting_down_reason(&mut tui_reader).await,
+        super::super::protocol::ShutdownReason::Manual,
+        "a bystander TUI must still be told the leader is going away"
+    );
+    let _ = tokio::time::timeout(GX_SHUTDOWN_TIMEOUT, srv).await;
+}
+
+/// Idempotence, and the ordering that makes the whole feature work.
+///
+/// A wedged fake session actor holds the flush open. While it is held: the leader is still serving
+/// control traffic (so the drain cannot be blocking the event loop), a second `Shutdown` is acked
+/// as a no-op rather than starting a second flush, and the leader has NOT exited. Releasing the
+/// actor completes the flush, and only then does the leader stop — which is exactly the order
+/// `SessionEnd` hooks need, since the cancel that follows stops the `LocalSet` they run on.
+#[tokio::test]
+async fn gx_shutdown_flushes_sessions_before_exiting_and_is_idempotent() {
+    let _serialized = gx_flush_lock().await;
+    let temp = TempDir::new().unwrap();
+    let activity = AgentActivity::default();
+    let (mut session_rx, _prompt_id, _pending) = activity.register_for_test("sess-1");
+    let (sock_path, _cancel, _response_tx, _acp_rx, _count, srv) =
+        spawn_server_with(&temp, true, activity).await;
+
+    // The fake session actor: report the Shutdown, then stay alive until released.
+    let (got_shutdown_tx, got_shutdown_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let actor = tokio::spawn(async move {
+        let cmd = session_rx
+            .recv()
+            .await
+            .expect("the flush must reach the actor");
+        assert!(matches!(cmd, crate::session::SessionCommand::Shutdown(_)));
+        got_shutdown_tx.send(()).unwrap();
+        release_rx.await.unwrap();
+        // `session_rx` drops here: that is what tells the flush this actor has finished.
+    });
+
+    let (mut reader, mut writer) =
+        register_with(&sock_path, "gx-leader-kill", ClientCapabilities::default()).await;
+    send_shutdown(&mut writer, "kill-1").await;
+    assert!(
+        matches!(
+            next_control_payload(&mut reader, "kill-1").await,
+            ControlPayload::ShuttingDown {
+                already_shutting_down: false,
+                ..
+            }
+        ),
+        "the first request must arm the drain"
+    );
+
+    // Barrier: the flush is now provably in flight and waiting on the actor.
+    tokio::time::timeout(GX_SHUTDOWN_TIMEOUT, got_shutdown_rx)
+        .await
+        .expect("the drain must flush live sessions")
+        .unwrap();
+
+    // The leader is still serving control requests mid-flush, and a second request is a no-op.
+    send_shutdown(&mut writer, "kill-2").await;
+    assert!(
+        matches!(
+            next_control_payload(&mut reader, "kill-2").await,
+            ControlPayload::ShuttingDown {
+                already_shutting_down: true,
+                ..
+            }
+        ),
+        "a Shutdown during a shutdown must be acked without starting a second flush"
+    );
+    assert!(
+        !srv.is_finished(),
+        "the leader must not exit while a session actor is still running its SessionEnd hooks"
+    );
+
+    release_tx.send(()).unwrap();
+    actor.await.unwrap();
+    let exit = tokio::time::timeout(GX_SHUTDOWN_TIMEOUT, srv)
+        .await
+        .expect("the leader must exit once the flush completes")
+        .expect("the server task must not panic");
+    assert!(exit.is_ok(), "the leader must exit cleanly: {exit:?}");
+}
+
+/// The last client can leave *during* the flush, and the leader must still finish it.
+///
+/// `gx leader kill` holds its connection open across the wait, and an auto-spawned leader runs with
+/// `--no-exit-on-disconnect`, so neither of those hits this. A manually started `gx agent leader`
+/// does: it exits with its last client, and the client that asked it to stop is usually that last
+/// client. Exiting here returns from `run_leader_server`, which drops `run_leader`'s cancellation
+/// guard and cancels the root token — the `LocalSet` the session actors are running their
+/// `SessionEnd` hooks on stops being polled, and the flush this test wedges open runs nothing.
+///
+/// The positive control is the second half: once the actor is released, the same leader — with no
+/// clients at all — does exit.
+#[tokio::test]
+async fn gx_shutdown_outlives_the_last_client_disconnecting_mid_flush() {
+    let _serialized = gx_flush_lock().await;
+    let temp = TempDir::new().unwrap();
+    let activity = AgentActivity::default();
+    let (mut session_rx, _prompt_id, _pending) = activity.register_for_test("sess-1");
+    // `no_exit_on_disconnect = false` is the whole point: this is a leader that exits with its last
+    // client, i.e. the one configuration in which the disconnect can cancel the token mid-flush.
+    let (sock_path, _cancel, _response_tx, _acp_rx, count, srv) =
+        spawn_server_with(&temp, false, activity).await;
+
+    let (got_shutdown_tx, got_shutdown_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let actor = tokio::spawn(async move {
+        let cmd = session_rx
+            .recv()
+            .await
+            .expect("the flush must reach the actor");
+        assert!(matches!(cmd, crate::session::SessionCommand::Shutdown(_)));
+        got_shutdown_tx.send(()).unwrap();
+        release_rx.await.unwrap();
+        // `session_rx` drops here: that is what tells the flush this actor has finished.
+    });
+
+    let (mut reader, mut writer) =
+        register_with(&sock_path, "gx-leader-kill", ClientCapabilities::default()).await;
+    wait_for_client_count(&count, 1).await;
+    send_shutdown(&mut writer, "kill-1").await;
+    assert!(
+        matches!(
+            next_control_payload(&mut reader, "kill-1").await,
+            ControlPayload::ShuttingDown {
+                already_shutting_down: false,
+                ..
+            }
+        ),
+        "the first request must arm the drain"
+    );
+
+    // Barrier: the flush is provably in flight and parked on the actor before the client leaves.
+    tokio::time::timeout(GX_SHUTDOWN_TIMEOUT, got_shutdown_rx)
+        .await
+        .expect("the drain must flush live sessions")
+        .unwrap();
+
+    // The only client goes away mid-flush.
+    write_message(&mut writer, &ClientMessage::Disconnect)
+        .await
+        .unwrap();
+    drop(reader);
+    drop(writer);
+    // Barrier: the main loop has run its `Disconnected` arm, so the exit check has been evaluated.
+    wait_for_client_count(&count, 0).await;
+
+    assert!(
+        !srv.is_finished(),
+        "the leader exited on its last client's disconnect while a shutdown flush was still \
+         running: that cancels the root token and abandons the SessionEnd hooks mid-flight"
+    );
+
+    release_tx.send(()).unwrap();
+    actor.await.unwrap();
+    let exit = tokio::time::timeout(GX_SHUTDOWN_TIMEOUT, srv)
+        .await
+        .expect("the leader must exit once the flush completes")
+        .expect("the server task must not panic");
+    assert!(exit.is_ok(), "the leader must exit cleanly: {exit:?}");
+}
+
+/// A relaunch and a graceful shutdown must never both be armed.
+///
+/// Both end in `flush_all_sessions` followed by cancelling the root token, so a second drain's
+/// cancel would land in the middle of the first's flush and kill the `LocalSet` its `SessionEnd`
+/// hooks run on. The version guard is satisfied deliberately (`newer_than_test_leader_version`), so
+/// the decline can only come from the shutdown-already-armed check.
+#[tokio::test]
+async fn relaunch_during_a_gx_shutdown_is_declined() {
+    let _serialized = gx_flush_lock().await;
+    let temp = TempDir::new().unwrap();
+    let activity = AgentActivity::default();
+    let (mut session_rx, _prompt_id, _pending) = activity.register_for_test("sess-1");
+    let (sock_path, _cancel, _response_tx, _acp_rx, _count, srv) =
+        spawn_server_with(&temp, true, activity).await;
+
+    let (got_shutdown_tx, got_shutdown_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let actor = tokio::spawn(async move {
+        let cmd = session_rx
+            .recv()
+            .await
+            .expect("the flush must reach the actor");
+        assert!(matches!(cmd, crate::session::SessionCommand::Shutdown(_)));
+        got_shutdown_tx.send(()).unwrap();
+        release_rx.await.unwrap();
+    });
+
+    let (mut reader, mut writer) =
+        register_with(&sock_path, "gx-leader-kill", ClientCapabilities::default()).await;
+    send_shutdown(&mut writer, "kill-1").await;
+    assert!(
+        matches!(
+            next_control_payload(&mut reader, "kill-1").await,
+            ControlPayload::ShuttingDown {
+                already_shutting_down: false,
+                ..
+            }
+        ),
+        "the shutdown must be the one that arms"
+    );
+    tokio::time::timeout(GX_SHUTDOWN_TIMEOUT, got_shutdown_rx)
+        .await
+        .expect("the drain must flush live sessions")
+        .unwrap();
+
+    send_relaunch(&mut writer, "relaunch-1", &newer_than_test_leader_version()).await;
+    match next_control_payload(&mut reader, "relaunch-1").await {
+        ControlPayload::RelaunchDeclined { reason } => assert!(
+            reason.contains("shutdown"),
+            "the decline must name the shutdown that owns this leader's exit, got {reason:?}"
+        ),
+        other => panic!(
+            "a relaunch accepted during a shutdown would race the shutdown's flush; got {other:?}"
+        ),
+    }
+
+    release_tx.send(()).unwrap();
+    actor.await.unwrap();
+    let _ = tokio::time::timeout(GX_SHUTDOWN_TIMEOUT, srv).await;
+}
+
+/// The mirror image: a shutdown asked for during an armed relaunch is acked as a no-op, never a
+/// second drain. `already_shutting_down: true` is honest — the relaunch drain also ends in a cancel,
+/// so the leader really is on its way out and `gx leader kill`'s wait-for-exit will see it go.
+#[tokio::test]
+async fn gx_shutdown_during_a_relaunch_is_declined() {
+    let _serialized = gx_flush_lock().await;
+    let temp = TempDir::new().unwrap();
+    let activity = AgentActivity::default();
+    let (mut session_rx, _prompt_id, _pending) = activity.register_for_test("sess-1");
+    let (sock_path, _cancel, _response_tx, _acp_rx, _count, srv) =
+        spawn_server_with(&temp, true, activity).await;
+
+    let (got_shutdown_tx, got_shutdown_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let actor = tokio::spawn(async move {
+        let cmd = session_rx
+            .recv()
+            .await
+            .expect("the relaunch drain must flush the session too");
+        assert!(matches!(cmd, crate::session::SessionCommand::Shutdown(_)));
+        got_shutdown_tx.send(()).unwrap();
+        release_rx.await.unwrap();
+    });
+
+    let (mut reader, mut writer) =
+        register_with(&sock_path, "grok-tui", ClientCapabilities::default()).await;
+    send_relaunch(&mut writer, "relaunch-1", &newer_than_test_leader_version()).await;
+    assert!(
+        matches!(
+            next_control_payload(&mut reader, "relaunch-1").await,
+            ControlPayload::Relaunching { .. }
+        ),
+        "the relaunch must be the one that arms"
+    );
+    // Barrier: the relaunch drain is past its idle grace and parked in its own session flush.
+    tokio::time::timeout(GX_SHUTDOWN_TIMEOUT, got_shutdown_rx)
+        .await
+        .expect("the relaunch drain must flush live sessions")
+        .unwrap();
+
+    send_shutdown(&mut writer, "kill-1").await;
+    match next_control_payload(&mut reader, "kill-1").await {
+        ControlPayload::ShuttingDown {
+            already_shutting_down,
+            ..
+        } => assert!(
+            already_shutting_down,
+            "a shutdown asked for during a relaunch must be a no-op ack, not a second drain"
+        ),
+        other => panic!("expected a ShuttingDown ack, got {other:?}"),
+    }
+    assert!(
+        !srv.is_finished(),
+        "neither drain may cancel while the session actor is still running its SessionEnd hooks"
+    );
+
+    release_tx.send(()).unwrap();
+    actor.await.unwrap();
+    let _ = tokio::time::timeout(GX_SHUTDOWN_TIMEOUT, srv).await;
+}
+
+// -------------------------------------------------------------------------
+// 9. Detach on the last NON-observer (issue #14)
+// ---------------------------------------------------------------------------
+//
+// An observer is a subscriber, so upstream's "the subscriber set went empty" detach test never
+// fires for a session a phone has opened: the session stays resident for the life of the leader and
+// never fires its `SessionEnd` hooks, which is how roost lost track of a tab. The rule is now
+// "detach when the last REGISTERED NON-OBSERVER subscriber leaves", with one deliberate asymmetry —
+// the observer's *subscription* is left in place. `handle_evict_sessions` keeps a busy session
+// (running turn, pending approval) resident, and such a session has to keep delivering to the lane
+// or a phone loses the approval it is waiting on; for an idle session the agent unloads it and the
+// subscription is merely stale, which the lane's next request repairs by re-attaching.
+
+/// Wait for a client-disconnect `EvictSessions` and return the session ids it names.
+///
+/// `None` when none arrives inside the bound, which is what the "must NOT be detached" assertion
+/// below needs. Other internal notifications are skipped rather than mistaken for one.
+async fn next_evicted_sessions(
+    acp_rx: &mut mpsc::UnboundedReceiver<String>,
+) -> Option<Vec<String>> {
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(800);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        let Ok(Some(payload)) = tokio::time::timeout(remaining, acp_rx.recv()).await else {
+            return None;
+        };
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(&payload) else {
+            continue;
+        };
+        // Internal methods travel with a leading `_` on the wire.
+        if json["method"].as_str().and_then(|m| m.strip_prefix('_'))
+            != Some(InternalMethod::EvictSessions.name())
+        {
+            continue;
+        }
+        return Some(
+            json["params"]["sessionIds"]
+                .as_array()
+                .map(|ids| {
+                    ids.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        );
+    }
+}
+
+/// The bug, stated as a test: a session whose only remaining subscriber is the remote lane must
+/// still be detached when its TUI exits. Detaching is what lets the agent unload an idle session,
+/// and unloading is what fires its `SessionEnd` hooks — which is how roost learns the tab is free.
+#[tokio::test]
+async fn an_idle_session_is_detached_when_its_last_non_observer_leaves() {
+    let temp = TempDir::new().unwrap();
+    let (sock_path, cancel, response_tx, mut acp_rx, client_count, _srv) =
+        spawn_server(&temp, true).await;
+
+    let (tui_reader, mut tui_writer) =
+        register_with(&sock_path, "grok-tui", ClientCapabilities::default()).await;
+    load_session(&mut tui_writer, "sess-detach").await;
+    complete_load(&mut acp_rx, &response_tx, None).await;
+
+    let (mut obs_reader, mut obs_writer) =
+        register_with(&sock_path, "gx-remote-api", observer_caps()).await;
+    load_session(&mut obs_writer, "sess-detach").await;
+    complete_load(&mut acp_rx, &response_tx, None).await;
+    // The observer's load response is the barrier: the leader subscribes it in the same arm.
+    let _ = next_acp_payload(&mut obs_reader).await;
+
+    // Drain, so nothing forwarded before the disconnect can be mistaken for the eviction.
+    while acp_rx.try_recv().is_ok() {}
+
+    write_message(&mut tui_writer, &ClientMessage::Disconnect)
+        .await
+        .unwrap();
+    drop(tui_reader);
+    drop(tui_writer);
+    wait_for_client_count(&client_count, 1).await;
+
+    let evicted = next_evicted_sessions(&mut acp_rx)
+        .await
+        .expect("the leader must send an EvictSessions when the last non-observer leaves");
+    assert!(
+        evicted.iter().any(|sid| sid == "sess-detach"),
+        "the observer must not pin the session resident for the life of the leader, got: {evicted:?}"
+    );
+
+    cancel.cancel();
+}
+
+/// The other half of the rule, and the subtle one. Detaching must NOT drop the observer's
+/// subscription: the agent keeps a *busy* session resident across an eviction, and that session's
+/// notifications and reverse-requests still have to reach the phone — otherwise a user answering an
+/// approval from their phone loses it the moment they close the laptop lid.
+#[tokio::test]
+async fn an_observer_stays_subscribed_to_a_session_the_leader_detached() {
+    let temp = TempDir::new().unwrap();
+    let (sock_path, cancel, response_tx, mut acp_rx, client_count, _srv) =
+        spawn_server(&temp, true).await;
+
+    let (tui_reader, mut tui_writer) =
+        register_with(&sock_path, "grok-tui", ClientCapabilities::default()).await;
+    load_session(&mut tui_writer, "sess-busy").await;
+    complete_load(&mut acp_rx, &response_tx, None).await;
+
+    let (mut obs_reader, mut obs_writer) =
+        register_with(&sock_path, "gx-remote-api", observer_caps()).await;
+    load_session(&mut obs_writer, "sess-busy").await;
+    complete_load(&mut acp_rx, &response_tx, None).await;
+    let _ = next_acp_payload(&mut obs_reader).await;
+
+    while acp_rx.try_recv().is_ok() {}
+
+    write_message(&mut tui_writer, &ClientMessage::Disconnect)
+        .await
+        .unwrap();
+    drop(tui_reader);
+    drop(tui_writer);
+    wait_for_client_count(&client_count, 1).await;
+
+    // The session really was detached — without this the fan-out below would prove nothing new.
+    let evicted = next_evicted_sessions(&mut acp_rx)
+        .await
+        .expect("sanity: the last non-observer leaving must detach the session");
+    assert!(evicted.iter().any(|sid| sid == "sess-busy"), "{evicted:?}");
+
+    // …and the observer is still on the session's fan-out list, so a busy session the agent chose
+    // to keep resident keeps talking to the phone.
+    response_tx
+        .send(r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-busy","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"POST_DETACH_FANOUT"}}}}"#.into())
+        .unwrap();
+    assert!(
+        next_acp_payload_matching(&mut obs_reader, "POST_DETACH_FANOUT")
+            .await
+            .is_some(),
+        "detaching must not unsubscribe the observer: a busy session still has to reach the phone"
+    );
+
+    cancel.cancel();
+}
+
+/// The guard against over-detaching. Two TUIs on one session, one leaves: a real client is still
+/// watching it, so nothing is detached and the survivor keeps receiving the session. This is
+/// upstream's behaviour and the new rule must not disturb it.
+#[tokio::test]
+async fn a_session_with_two_non_observer_subscribers_survives_one_disconnect() {
+    let temp = TempDir::new().unwrap();
+    let (sock_path, cancel, response_tx, mut acp_rx, client_count, _srv) =
+        spawn_server(&temp, true).await;
+
+    let (first_reader, mut first_writer) =
+        register_with(&sock_path, "grok-tui", ClientCapabilities::default()).await;
+    load_session(&mut first_writer, "sess-shared").await;
+    complete_load(&mut acp_rx, &response_tx, None).await;
+
+    let (mut second_reader, mut second_writer) =
+        register_with(&sock_path, "grok-tui", ClientCapabilities::default()).await;
+    load_session(&mut second_writer, "sess-shared").await;
+    complete_load(&mut acp_rx, &response_tx, None).await;
+    let _ = next_acp_payload(&mut second_reader).await;
+
+    while acp_rx.try_recv().is_ok() {}
+
+    write_message(&mut first_writer, &ClientMessage::Disconnect)
+        .await
+        .unwrap();
+    drop(first_reader);
+    drop(first_writer);
+
+    // Two-step barrier, as elsewhere in this file: `client_count` drops at the top of the
+    // `Disconnected` arm, and the fan-out below is handled by a later iteration of the same
+    // single-threaded loop — so receiving it proves the whole arm already ran.
+    wait_for_client_count(&client_count, 1).await;
+    response_tx
+        .send(r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-shared","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"SURVIVOR_FANOUT"}}}}"#.into())
+        .unwrap();
+    assert!(
+        next_acp_payload_matching(&mut second_reader, "SURVIVOR_FANOUT")
+            .await
+            .is_some(),
+        "the remaining TUI must still be subscribed"
+    );
+
+    assert!(
+        next_evicted_sessions(&mut acp_rx).await.is_none(),
+        "a session another TUI is still watching must never be detached"
+    );
+
+    cancel.cancel();
 }
