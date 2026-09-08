@@ -34,6 +34,7 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
@@ -326,22 +327,68 @@ impl AcpClient {
     /// and a turn that errors is reported on the event stream, which is the only place a client is
     /// still listening by then.
     pub async fn request_detached(&self, method: &str, params: Value) -> Result<(), AcpError> {
+        self.request_detached_with(method, params, |_| async {})
+            .await
+    }
+
+    /// [`Self::request_detached`], with the outcome handed to `on_outcome` instead of only logged.
+    ///
+    /// Same dispatch, same immediate return — the payload is queued for the link before this
+    /// resolves, so a caller still answers `202 accepted` without waiting for the turn — but the
+    /// background task now *observes* the answer rather than dropping it after a log line.
+    ///
+    /// That is the whole difference, and it is not cosmetic. A queued `session/prompt` the agent
+    /// refuses because it unloaded the session (`invalid_params` / `unknown session id`) used to be
+    /// a `warn!` and nothing else: the client had already been told `202`, so the prompt was
+    /// silently lost. [`crate::routes::sessions::session_scoped_request_detached`] is the caller
+    /// that turns that outcome into the same one-shot re-attach-and-replay the awaited paths do.
+    ///
+    /// `on_outcome` sees exactly what [`Self::request`] would have returned — envelope unwrapped,
+    /// errors typed — with one deliberate difference: there is **no timeout**, because a turn has no
+    /// bound. It is still woken if the link dies, because `run_link` clears the pending map on
+    /// close, which drops the sender.
+    pub async fn request_detached_with<F, Fut>(
+        &self,
+        method: &str,
+        params: Value,
+        on_outcome: F,
+    ) -> Result<(), AcpError>
+    where
+        F: FnOnce(Result<Value, AcpError>) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
         let (id, rx) = self.dispatch(method, params).await?;
         let method = method.to_string();
         tokio::spawn(async move {
-            match rx.await {
-                Ok(Ok(_)) => debug!(id, method, "gx-remote-api: detached request completed"),
-                Ok(Err((code, message, _data))) => {
+            let outcome = match rx.await {
+                Ok(Ok(result)) => {
+                    debug!(id, method, "gx-remote-api: detached request completed");
+                    unwrap_ext_envelope(result).map_err(|detail| AcpError::Ext {
+                        method: method.clone(),
+                        detail,
+                    })
+                }
+                Ok(Err((code, message, data))) => {
                     warn!(
                         id,
                         method, code, message, "gx-remote-api: detached request failed"
-                    )
+                    );
+                    Err(AcpError::Rpc {
+                        method: method.clone(),
+                        code,
+                        message,
+                        data,
+                    })
                 }
-                Err(_) => debug!(
-                    id,
-                    method, "gx-remote-api: link closed before the detached request answered"
-                ),
-            }
+                Err(_) => {
+                    debug!(
+                        id,
+                        method, "gx-remote-api: link closed before the detached request answered"
+                    );
+                    Err(AcpError::Closed)
+                }
+            };
+            on_outcome(outcome).await;
         });
         Ok(())
     }

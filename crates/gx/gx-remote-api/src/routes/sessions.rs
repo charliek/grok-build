@@ -13,6 +13,7 @@ use serde_json::{Value, json};
 use tracing::warn;
 use xai_grok_shell::agent::roster::{RosterActivity, RosterEntry};
 
+use crate::acp_client::AcpError;
 use crate::error::ApiError;
 use crate::state::AppState;
 
@@ -166,6 +167,79 @@ pub async fn session_scoped_request(
         }
         other => Ok(other?),
     }
+}
+
+/// [`session_scoped_request`] for a call whose answer arrives far too late to hold an HTTP request
+/// open for: same one-shot recovery, performed on the background task instead of in the handler.
+///
+/// `session/prompt` is the only caller. Its JSON-RPC response does not arrive until the **turn
+/// ends**, so the route puts the prompt on the wire and answers `202 accepted` immediately (see
+/// [`crate::routes::messages`]) — and that is exactly what made the plain
+/// [`AcpClient::request_detached`] wrong here. The unloaded-session window
+/// [`session_scoped_request`] exists to close is *widest* on this path: a prompt sent from a phone
+/// lands on a session whose last TUI may have exited seconds ago, and the refusal it earns was only
+/// ever logged. The caller had already been told `202`; the prompt was gone.
+///
+/// So the return value keeps its meaning — `Ok(())` still says only "queued for the leader", never
+/// "the agent accepted it" — and the recovery moves to where the answer actually arrives. Exactly
+/// once, on the same discriminator ([`AcpError::is_unknown_session`]) and via the same
+/// [`reattach`], so the two flows cannot drift on when a retry is legitimate.
+///
+/// A second refusal is the last word: it is logged by the ACP client like every other detached
+/// failure and goes no further. There is no HTTP request left to fail by then — the client is on
+/// the event stream, which is where a turn that does not happen is visible as silence.
+///
+/// [`AcpClient::request_detached`]: crate::acp_client::AcpClient::request_detached
+/// [`AcpError::is_unknown_session`]: crate::acp_client::AcpError::is_unknown_session
+pub async fn session_scoped_request_detached(
+    state: &Arc<AppState>,
+    session: &SessionSummary,
+    method: &str,
+    params: Value,
+) -> Result<(), ApiError> {
+    let on_outcome = {
+        let state = state.clone();
+        let session = session.clone();
+        let method = method.to_string();
+        let params = params.clone();
+        move |outcome: Result<Value, AcpError>| async move {
+            let Err(err) = outcome else { return };
+            if !err.is_unknown_session() {
+                // Everything else is either fine or not ours to fix; the client already logged it.
+                return;
+            }
+            warn!(
+                session_id = %session.session_id,
+                method = %method,
+                "gx-remote-api: the agent no longer holds this session; re-attaching and replaying the queued request once"
+            );
+            if let Err(err) = reattach(&state, &session).await {
+                warn!(
+                    session_id = %session.session_id,
+                    method = %method,
+                    %err,
+                    "gx-remote-api: re-attach failed; the queued request is lost"
+                );
+                return;
+            }
+            // Detached again, so a second refusal is logged rather than retried: this is the one
+            // retry, not the first of many.
+            if let Err(err) = state.acp.request_detached(&method, params).await {
+                warn!(
+                    session_id = %session.session_id,
+                    method = %method,
+                    %err,
+                    "gx-remote-api: replaying the queued request failed"
+                );
+            }
+        }
+    };
+
+    state
+        .acp
+        .request_detached_with(method, params, on_outcome)
+        .await?;
+    Ok(())
 }
 
 /// The `session/load` itself, behind the per-session [`OnceCell`] that makes two concurrent

@@ -250,7 +250,10 @@ curl -s -H "$AUTH" -H 'content-type: application/json' \
 
 - `queue` → `session/prompt`. Its JSON-RPC response arrives when the **turn ends**, so the lane
   does not await it: `202 { "accepted": true, "mode": "queue" }` means *queued*, and the turn plays
-  out on the event stream.
+  out on the event stream. Not awaiting it is not the same as not watching it — the lane still
+  observes the response in the background and applies the same one-shot re-attach-and-replay as
+  every other session-scoped call (see [Attach policy](#attach-policy)), so a prompt that lands in
+  the window where the agent has just unloaded the session is replayed rather than lost.
 - `interject` → `x.ai/interject`, which answers immediately:
   `202 { "accepted": true, "mode": "interject", "status": "…" }`.
 
@@ -261,7 +264,9 @@ curl -s -X POST -H "$AUTH" "http://127.0.0.1:2421/v1/sessions/$SID/cancel"
 ```
 
 `202 { "accepted": true }`. `session/cancel` is a notification: the 202 says the cancel was handed
-to the leader, not that the turn has stopped. The turn's actual end arrives on the stream.
+to the leader, not that the turn has stopped. The turn's actual end arrives on the stream. Because
+it is a notification it carries no response, so — alone among the session-scoped calls — it has no
+re-attach retry available to it; see [Attach policy](#attach-policy).
 
 ### `GET /v1/sessions/{id}/events` — see [SSE](#sse) below
 
@@ -285,8 +290,22 @@ never has to know it happened:
    `"resident": false` drops the cached attachment, so the `session/load` really is re-sent;
 2. for the window the roster cannot see — resident when it was read, unloaded a moment later — the
    agent answers with `invalid_params` and an `unknown session id`, and the lane reloads and
-   replays that one request **once**. A second failure is reported as `503 leader_unavailable`
-   rather than retried again.
+   replays that one request **once**. A second failure is not retried again.
+
+Point 2 covers every session-scoped call the lane makes *except* `session/cancel`, and that
+exception is structural, not an oversight: `session/cancel` is a JSON-RPC **notification** — no id,
+no response — so there is no refusal to observe and nothing that could be replayed. A cancel sent
+into the unloaded window is dropped by the agent; retry it if the stream shows the turn still
+running.
+
+How the second failure is reported depends on whether anyone is still waiting for it:
+
+- on an awaited call (`/history`, `/cancel`'s attach, `/approvals`, `interject`) it becomes
+  `503 leader_unavailable`;
+- on a **queued prompt** (`mode: "queue"`) it cannot, because the `202` was already sent — the
+  prompt's own response is a whole turn away. The reload and the single replay still happen, on a
+  background task; a replay that is refused again is logged by the leader process and the turn
+  simply never starts, which the client sees as silence on the event stream.
 
 The visible cost of a reload is one extra round trip on the first request after a TUI exits. There
 is still no *explicit* detach endpoint, and no idle timer of the lane's own.

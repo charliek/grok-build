@@ -10,11 +10,20 @@
 //! `session/prompt`'s JSON-RPC response arrives when the **turn ends**. Awaiting it would hold an
 //! HTTP request open for the length of a coding turn and then time out. The lane instead puts the
 //! prompt on the wire, answers `202 accepted`, and lets the turn play out over
-//! `/v1/sessions/{id}/events` — see [`crate::acp_client::AcpClient::request_detached`], which owns
-//! the not-leaking part. `202` is the honest status: the prompt is queued, not completed.
+//! `/v1/sessions/{id}/events`. `202` is the honest status: the prompt is queued, not completed.
+//!
+//! Answering early is not the same as not looking. The prompt goes out through
+//! [`session_scoped_request_detached`], which keeps the immediate `202` *and* watches the response
+//! on a background task, so the one refusal this lane can recover from — the agent having unloaded
+//! the session between the roster read and the prompt — is re-attached and replayed once, exactly
+//! as it is on the awaited paths. A prompt from a phone arriving just after the last TUI exited is
+//! the whole reason: without that, `202` would have been a lie.
 //!
 //! `_x.ai/interject` is the opposite shape — it answers immediately with `{status}` — so that one
-//! is awaited and its status is passed through.
+//! is awaited ([`session_scoped_request`]) and its status is passed through.
+//!
+//! `session/cancel` is a third shape again: a JSON-RPC **notification**, with no id and no
+//! response. There is no outcome to observe, so it gets no retry of either kind.
 
 use std::sync::Arc;
 
@@ -29,7 +38,9 @@ use xai_message_delivery_core::Operation;
 use crate::error::ApiError;
 use crate::policy;
 use crate::routes::parse_body;
-use crate::routes::sessions::{ensure_attached, resolve_session, session_scoped_request};
+use crate::routes::sessions::{
+    ensure_attached, resolve_session, session_scoped_request, session_scoped_request_detached,
+};
 use crate::state::AppState;
 
 /// Logical ACP method names; the leading `_` is applied on the wire by
@@ -112,10 +123,13 @@ pub async fn post_message(
 
     match mode {
         Mode::Queue => {
-            state
-                .acp
-                .request_detached(SESSION_PROMPT, prompt_params(&id, &body.text))
-                .await?;
+            session_scoped_request_detached(
+                &state,
+                &session,
+                SESSION_PROMPT,
+                prompt_params(&id, &body.text),
+            )
+            .await?;
             Ok(accepted(
                 json!({ "accepted": true, "mode": mode.wire_name() }),
             ))
@@ -191,7 +205,10 @@ pub async fn create_session(
     state.attachments.mark_attached(&session_id);
 
     // A brand-new session is idle, and idle admits `Queue` — the authorization table's first
-    // column. Sent detached for the same reason as any other queued prompt.
+    // column. Sent detached for the same reason as any other queued prompt, but with the plain
+    // fire-and-forget send rather than `session_scoped_request_detached`: the re-attach retry exists
+    // for a *cached* attachment outliving the agent's copy of the session, and this attachment is
+    // one round trip old, to a session the agent created and has not been given a chance to unload.
     if let Some(text) = body.text.as_deref().filter(|t| !t.trim().is_empty()) {
         state
             .acp
