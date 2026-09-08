@@ -2348,6 +2348,8 @@ async fn retry_after_lost_ack_converges_memory_and_disk_to_authoritative_item() 
             reasoning_effort: None,
             stream_tool_calls: None,
             codex_compat: None,
+            // gx: see `SamplingConfig::hoist_tool_images`.
+            hoist_tool_images: None,
         },
         Box::new(persistence),
         event_tx,

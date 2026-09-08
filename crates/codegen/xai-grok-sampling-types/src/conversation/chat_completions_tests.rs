@@ -547,6 +547,209 @@ fn test_tool_result_with_images_to_chat_completions() {
     );
 }
 
+// gx: `hoist_tool_images` — `[Text, ImageUrl…]` in a `tool` message is an xAI
+// extension the OpenAI spec does not allow. Meta's Muse gateway 400s on it
+// (`messages[N].content did not match any supported type`) but accepts the same
+// image in a following `user` message. These assert the hoisted shape, that
+// tool messages stay adjacent across a run of parallel calls, and that the
+// default-off path is byte-identical to what it was.
+
+fn image(url: &str) -> ContentPart {
+    ContentPart::Image { url: url.into() }
+}
+
+/// Assert `msg` is the hoisted user message for tool calls `ids`: the pinned
+/// preamble first, then exactly one image block per entry of `urls`.
+#[track_caller]
+fn assert_hoisted_user_message(msg: &ChatRequestMessage, ids: &str, urls: &[&str]) {
+    assert_eq!(msg.role, Role::User);
+    assert_eq!(msg.tool_call_id, None);
+
+    let mut expected = vec![ChatContentBlock::Text {
+        text: format!(
+            "The following images were returned by tool call(s) {ids}; they are \
+             attached here because this provider only accepts text in tool \
+             messages. Continue the task."
+        ),
+    }];
+    expected.extend(urls.iter().map(|url| ChatContentBlock::ImageUrl {
+        image_url: ImageUrl {
+            url: (*url).to_owned(),
+        },
+    }));
+
+    let MessageContent::Blocks(blocks) = &msg.content else {
+        panic!("expected blocks on the hoisted user message: {msg:?}");
+    };
+    assert_eq!(blocks, &expected);
+}
+
+#[test]
+fn hoisted_tool_result_images_move_to_a_following_user_message() {
+    let msgs = conversation_to_chat_messages(
+        vec![ConversationItem::tool_result_with_images(
+            "call_1",
+            "Read image file: photo.png",
+            vec![image("data:image/png;base64,iVBOR")],
+        )],
+        true,
+    );
+
+    assert_eq!(msgs.len(), 2, "one tool message plus the hoisted user one");
+    assert_eq!(msgs[0].role, Role::Tool);
+    assert_eq!(msgs[0].tool_call_id, Some("call_1".to_string()));
+    assert_matches!(
+        &msgs[0].content,
+        MessageContent::Text(text) if text == "Read image file: photo.png",
+        "a hoisting provider only accepts text in a tool message"
+    );
+
+    assert_hoisted_user_message(&msgs[1], "call_1", &["data:image/png;base64,iVBOR"]);
+}
+
+#[test]
+fn hoisting_keeps_parallel_tool_messages_adjacent() {
+    // Two tool calls answered back to back: both `tool` messages must stay
+    // adjacent to their assistant, or the provider rejects the sequence.
+    // Only the one with an image names itself in the preamble.
+    let items = vec![
+        ConversationItem::assistant_tool_calls(vec![
+            ToolCall {
+                id: "call_a".into(),
+                name: "read_file".to_string(),
+                arguments: "{}".into(),
+            },
+            ToolCall {
+                id: "call_b".into(),
+                name: "grep".to_string(),
+                arguments: "{}".into(),
+            },
+        ]),
+        ConversationItem::tool_result_with_images(
+            "call_a",
+            "Read image file: a.png",
+            vec![image("data:image/png;base64,AAA")],
+        ),
+        ConversationItem::tool_result("call_b", "no matches"),
+    ];
+
+    let msgs = conversation_to_chat_messages(items, true);
+
+    let roles: Vec<Role> = msgs.iter().map(|m| m.role).collect();
+    assert_eq!(
+        roles,
+        vec![Role::Assistant, Role::Tool, Role::Tool, Role::User],
+        "the hoisted user message comes after the whole run of tool results"
+    );
+    assert_eq!(msgs[1].tool_call_id, Some("call_a".to_string()));
+    assert_eq!(msgs[2].tool_call_id, Some("call_b".to_string()));
+
+    // `call_b` returned no image, so it is neither named in the preamble nor
+    // represented by a block.
+    assert_hoisted_user_message(&msgs[3], "call_a", &["data:image/png;base64,AAA"]);
+}
+
+#[test]
+fn one_run_with_several_image_results_shares_a_single_hoisted_message() {
+    let items = vec![
+        ConversationItem::tool_result_with_images(
+            "call_a",
+            "a.png",
+            vec![image("data:image/png;base64,AAA")],
+        ),
+        ConversationItem::tool_result_with_images(
+            "call_b",
+            "b.png",
+            vec![image("data:image/png;base64,BBB")],
+        ),
+    ];
+
+    let msgs = conversation_to_chat_messages(items, true);
+
+    let roles: Vec<Role> = msgs.iter().map(|m| m.role).collect();
+    assert_eq!(roles, vec![Role::Tool, Role::Tool, Role::User]);
+    assert_hoisted_user_message(
+        &msgs[2],
+        "call_a, call_b",
+        &["data:image/png;base64,AAA", "data:image/png;base64,BBB"],
+    );
+}
+
+#[test]
+fn each_run_of_tool_results_gets_its_own_hoisted_message() {
+    let items = vec![
+        ConversationItem::tool_result_with_images(
+            "call_1",
+            "first",
+            vec![image("data:image/png;base64,ONE")],
+        ),
+        ConversationItem::assistant("thinking about it"),
+        ConversationItem::tool_result_with_images(
+            "call_2",
+            "second",
+            vec![image("data:image/png;base64,TWO")],
+        ),
+    ];
+
+    let msgs = conversation_to_chat_messages(items, true);
+
+    let roles: Vec<Role> = msgs.iter().map(|m| m.role).collect();
+    assert_eq!(
+        roles,
+        vec![
+            Role::Tool,
+            Role::User,
+            Role::Assistant,
+            Role::Tool,
+            Role::User
+        ],
+        "an assistant message ends the run, so each run flushes separately"
+    );
+    assert_hoisted_user_message(&msgs[1], "call_1", &["data:image/png;base64,ONE"]);
+    assert_hoisted_user_message(&msgs[4], "call_2", &["data:image/png;base64,TWO"]);
+}
+
+#[test]
+fn without_hoisting_the_tool_message_shape_is_exactly_what_it_was() {
+    // xAI's shape, byte for byte: images stay inside the tool message and no
+    // user message is synthesized.
+    let item = ConversationItem::tool_result_with_images(
+        "call_1",
+        "Read image file: photo.png",
+        vec![image("data:image/png;base64,iVBOR")],
+    );
+
+    let msgs = conversation_to_chat_messages(vec![item.clone()], false);
+
+    assert_eq!(msgs.len(), 1, "nothing is hoisted when the flag is off");
+    assert_eq!(
+        serde_json::to_value(&msgs[0]).unwrap(),
+        serde_json::to_value(conversation_item_to_chat_message(item)).unwrap(),
+        "the flag-off wire shape is the single-item conversion, unchanged"
+    );
+    assert_eq!(msgs[0].role, Role::Tool);
+    let MessageContent::Blocks(blocks) = &msgs[0].content else {
+        panic!("expected inline blocks: {:?}", msgs[0]);
+    };
+    assert_eq!(blocks.len(), 2);
+    assert_matches!(&blocks[1], ChatContentBlock::ImageUrl { .. });
+}
+
+#[test]
+fn hoisting_an_imageless_conversation_changes_nothing() {
+    let items = vec![
+        ConversationItem::user("hi"),
+        ConversationItem::tool_result("call_1", "no images here"),
+        ConversationItem::assistant("done"),
+    ];
+
+    assert_eq!(
+        serde_json::to_value(conversation_to_chat_messages(items.clone(), true)).unwrap(),
+        serde_json::to_value(conversation_to_chat_messages(items, false)).unwrap(),
+        "a run that carried no image must not synthesize a user message"
+    );
+}
+
 #[test]
 fn conversation_to_chat_messages_drops_reasoning_when_user_intervenes() {
     // Reasoning only folds onto the *immediately* following assistant
@@ -558,7 +761,7 @@ fn conversation_to_chat_messages_drops_reasoning_when_user_intervenes() {
         ConversationItem::assistant("answer"),
     ];
 
-    let msgs = conversation_to_chat_messages(items);
+    let msgs = conversation_to_chat_messages(items, false);
 
     assert_eq!(
         msgs.len(),
@@ -590,7 +793,7 @@ fn upgrade_then_fold_through_conversation_to_chat_messages() {
     let assistant: ConversationItem = serde_json::from_value(raw).unwrap();
     siblings.push(assistant);
 
-    let msgs = conversation_to_chat_messages(siblings);
+    let msgs = conversation_to_chat_messages(siblings, false);
     assert_eq!(msgs.len(), 1);
     assert_eq!(msgs[0].role, Role::Assistant);
     assert_eq!(

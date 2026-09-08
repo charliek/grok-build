@@ -648,6 +648,8 @@ impl SessionActor {
                 reasoning_effort: None,
                 stream_tool_calls: None,
                 codex_compat: None,
+                // gx: see `SamplingConfig::hoist_tool_images`.
+                hoist_tool_images: None,
             });
         let creds = self.chat_state_handle.get_credentials().await;
         let model_facts = self.model_auth_facts(cfg.model.as_str());
@@ -737,6 +739,9 @@ impl SessionActor {
             // gx: survives model switches -- this config is rebuilt from the
             // chat-state actor's copy on every turn.
             codex_compat: cfg.codex_compat.unwrap_or(false),
+            hoist_tool_images: cfg.hoist_tool_images.unwrap_or(false),
+            // gx: see `SessionActor::supports_vision`.
+            supports_vision: self.supports_vision.get(),
             idle_timeout_secs: None,
             client_identifier: self.client_identifier.clone(),
             deployment_id: crate::managed_config::resolve_deployment_id(

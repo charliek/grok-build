@@ -89,6 +89,10 @@ fn test_config(base_url: String, model: &str) -> SamplerConfig {
         rate_limit_retry_threshold: None,
         stream_tool_calls: false,
         codex_compat: false,
+        // gx: see `SamplerConfig::hoist_tool_images`.
+        hoist_tool_images: false,
+        // gx: see `SamplerConfig::supports_vision`.
+        supports_vision: true,
         idle_timeout_secs: Some(30),
         reasoning_effort: None,
         origin_client: None,
@@ -729,6 +733,68 @@ async fn many_image_dimension_400_strips_as_heuristic() {
     assert!(
         matches!(events.last(), Some(SamplingEvent::Completed { .. })),
         "expected Completed after strip-retry"
+    );
+}
+
+// gx: `supports_vision = false` strips images before the first attempt
+// instead of paying a guaranteed 400 to discover the model is text-only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn text_only_model_strips_image_before_first_attempt() {
+    const IMAGE_URI: &str = "data:image/png;base64,cG9pc29uZWQ=";
+    let counter = Arc::new(AtomicU32::new(0));
+    let counter_handler = Arc::clone(&counter);
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(move |body: String| {
+            let counter = Arc::clone(&counter_handler);
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                assert!(
+                    !body.contains(IMAGE_URI),
+                    "the image must never reach the wire for a text-only model, body: {body}"
+                );
+                let events = sse::chat_completion_events("recovered", "test-model");
+                Sse::new(stream::iter(
+                    events.into_iter().map(Ok::<_, std::convert::Infallible>),
+                ))
+            }
+        }),
+    );
+    let server = MockServer::spawn(app).await;
+    let mut config = test_config(server.base_url(), "test-model");
+    // gx: see `SamplerConfig::supports_vision`.
+    config.supports_vision = false;
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let handle = SamplerActor::spawn(config, RetryPolicy::default(), event_tx);
+
+    let mut request = user_request("what is in this image?");
+    if let Some(ConversationItem::User(u)) = request.items.first_mut() {
+        u.add_image(IMAGE_URI);
+    }
+    handle.submit(RequestId::from("req-text-only-strip"), request);
+
+    let events = drain_until_terminal(&mut event_rx, Duration::from_secs(15)).await;
+    server.shutdown();
+
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            SamplingEvent::ImagesStripped {
+                stripped_urls,
+                reason: StripReason::ModelTextOnly,
+                ..
+            } if stripped_urls.len() == 1 && stripped_urls[0].as_ref() == IMAGE_URI
+        )),
+        "expected a ModelTextOnly ImagesStripped event carrying the image URL, got {events:?}"
+    );
+    assert!(
+        matches!(events.last(), Some(SamplingEvent::Completed { .. })),
+        "the stripped request must succeed on the first attempt, got {events:?}"
+    );
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        1,
+        "the pre-flight strip must avoid a wasted failed request: exactly one HTTP call"
     );
 }
 

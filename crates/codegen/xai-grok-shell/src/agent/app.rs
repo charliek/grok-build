@@ -741,6 +741,10 @@ pub async fn run_leader(
     let client_count = Arc::new(AtomicUsize::new(0));
     let agent_busy = Arc::new(AtomicBool::new(false));
     let agent_activity = crate::agent::activity::AgentActivity::default();
+    // gx: publish the pair a signal handler needs to end this leader gracefully — flush the session
+    // actors (running their SessionEnd hooks) before cancelling the token that stops polling the
+    // LocalSet they live on. Without it a SIGTERM'd leader ran no SessionEnd at all (issue #14).
+    crate::agent::gx_leader_shutdown::register(cancel.clone(), agent_activity.clone());
     let control_state = LeaderServerControlState::new(LeaderServerMetadata {
         pid: std::process::id(),
         socket_path: socket_path.clone(),

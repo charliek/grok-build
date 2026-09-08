@@ -1565,6 +1565,10 @@ async fn set_session_model_invalidates_byok_memo_for_same_model_id() {
                 rate_limit_retry_threshold: Some(4),
                 stream_tool_calls: false,
                 codex_compat: false,
+                // gx: see `SamplingConfig::hoist_tool_images`.
+                hoist_tool_images: false,
+                // gx: see `SamplerConfig::supports_vision`.
+                supports_vision: true,
                 idle_timeout_secs: None,
                 client_identifier: None,
                 reasoning_effort: None,
@@ -1672,6 +1676,10 @@ async fn switch_to_first_party_model_drops_minted_provider_token() {
                 rate_limit_retry_threshold: None,
                 stream_tool_calls: false,
                 codex_compat: false,
+                // gx: see `SamplingConfig::hoist_tool_images`.
+                hoist_tool_images: false,
+                // gx: see `SamplerConfig::supports_vision`.
+                supports_vision: true,
                 idle_timeout_secs: None,
                 client_identifier: None,
                 reasoning_effort: None,

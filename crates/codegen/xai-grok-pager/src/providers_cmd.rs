@@ -504,6 +504,11 @@ const GLM_53_FIELDS: &[PresetField] = &[
     PresetField::new("reasoning_effort", &[s("max")]),
     ZAI_REASONING_EFFORTS,
     PresetField::new("system_prompt_label", &[s("GLM 5.3")]),
+    // gx: verified live (2026-09-07) -- `glm-5.3`'s coding-plan endpoint 400s
+    // on an image in any role (`messages.content.type is invalid, allowed
+    // values: ['text']`). `glm-5.3-flash` below is vision-capable and must
+    // NOT get this field.
+    PresetField::new("supports_vision", &[b(false)]),
 ];
 
 // `glm-5.3-flash` is the fast sibling of `glm-5.3` on Z.AI's coding-plan API,

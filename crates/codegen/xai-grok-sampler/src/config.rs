@@ -68,6 +68,24 @@ pub struct SamplerConfig {
     // requires. `false` everywhere else, which is the pre-gx behavior.
     #[serde(default)]
     pub codex_compat: bool,
+    // gx: emit tool-result images as a following `user` message rather than as
+    // image blocks inside the `tool` message. Set from
+    // `[model.<id>].tool_result_images` (defaulted per provider by
+    // `agent::gx_tool_images`); carried onto every `ConversationRequest` this
+    // client sends (see `SamplingClient::apply_conversation_defaults`).
+    // `false` everywhere else, which is the pre-gx behavior.
+    #[serde(default)]
+    pub hoist_tool_images: bool,
+    // gx: whether this model's endpoint accepts image content at all. Set
+    // from `[model.<id>].supports_vision` (absent means `true`); when
+    // `false`, `run_request_task` strips every image from the request before
+    // the first attempt instead of paying a guaranteed 400 to find out (see
+    // `StripReason::ModelTextOnly`).
+    //
+    // `Default` is `true` — every model is assumed to accept images unless
+    // explicitly opted out.
+    #[serde(default = "default_supports_vision")]
+    pub supports_vision: bool,
     pub idle_timeout_secs: Option<u64>,
 
     // Reasoning effort
@@ -137,6 +155,10 @@ impl Default for SamplerConfig {
             rate_limit_retry_threshold: None,
             stream_tool_calls: false,
             codex_compat: false,
+            // gx: see `SamplerConfig::hoist_tool_images`.
+            hoist_tool_images: false,
+            // gx: see `SamplerConfig::supports_vision`.
+            supports_vision: true,
             idle_timeout_secs: None,
             reasoning_effort: None,
             origin_client: None,
@@ -154,6 +176,12 @@ impl Default for SamplerConfig {
             header_injector: None,
         }
     }
+}
+
+// gx: serde default for `SamplerConfig::supports_vision` — a model accepts
+// images unless a config explicitly says otherwise.
+fn default_supports_vision() -> bool {
+    true
 }
 
 /// Cheap sync read of the current bearer for [`SamplerConfig::bearer_resolver`].

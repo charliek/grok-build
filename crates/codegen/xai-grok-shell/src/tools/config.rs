@@ -216,6 +216,10 @@ impl ShellToolsetConfig {
             rate_limit_retry_threshold: None,
             stream_tool_calls: false,
             codex_compat: false,
+            // gx: see `SamplerConfig::hoist_tool_images`.
+            hoist_tool_images: false,
+            // gx: see `SamplerConfig::supports_vision`.
+            supports_vision: true,
             idle_timeout_secs: None,
             client_identifier: None,
             deployment_id: None,

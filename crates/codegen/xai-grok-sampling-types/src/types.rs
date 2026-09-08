@@ -1076,6 +1076,13 @@ pub struct SamplingConfig {
     /// switch; dropping it here would silently disable the shaping mid-session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_compat: Option<bool>,
+    /// gx: when true, a tool result's images are emitted as a following `user`
+    /// message instead of as image blocks inside the `tool` message. Carried
+    /// here (and not only on `SamplerConfig`) because the per-turn sampler
+    /// config is rebuilt from this struct after every model switch; dropping it
+    /// here would silently re-enable the shape the provider rejects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hoist_tool_images: Option<bool>,
 }
 
 // ============ Responses API wrapper ============

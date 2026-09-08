@@ -391,6 +391,7 @@ User-level configuration lives in `$GROK_HOME/config.toml` (default `~/.grok/con
 | `model.<id>.supports_reasoning_effort` | `boolean` | `yes` | `user` | Deprecated; prefer `reasoning_efforts`. |
 | `model.<id>.system_prompt_label` | `string` | `yes` | `user` | Per-model system-prompt identity label. |
 | `model.<id>.temperature` | `number` | `yes` | `user` | Per-model sampling temperature. |
+| `model.<id>.tool_result_images` | `string` | `yes` | `user` | gx: where a tool result's images go on the Chat Completions wire — `"inline"` (xAI's image blocks inside the `tool` message) or `"hoist"` (a following `user` message, for a provider that accepts only text in a tool message). Unset derives per provider: hoist on non-xAI Chat Completions, inline elsewhere. |
 | `model.<id>.top_p` | `number` | `yes` | `user` | Per-model top_p. |
 | `model.<id>.use_concise` | `boolean` | `yes` | `user` | Use the concise tool-description pack for this model. |
 

@@ -1087,6 +1087,10 @@ fn test_model_entry(
             show_model_fingerprint: false,
             stream_tool_calls: None,
             codex_compat: None,
+            // gx: see `ModelEntryConfig::tool_result_images`.
+            tool_result_images: None,
+            // gx: see `ModelEntryConfig::supports_vision`.
+            supports_vision: None,
             laziness_detector: LazinessDetectorPerModelConfig::default(),
             variants: Vec::new(),
         },
@@ -2159,6 +2163,10 @@ fn model_info_from_config_propagates_use_concise() {
         show_model_fingerprint: false,
         stream_tool_calls: None,
         codex_compat: None,
+        // gx: see `ModelEntryConfig::tool_result_images`.
+        tool_result_images: None,
+        // gx: see `ModelEntryConfig::supports_vision`.
+        supports_vision: None,
         laziness_detector: LazinessDetectorPerModelConfig::default(),
         variants: Vec::new(),
     };
@@ -2323,6 +2331,10 @@ fn model_info_from_config_propagates_agent_type() {
         show_model_fingerprint: false,
         stream_tool_calls: None,
         codex_compat: None,
+        // gx: see `ModelEntryConfig::tool_result_images`.
+        tool_result_images: None,
+        // gx: see `ModelEntryConfig::supports_vision`.
+        supports_vision: None,
         laziness_detector: LazinessDetectorPerModelConfig::default(),
         variants: Vec::new(),
     };
@@ -2779,6 +2791,10 @@ fn inference_idle_timeout_propagates_to_model_info() {
         show_model_fingerprint: false,
         stream_tool_calls: None,
         codex_compat: None,
+        // gx: see `ModelEntryConfig::tool_result_images`.
+        tool_result_images: None,
+        // gx: see `ModelEntryConfig::supports_vision`.
+        supports_vision: None,
         laziness_detector: LazinessDetectorPerModelConfig::default(),
         variants: Vec::new(),
     };
@@ -7436,6 +7452,10 @@ fn prefetch_model_entry(slug: &str, context_window: u64, api_backend: ApiBackend
             show_model_fingerprint: false,
             stream_tool_calls: None,
             codex_compat: None,
+            // gx: see `ModelEntryConfig::tool_result_images`.
+            tool_result_images: None,
+            // gx: see `ModelEntryConfig::supports_vision`.
+            supports_vision: None,
             laziness_detector: LazinessDetectorPerModelConfig::default(),
             auto_compact_threshold_percent: None,
             system_prompt_label: None,

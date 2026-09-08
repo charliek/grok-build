@@ -586,6 +586,29 @@ fn backfill_child_routes(
 fn is_registered_non_observer(clients: &HashMap<ClientId, ClientState>, id: ClientId) -> bool {
     clients.get(&id).is_none_or(|c| !c.capabilities.observer)
 }
+/// gx: remove a client-supplied `_meta["gx/hookEnv"]` from a session request, returning whether it
+/// removed anything (issue #14).
+///
+/// `gx/hookEnv` is stamped by the leader from the client's REGISTRATION, never taken from the
+/// request body: `ROOST_AGENT_HOOK` names an executable every hook of that session then runs, so a
+/// client that could put it in the body could pick that executable for a session another client is
+/// driving. The strip runs ahead of `inject_session_request_context`'s capability early-return
+/// because a client chooses its own capabilities and client type, and could therefore reach that
+/// return deliberately with a forged key still in the body.
+fn gx_strip_hook_env_from_request(json: &mut serde_json::Value) -> bool {
+    let method = json.get("method").and_then(|m| m.as_str()).unwrap_or("");
+    if method != AGENT_METHOD_NAMES.session_new
+        && method != AGENT_METHOD_NAMES.session_load
+        && method != AGENT_METHOD_NAMES.session_resume
+    {
+        return false;
+    }
+    json.get_mut("params")
+        .and_then(|p| p.as_object_mut())
+        .and_then(|params| params.get_mut("_meta"))
+        .and_then(|meta| meta.as_object_mut())
+        .is_some_and(|meta| meta.remove(crate::agent::gx_hook_env::META_KEY).is_some())
+}
 /// Inject the requesting client's context into a `session/new`, `session/load`, or `session/resume` request, **in place**.
 /// The agent's own state names whichever client initialized last, which in leader mode is the wrong client.
 /// For a session/new request: If the client has yolo_mode enabled, injects `yoloMode: true` into the request's `_meta` object. If the client has default_model set and the request doesn't already have a modelId, injects `modelId` into the request's `_meta` object. Injects `clientIdentifier` so the agent can track which client owns each session (scopes `yolo_mode_changed` broadcasts in leader mode).
@@ -599,6 +622,10 @@ fn inject_session_request_context(
         .default_model
         .as_ref()
         .is_some_and(|m| !m.is_empty());
+    // gx: strip first and unconditionally — a forged `gx/hookEnv` must not survive the early-return
+    // below, which a client can reach by registering with no capabilities and an empty client type.
+    // See `gx_strip_hook_env_from_request`.
+    let gx_stripped_hook_env = gx_strip_hook_env_from_request(json);
     if !capabilities.yolo_mode
         && !capabilities.auto_mode
         && !has_model
@@ -609,8 +636,14 @@ fn inject_session_request_context(
         && !capabilities.fs_write
         && !capabilities.status_line
         && !capabilities.user_message_echo
+        // gx: a client whose only capability is a roost identity still has meta to inject.
+        && capabilities.hook_env.is_empty()
     {
-        return false;
+        // gx: strip-only on this path, so a request upstream would forward untouched still is. A
+        // real client never lands here — every one of them registers a non-empty client type — and
+        // for the anonymous shape that can, leaving the key ABSENT is the conservative reading:
+        // it can neither set a session's identity nor clear one.
+        return gx_stripped_hook_env;
     }
     let method = json.get("method").and_then(|m| m.as_str()).unwrap_or("");
     let is_session_new = method == AGENT_METHOD_NAMES.session_new;
@@ -707,6 +740,23 @@ fn inject_session_request_context(
                     serde_json::json!(true),
                 );
             }
+            // gx: stamp the requesting client's own roost identity (issue #14). Unconditional, so
+            // the key's PRESENCE — not its contents — is what the agent keys off: present-and-empty
+            // says "this client has no roost identity", which CLEARS whatever the session was
+            // carrying, and is how a TUI outside a roost tab stops a session reporting to the tab
+            // that used to own it. Only reached for a non-observer: the observer branch above
+            // returns before this, so the remote lane can neither choose the `ROOST_AGENT_HOOK`
+            // executable a session's hooks run nor clear the owning tab's identity by attaching.
+            // The key the client may have sent was already removed above, so this is the
+            // registration's value or nothing.
+            meta_obj.insert(
+                crate::agent::gx_hook_env::META_KEY.to_string(),
+                serde_json::json!(capabilities.hook_env),
+            );
+            debug!(
+                entries = capabilities.hook_env.len(),
+                "gx: injected hook env into session request"
+            );
         }
     }
     mutated
@@ -1244,6 +1294,10 @@ fn handle_control_command(
         ControlCommand::RelaunchForUpdate { .. } => {
             unreachable!("RelaunchForUpdate must be handled asynchronously")
         }
+        // gx: like RelaunchForUpdate, the ack is sent before the drain starts; see `decide_gx_shutdown`.
+        ControlCommand::Shutdown => {
+            unreachable!("gx: ControlCommand::Shutdown must be handled asynchronously")
+        }
     }
 }
 async fn handle_stop_cpu_profile(
@@ -1394,12 +1448,119 @@ fn spawn_relaunch_drain(
                 _ = tokio::time::sleep(RELAUNCH_GRACE_POLL) => {}
             }
         }
-        agent_activity
-            .flush_all_sessions(RELAUNCH_FLUSH_GRACE)
-            .await;
-        let _ = shutdown_tx.send(super::protocol::ShutdownReason::AutoUpdate);
-        cancel.cancel();
+        // gx: mark the relaunch flush the same way the gx shutdown drain marks its own. Upstream's
+        // relaunch has the identical exposure: if the last client disconnects while these hooks are
+        // running, the disconnect arm below would break the loop, `run_leader` would return, and its
+        // cancel guard would kill the `LocalSet` the actors are flushing on. See
+        // `gx_leader_shutdown::during_flush`.
+        crate::agent::gx_leader_shutdown::during_flush(async {
+            agent_activity
+                .flush_all_sessions(RELAUNCH_FLUSH_GRACE)
+                .await;
+            let _ = shutdown_tx.send(super::protocol::ShutdownReason::AutoUpdate);
+            cancel.cancel();
+        })
+        .await;
     });
+}
+/// gx: [`decide_relaunch_for_update`], plus mutual exclusion with a graceful shutdown.
+///
+/// A relaunch and a `ControlCommand::Shutdown` are two arms of the same decision: each ends in
+/// `flush_all_sessions` followed by cancelling the root token. Arming both would let one drain's
+/// cancel land in the middle of the other's flush, stopping the `LocalSet` its `SessionEnd` hooks
+/// run on. Upstream's `relaunching` guard only makes *relaunches* mutually exclusive, so this wraps
+/// it rather than changing it — a wrapper keeps upstream's function and its tests untouched.
+///
+/// Ordering: `decide_relaunch_for_update` has already swapped `relaunching` to `true` by the time
+/// this reads `gx_shutting_down`, and [`decide_gx_shutdown`] does the same in the other direction.
+/// Under `SeqCst` two such swap-then-read pairs cannot both read `false`, so at most one of the two
+/// drains is ever armed. The loser puts its own flag back, so a declined request never leaves the
+/// leader unable to stop.
+fn gx_decide_relaunch_for_update(
+    control_state: &LeaderServerControlState,
+    to_version: String,
+    relaunching: &AtomicBool,
+    gx_shutting_down: &AtomicBool,
+) -> Result<ControlPayload, ControlError> {
+    let decided = decide_relaunch_for_update(control_state, to_version, relaunching);
+    if matches!(decided, Ok(ControlPayload::Relaunching { .. }))
+        && gx_shutting_down.load(Ordering::SeqCst)
+    {
+        relaunching.store(false, Ordering::SeqCst);
+        debug!("gx: RelaunchForUpdate declined; a graceful shutdown is already in progress");
+        return Ok(ControlPayload::RelaunchDeclined {
+            reason: "a graceful shutdown is already in progress".to_string(),
+        });
+    }
+    decided
+}
+/// gx: decide a [`ControlCommand::Shutdown`] request (the synchronous half).
+///
+/// Split from the drain for the same reason [`decide_relaunch_for_update`] is: the ack must be sent
+/// BEFORE the leader starts shutting down, or the client races the teardown and sees a dropped
+/// control response instead of an acknowledgement.
+///
+/// Always acks. `already_shutting_down` reports whether a shutdown was already in progress; only
+/// the first request arms the drain, so duplicate requests can never start a second flush. An armed
+/// `RelaunchForUpdate` counts as "already shutting down": that drain also ends in a cancel, so the
+/// leader really is on its way out and a second drain would only race it.
+fn decide_gx_shutdown(
+    shutting_down: &AtomicBool,
+    relaunching: &AtomicBool,
+) -> Result<ControlPayload, ControlError> {
+    let grace_ms = crate::agent::activity::SESSION_FLUSH_GRACE.as_millis() as u64;
+    let already_shutting_down = shutting_down.swap(true, Ordering::SeqCst);
+    // gx: the mirror of the check in `gx_decide_relaunch_for_update`; see the note there for why
+    // the swap comes before the read and why the loser rolls its own flag back.
+    if !already_shutting_down && relaunching.load(Ordering::SeqCst) {
+        shutting_down.store(false, Ordering::SeqCst);
+        debug!("gx: Shutdown request declined; a relaunch drain already owns this leader's exit");
+        return Ok(ControlPayload::ShuttingDown {
+            grace_ms,
+            already_shutting_down: true,
+        });
+    }
+    if already_shutting_down {
+        debug!("gx: Shutdown request ignored; a shutdown is already in progress");
+    } else {
+        info!(
+            grace_ms,
+            "gx: Shutdown accepted; flushing sessions (SessionEnd hooks) before exit"
+        );
+    }
+    Ok(ControlPayload::ShuttingDown {
+        grace_ms,
+        already_shutting_down,
+    })
+}
+/// gx: run an accepted [`ControlCommand::Shutdown`]: flush every session actor, publish the reason,
+/// then cancel.
+///
+/// The order is load-bearing and is why this cannot be a plain SIGTERM. Session actors are
+/// `spawn_local` tasks on the `LocalSet` that `run_leader` drives with
+/// `run_until(select! { .., cancel.cancelled() })`. Once the root token is cancelled that `LocalSet`
+/// is never polled again, so a flush issued afterwards would burn its whole grace and still run no
+/// `SessionEnd` hook. [`AgentActivity::flush_all_sessions`] documents the same constraint.
+///
+/// Spawned (like [`spawn_relaunch_drain`]) so the server event loop keeps running underneath the
+/// flush: the actors' shutdown work reaches the agent over channels this loop still serves.
+/// Must be called *after* the ack has been queued to the requesting client.
+///
+/// The whole sequence runs inside [`crate::agent::gx_leader_shutdown::during_flush`], which is what
+/// the exit-on-disconnect check below reads: the client that asked for the shutdown is usually the
+/// last one, and the event loop this drain depends on must not exit underneath it.
+fn spawn_gx_shutdown_drain(
+    shutdown_tx: watch::Sender<super::protocol::ShutdownReason>,
+    cancel: CancellationToken,
+    agent_activity: AgentActivity,
+) {
+    tokio::spawn(crate::agent::gx_leader_shutdown::during_flush(async move {
+        agent_activity
+            .flush_all_sessions(crate::agent::activity::SESSION_FLUSH_GRACE)
+            .await;
+        let _ = shutdown_tx.send(super::protocol::ShutdownReason::Manual);
+        cancel.cancel();
+    }));
 }
 #[derive(Debug, thiserror::Error)]
 pub enum ServerError {
@@ -1471,6 +1632,10 @@ pub async fn run_leader_server(
     let mut had_clients = false;
     let mut pending_requests: usize = 0;
     let relaunching = Arc::new(AtomicBool::new(false));
+    // gx: set by the first accepted `ControlCommand::Shutdown`, so a second one is acked without
+    // starting a second session flush. Same role `relaunching` plays for `RelaunchForUpdate` — and
+    // the two are read against each other, so at most one of the two drains is ever armed.
+    let gx_shutting_down = Arc::new(AtomicBool::new(false));
     loop {
         let poll = tokio::select! {
             biased;
@@ -1523,7 +1688,12 @@ pub async fn run_leader_server(
                 Err(e) => error!(error = %e, "Accept failed"),
             },
             LeaderServerPoll::Event(event) => match event {
-                ServerEvent::Registered(id, mode, capabilities, client_type) => {
+                ServerEvent::Registered(id, mode, mut capabilities, client_type) => {
+                    // gx: clamp the client's roost identity once, here, where the leader takes
+                    // ownership of it — so an oversized or forged map is never held, let alone
+                    // stamped into a session request (issue #14).
+                    capabilities.hook_env =
+                        crate::agent::gx_hook_env::validate(capabilities.hook_env);
                     if let Some(client) = clients.get_mut(&id) {
                         client.mode = mode;
                         client
@@ -1604,6 +1774,36 @@ pub async fn run_leader_server(
                             session_subscribers.remove(&sid);
                             session_driver.remove(&sid);
                             detached_sessions.push(sid);
+                            continue;
+                        }
+                        // gx: the remote lane subscribes as an OBSERVER, so "the subscriber set is
+                        // empty" is the wrong detach test (issue #14): a session a phone had once
+                        // opened would stay resident for the life of the leader and never fire its
+                        // `SessionEnd` hooks. Detach on the last registered NON-observer instead.
+                        // Stricter than `is_registered_non_observer`, which counts an *unknown* id
+                        // as a non-observer — the safe answer when picking a driver, the wrong one
+                        // here, where an id the leader can no longer vouch for must not pin a
+                        // session resident forever.
+                        let has_non_observer = session_subscribers.get(&sid).is_some_and(|subs| {
+                            subs.iter().any(|cid| {
+                                clients.get(cid).is_some_and(|c| !c.capabilities.observer)
+                            })
+                        });
+                        if !has_non_observer {
+                            // gx: detach, but deliberately LEAVE the observer subscribed. The agent
+                            // keeps a *busy* session (running turn, pending approval) resident on
+                            // `EvictSessions`, and that session has to keep delivering its
+                            // notifications and reverse-requests to the lane or a phone loses the
+                            // approval it is waiting on. For an idle session the agent unloads it
+                            // and the subscription is merely stale — the lane's next request
+                            // re-attaches, which re-subscribes.
+                            session_driver.remove(&sid);
+                            debug!(
+                                session_id = %sid,
+                                client_id = id.0,
+                                "gx: last non-observer subscriber left; detaching (observer stays subscribed)"
+                            );
+                            detached_sessions.push(sid);
                         } else if session_driver.get(&sid) == Some(&id) {
                             // gx: promote the first remaining NON-observer subscriber; if only observers
                             // are left the session goes driverless (driver-only messages drop) rather than
@@ -1645,9 +1845,16 @@ pub async fn run_leader_server(
                     // `all()` on an empty map is `true`, and an accepted-but-unregistered connection
                     // still carries `ClientCapabilities::default()` (`observer: false`), so this is
                     // exactly upstream's `is_empty()` whenever no observer is connected.
+                    // gx: ...and never while a shutdown is flushing this leader's sessions. Breaking
+                    // here returns from `run_leader_server`, which drops `run_leader`'s
+                    // `CancellationToken` guard and cancels the root token — the one thing a flush
+                    // must outlive, since the session actors running the `SessionEnd` hooks live on
+                    // a `LocalSet` that stops being polled the moment it is cancelled. The flushing
+                    // path cancels it itself when it is done. See `agent::gx_leader_shutdown`.
                     if clients.values().all(|c| c.capabilities.observer)
                         && had_clients
                         && !no_exit_on_disconnect
+                        && !crate::agent::gx_leader_shutdown::is_flushing()
                     {
                         info!("Leader server shutting down (all clients disconnected)");
                         break;
@@ -1668,6 +1875,8 @@ pub async fn run_leader_server(
                         let agent_busy = agent_busy.clone();
                         let agent_activity = agent_activity.clone();
                         let relaunching = relaunching.clone();
+                        // gx: see `decide_gx_shutdown`.
+                        let gx_shutting_down = gx_shutting_down.clone();
                         tokio::spawn(async move {
                             let result = match command {
                                 ControlCommand::StopCpuProfile => {
@@ -1694,22 +1903,50 @@ pub async fn run_leader_server(
                                 ControlCommand::WorkspaceStatus => {
                                     handle_workspace_status(control_state).await
                                 }
+                                // gx: upstream's `decide_relaunch_for_update` behind a wrapper that
+                                // also declines when a graceful shutdown is already armed.
                                 ControlCommand::RelaunchForUpdate { to_version } => {
-                                    decide_relaunch_for_update(
+                                    gx_decide_relaunch_for_update(
                                         &control_state,
                                         to_version,
                                         &relaunching,
+                                        &gx_shutting_down,
                                     )
+                                }
+                                // gx: graceful shutdown over the socket, so `SessionEnd` hooks run
+                                // (issue #14). Handled here, asynchronously, for the same reason
+                                // `RelaunchForUpdate` is: ack first, then drain.
+                                ControlCommand::Shutdown => {
+                                    decide_gx_shutdown(&gx_shutting_down, &relaunching)
                                 }
                                 other => handle_control_command(&control_state, other),
                             };
                             let arm_relaunch =
                                 matches!(result, Ok(ControlPayload::Relaunching { .. }));
+                            // gx: only the request that flipped the flag arms the drain.
+                            let arm_gx_shutdown = matches!(
+                                result,
+                                Ok(ControlPayload::ShuttingDown {
+                                    already_shutting_down: false,
+                                    ..
+                                })
+                            );
                             if let Err(e) = client_tx
                                 .send(ServerMessage::ControlResult { request_id, result }.into())
                                 .await
                             {
                                 warn!(client_id = id.0, error = %e, "Failed to send control response to client");
+                            }
+                            // gx: cloned rather than moved so upstream's `spawn_relaunch_drain` call
+                            // below keeps taking the originals. The two arms are mutually exclusive
+                            // — `decide_gx_shutdown` and `gx_decide_relaunch_for_update` each
+                            // decline when the other is armed — so only one drain ever runs.
+                            if arm_gx_shutdown {
+                                spawn_gx_shutdown_drain(
+                                    shutdown_tx.clone(),
+                                    cancel.clone(),
+                                    agent_activity.clone(),
+                                );
                             }
                             if arm_relaunch {
                                 spawn_relaunch_drain(

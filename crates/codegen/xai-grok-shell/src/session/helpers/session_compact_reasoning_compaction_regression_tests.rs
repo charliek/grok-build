@@ -156,6 +156,13 @@ fn assert_preserved_compaction_body(body: &serde_json::Value) {
     let serialized = body.to_string();
     assert!(serialized.contains(USER_IMAGE_SENTINEL));
     assert!(serialized.contains(TOOL_IMAGE_SENTINEL));
+    assert_non_image_sentinels(&serialized);
+}
+
+/// gx: the sentinels every compaction body must carry regardless of whether
+/// its images survived -- shared by `assert_preserved_compaction_body` and
+/// the text-only-model strip test below.
+fn assert_non_image_sentinels(serialized: &str) {
     assert!(serialized.contains("user text sentinel"));
     assert!(serialized.contains("tool result text sentinel"));
     assert!(serialized.contains("call-image-sentinel"));
@@ -184,6 +191,10 @@ fn test_config(base_url: &str) -> SamplerConfig {
         rate_limit_retry_threshold: None,
         stream_tool_calls: false,
         codex_compat: false,
+        // gx: see `SamplingConfig::hoist_tool_images`.
+        hoist_tool_images: false,
+        // gx: see `SamplerConfig::supports_vision`.
+        supports_vision: true,
         idle_timeout_secs: None,
         client_identifier: None,
         reasoning_effort: None,
@@ -372,6 +383,83 @@ async fn chat_completions_below_trigger_preserves_images_and_tools() {
         without_tools.get("tool_choice").is_none(),
         "tool_choice without tools is rejected by OpenAI-compat backends"
     );
+
+    let _ = shutdown_tx.send(());
+}
+
+/// gx: the ChatCompletions compaction path builds its own request and never
+/// reaches the sampler's pre-flight strip (`run_request_task`), so a
+/// text-only model's images must be dropped here too or the compaction call
+/// 400s on the same image the sampler would have stripped.
+#[tokio::test]
+async fn chat_completions_text_only_model_strips_images_before_compaction() {
+    use std::sync::{Arc, Mutex};
+
+    let captured: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let cap = captured.clone();
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(move |body: axum::Json<serde_json::Value>| {
+            let cap = cap.clone();
+            async move {
+                cap.lock().unwrap().push(body.0);
+                let stream = stream::iter(
+                    summary_stream()
+                        .into_iter()
+                        .map(Ok::<_, std::convert::Infallible>),
+                );
+                Sse::new(stream).keep_alive(KeepAlive::default())
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .unwrap();
+    });
+
+    let base_url = format!("http://{addr}/v1");
+    let mut config = test_config(&base_url);
+    // gx: see `SamplerConfig::supports_vision`.
+    config.supports_vision = false;
+
+    let chat_history = image_compaction_history();
+    let client = Client::new(config.clone()).unwrap();
+    generate_session_compact(
+        chat_history,
+        0,
+        vec![],
+        vec![],
+        client,
+        acp::SessionId::new("test-session"),
+        &config,
+        std::time::Duration::from_secs(30),
+        0,
+        crate::util::config::CompactionToolChoice::Auto,
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("compaction for a text-only model must still succeed"));
+
+    let bodies = captured.lock().unwrap();
+    assert_eq!(bodies.len(), 1, "mock must have served the one request");
+    let serialized = bodies[0].to_string();
+    assert!(
+        !serialized.contains(USER_IMAGE_SENTINEL),
+        "the user image must never reach a text-only model's compaction request: {serialized}"
+    );
+    assert!(
+        !serialized.contains(TOOL_IMAGE_SENTINEL),
+        "the tool-result image must never reach a text-only model's compaction request: {serialized}"
+    );
+    // Only the images are dropped; every other sentinel survives.
+    assert_non_image_sentinels(&serialized);
 
     let _ = shutdown_tx.send(());
 }

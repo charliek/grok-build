@@ -755,6 +755,9 @@ impl SessionActor {
             }
         }
         self.refresh_hook_disabled();
+        // gx: the freshly-discovered registry is the new pristine one; re-layer the session's roost
+        // identity onto it so a hook reload does not silently drop the tab (issue #14).
+        self.gx_hook_registry_rebuilt();
         tracing::info!(hook_count, "hooks reloaded mid-session");
 
         // Notify pager about hooks change.
@@ -921,6 +924,11 @@ impl SessionActor {
                 }
             }
             hooks_reloaded = new_specs.len();
+            // gx: this branch mutates the LIVE registry in place, so drop the session's roost
+            // identity back out first — otherwise it would be baked into the pristine snapshot
+            // taken below and a later clear could not restore a user hook's own value of the same
+            // name. Re-layered by `gx_hook_registry_rebuilt` once the reload has finished.
+            self.gx_restore_pristine_hook_registry();
             {
                 let mut reg = self.hook_registry.borrow_mut();
                 if let Some(ref mut arc_reg) = *reg {
@@ -943,6 +951,8 @@ impl SessionActor {
                     *reg = Some(Arc::new(new_reg));
                 }
             }
+            // gx: the reloaded registry is the new pristine one; re-layer the roost identity (#14).
+            self.gx_hook_registry_rebuilt();
         }
 
         xai_grok_telemetry::unified_log::info(

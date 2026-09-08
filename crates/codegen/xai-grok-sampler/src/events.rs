@@ -28,6 +28,12 @@ pub enum StripReason {
     /// Non-deterministic covers a proxy-wrapped 500, a legacy phrase match, or an uncoded mid-stream error.
     /// The failure may be transient and blames no particular image.
     PayloadHeuristic,
+    /// gx: a pre-flight strip: `[model.<id>].supports_vision = false` says this
+    /// endpoint never accepts images, so `run_request_task` strips them
+    /// before the first attempt rather than paying a guaranteed 400. Never a
+    /// server verdict on any particular image and never deferred — chat
+    /// history keeps the images; only this request drops them.
+    ModelTextOnly,
 }
 /// Events emitted by the sampler for a single in-flight request.
 /// Events are sent on the shared event channel that callers subscribe to.

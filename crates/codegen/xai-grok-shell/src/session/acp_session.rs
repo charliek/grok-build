@@ -210,6 +210,9 @@ pub(crate) use goal_support::*;
 #[path = "acp_session_impl/hook_dispatch.rs"]
 mod hook_dispatch;
 use hook_dispatch::*;
+// gx: per-session roost hook identity (issue #14); see the module docs.
+#[path = "acp_session_impl/gx_hook_env.rs"]
+mod gx_hook_env;
 #[path = "acp_session_impl/turn_report_slot.rs"]
 mod turn_report_slot;
 pub(crate) use turn_report_slot::TurnEpoch;
@@ -762,6 +765,11 @@ pub(crate) struct SessionActor {
     /// Resolved at spawn as `is_telemetry_enabled() && !is_zdr()`; ZDR teams always have this false.
     pub(crate) telemetry_enabled: bool,
     pub(crate) supports_backend_search: std::cell::Cell<bool>,
+    /// gx: see `ModelEntryConfig::supports_vision`. Cached like
+    /// `supports_backend_search` above: the persisted chat-state
+    /// `SamplingConfig` predates this field, so `reconstruct_full_config`
+    /// cannot read it back from there. Refreshed on model switch.
+    pub(crate) supports_vision: std::cell::Cell<bool>,
     /// Per-turn override, set at promotion. Not persisted; a reload reverts to the definition seed.
     pub(crate) tool_overrides: std::cell::RefCell<Option<xai_grok_sampling_types::ToolOverrides>>,
     pub(crate) resolved_tool_overrides:
@@ -1017,6 +1025,9 @@ pub(crate) struct SessionActor {
     /// Disabled-hooks snapshot every dispatch filters on, so the actor never reads the file mid-turn.
     /// Loaded at spawn and refreshed by hook reload and enable/disable; another session's toggle lands here at the next reload.
     pub(crate) hook_disabled: std::cell::RefCell<Arc<xai_grok_hooks::trust::DisabledHooks>>,
+    /// gx: the roost identity this session's hooks export, plus the pristine registry it is
+    /// layered onto (issue #14). See [`gx_hook_env`].
+    pub(crate) gx_hook_env: gx_hook_env::GxHookEnvState,
     /// The turn's single end-of-turn hook report.
     /// Actor-scoped rather than turn-local because the gate runs on the turn task while a cancel runs on the command loop.
     pub(crate) turn_report: turn_report_slot::TurnReportSlot,
@@ -1102,6 +1113,11 @@ pub(crate) struct SessionActor {
     >,
     /// Serializes durable image-strip writes with conversation rewinds.
     pub(crate) image_strip_rewrite_barrier: ImageStripRewriteBarrier,
+    /// gx: whether the once-per-session `StripReason::ModelTextOnly` notice
+    /// (see `image_strip::handle_images_stripped`) has already fired. A
+    /// text-only model strips on every turn that carries an image, so
+    /// without this the notice would repeat every turn.
+    pub(crate) told_model_text_only_image_notice: std::sync::atomic::AtomicBool,
     /// Handle to the per-session `xai-grok-sampler` actor.
     /// Live sessions get a real handle from `spawn_session_actor`; tests and other constructor sites use `SamplerHandle::noop()`.
     /// All inference flows through this handle.
