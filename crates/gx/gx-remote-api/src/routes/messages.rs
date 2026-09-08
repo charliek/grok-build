@@ -29,7 +29,7 @@ use xai_message_delivery_core::Operation;
 use crate::error::ApiError;
 use crate::policy;
 use crate::routes::parse_body;
-use crate::routes::sessions::{ensure_attached, resolve_session};
+use crate::routes::sessions::{ensure_attached, resolve_session, session_scoped_request};
 use crate::state::AppState;
 
 /// Logical ACP method names; the leading `_` is applied on the wire by
@@ -103,7 +103,7 @@ pub async fn post_message(
     }
 
     let session = resolve_session(&state, &id).await?;
-    ensure_attached(&state, &id, &session.cwd).await?;
+    ensure_attached(&state, &session).await?;
     policy::authorize(
         &id,
         &policy::effective_activity(&state.approvals, &id, &session.activity),
@@ -121,10 +121,13 @@ pub async fn post_message(
             ))
         }
         Mode::Interject => {
-            let response = state
-                .acp
-                .request(INTERJECT, json!({ "sessionId": id, "text": body.text }))
-                .await?;
+            let response = session_scoped_request(
+                &state,
+                &session,
+                INTERJECT,
+                json!({ "sessionId": id, "text": body.text }),
+            )
+            .await?;
             Ok(accepted(json!({
                 "accepted": true,
                 "mode": mode.wire_name(),
@@ -144,7 +147,7 @@ pub async fn post_cancel(
     Path(id): Path<String>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let session = resolve_session(&state, &id).await?;
-    ensure_attached(&state, &id, &session.cwd).await?;
+    ensure_attached(&state, &session).await?;
     policy::authorize(
         &id,
         &policy::effective_activity(&state.approvals, &id, &session.activity),

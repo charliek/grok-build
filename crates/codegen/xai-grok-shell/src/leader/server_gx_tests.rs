@@ -519,9 +519,13 @@ async fn observer_traffic_does_not_steal_last_active_client() {
 // ---------------------------------------------------------------------------
 
 /// When the driver disconnects and only an observer is left subscribed, the driver slot is CLEARED
-/// rather than handed to the observer. The session stays subscribed (no `EvictSessions`), so it
-/// stays resident for the handoff, but driver-only reverse-requests drop instead of reaching the
+/// rather than handed to the observer: driver-only reverse-requests drop instead of reaching the
 /// phone with a modal the TUI owns.
+///
+/// The observer's subscription SURVIVES the disconnect — that is what keeps a busy session's
+/// notifications and approvals flowing to the phone — but it does not make the session resident:
+/// the leader detaches on the last non-observer, so an `EvictSessions` names it and the agent
+/// unloads it if it is idle (issue #14). Everything else about the routing is unchanged.
 #[tokio::test]
 async fn driver_reassignment_on_disconnect_skips_observers() {
     let temp = TempDir::new().unwrap();
@@ -575,9 +579,10 @@ async fn driver_reassignment_on_disconnect_skips_observers() {
         "the observer must remain a subscriber after the driver leaves"
     );
 
+    let evicted = next_evicted_sessions(&mut acp_rx).await.unwrap_or_default();
     assert!(
-        acp_rx.try_recv().is_err(),
-        "the session must NOT be evicted while the observer is still subscribed (residency)"
+        evicted.iter().any(|sid| sid == "sess-xfer"),
+        "an observer-only session must be detached when its last TUI leaves, got: {evicted:?}"
     );
 
     // But the driver slot was cleared, not transferred to the observer.
@@ -1649,4 +1654,198 @@ async fn gx_shutdown_during_a_relaunch_is_declined() {
     release_tx.send(()).unwrap();
     actor.await.unwrap();
     let _ = tokio::time::timeout(GX_SHUTDOWN_TIMEOUT, srv).await;
+}
+
+// -------------------------------------------------------------------------
+// 9. Detach on the last NON-observer (issue #14)
+// ---------------------------------------------------------------------------
+//
+// An observer is a subscriber, so upstream's "the subscriber set went empty" detach test never
+// fires for a session a phone has opened: the session stays resident for the life of the leader and
+// never fires its `SessionEnd` hooks, which is how roost lost track of a tab. The rule is now
+// "detach when the last REGISTERED NON-OBSERVER subscriber leaves", with one deliberate asymmetry —
+// the observer's *subscription* is left in place. `handle_evict_sessions` keeps a busy session
+// (running turn, pending approval) resident, and such a session has to keep delivering to the lane
+// or a phone loses the approval it is waiting on; for an idle session the agent unloads it and the
+// subscription is merely stale, which the lane's next request repairs by re-attaching.
+
+/// Wait for a client-disconnect `EvictSessions` and return the session ids it names.
+///
+/// `None` when none arrives inside the bound, which is what the "must NOT be detached" assertion
+/// below needs. Other internal notifications are skipped rather than mistaken for one.
+async fn next_evicted_sessions(
+    acp_rx: &mut mpsc::UnboundedReceiver<String>,
+) -> Option<Vec<String>> {
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(800);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        let Ok(Some(payload)) = tokio::time::timeout(remaining, acp_rx.recv()).await else {
+            return None;
+        };
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(&payload) else {
+            continue;
+        };
+        // Internal methods travel with a leading `_` on the wire.
+        if json["method"].as_str().and_then(|m| m.strip_prefix('_'))
+            != Some(InternalMethod::EvictSessions.name())
+        {
+            continue;
+        }
+        return Some(
+            json["params"]["sessionIds"]
+                .as_array()
+                .map(|ids| {
+                    ids.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        );
+    }
+}
+
+/// The bug, stated as a test: a session whose only remaining subscriber is the remote lane must
+/// still be detached when its TUI exits. Detaching is what lets the agent unload an idle session,
+/// and unloading is what fires its `SessionEnd` hooks — which is how roost learns the tab is free.
+#[tokio::test]
+async fn an_idle_session_is_detached_when_its_last_non_observer_leaves() {
+    let temp = TempDir::new().unwrap();
+    let (sock_path, cancel, response_tx, mut acp_rx, client_count, _srv) =
+        spawn_server(&temp, true).await;
+
+    let (tui_reader, mut tui_writer) =
+        register_with(&sock_path, "grok-tui", ClientCapabilities::default()).await;
+    load_session(&mut tui_writer, "sess-detach").await;
+    complete_load(&mut acp_rx, &response_tx, None).await;
+
+    let (mut obs_reader, mut obs_writer) =
+        register_with(&sock_path, "gx-remote-api", observer_caps()).await;
+    load_session(&mut obs_writer, "sess-detach").await;
+    complete_load(&mut acp_rx, &response_tx, None).await;
+    // The observer's load response is the barrier: the leader subscribes it in the same arm.
+    let _ = next_acp_payload(&mut obs_reader).await;
+
+    // Drain, so nothing forwarded before the disconnect can be mistaken for the eviction.
+    while acp_rx.try_recv().is_ok() {}
+
+    write_message(&mut tui_writer, &ClientMessage::Disconnect)
+        .await
+        .unwrap();
+    drop(tui_reader);
+    drop(tui_writer);
+    wait_for_client_count(&client_count, 1).await;
+
+    let evicted = next_evicted_sessions(&mut acp_rx)
+        .await
+        .expect("the leader must send an EvictSessions when the last non-observer leaves");
+    assert!(
+        evicted.iter().any(|sid| sid == "sess-detach"),
+        "the observer must not pin the session resident for the life of the leader, got: {evicted:?}"
+    );
+
+    cancel.cancel();
+}
+
+/// The other half of the rule, and the subtle one. Detaching must NOT drop the observer's
+/// subscription: the agent keeps a *busy* session resident across an eviction, and that session's
+/// notifications and reverse-requests still have to reach the phone — otherwise a user answering an
+/// approval from their phone loses it the moment they close the laptop lid.
+#[tokio::test]
+async fn an_observer_stays_subscribed_to_a_session_the_leader_detached() {
+    let temp = TempDir::new().unwrap();
+    let (sock_path, cancel, response_tx, mut acp_rx, client_count, _srv) =
+        spawn_server(&temp, true).await;
+
+    let (tui_reader, mut tui_writer) =
+        register_with(&sock_path, "grok-tui", ClientCapabilities::default()).await;
+    load_session(&mut tui_writer, "sess-busy").await;
+    complete_load(&mut acp_rx, &response_tx, None).await;
+
+    let (mut obs_reader, mut obs_writer) =
+        register_with(&sock_path, "gx-remote-api", observer_caps()).await;
+    load_session(&mut obs_writer, "sess-busy").await;
+    complete_load(&mut acp_rx, &response_tx, None).await;
+    let _ = next_acp_payload(&mut obs_reader).await;
+
+    while acp_rx.try_recv().is_ok() {}
+
+    write_message(&mut tui_writer, &ClientMessage::Disconnect)
+        .await
+        .unwrap();
+    drop(tui_reader);
+    drop(tui_writer);
+    wait_for_client_count(&client_count, 1).await;
+
+    // The session really was detached — without this the fan-out below would prove nothing new.
+    let evicted = next_evicted_sessions(&mut acp_rx)
+        .await
+        .expect("sanity: the last non-observer leaving must detach the session");
+    assert!(evicted.iter().any(|sid| sid == "sess-busy"), "{evicted:?}");
+
+    // …and the observer is still on the session's fan-out list, so a busy session the agent chose
+    // to keep resident keeps talking to the phone.
+    response_tx
+        .send(r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-busy","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"POST_DETACH_FANOUT"}}}}"#.into())
+        .unwrap();
+    assert!(
+        next_acp_payload_matching(&mut obs_reader, "POST_DETACH_FANOUT")
+            .await
+            .is_some(),
+        "detaching must not unsubscribe the observer: a busy session still has to reach the phone"
+    );
+
+    cancel.cancel();
+}
+
+/// The guard against over-detaching. Two TUIs on one session, one leaves: a real client is still
+/// watching it, so nothing is detached and the survivor keeps receiving the session. This is
+/// upstream's behaviour and the new rule must not disturb it.
+#[tokio::test]
+async fn a_session_with_two_non_observer_subscribers_survives_one_disconnect() {
+    let temp = TempDir::new().unwrap();
+    let (sock_path, cancel, response_tx, mut acp_rx, client_count, _srv) =
+        spawn_server(&temp, true).await;
+
+    let (first_reader, mut first_writer) =
+        register_with(&sock_path, "grok-tui", ClientCapabilities::default()).await;
+    load_session(&mut first_writer, "sess-shared").await;
+    complete_load(&mut acp_rx, &response_tx, None).await;
+
+    let (mut second_reader, mut second_writer) =
+        register_with(&sock_path, "grok-tui", ClientCapabilities::default()).await;
+    load_session(&mut second_writer, "sess-shared").await;
+    complete_load(&mut acp_rx, &response_tx, None).await;
+    let _ = next_acp_payload(&mut second_reader).await;
+
+    while acp_rx.try_recv().is_ok() {}
+
+    write_message(&mut first_writer, &ClientMessage::Disconnect)
+        .await
+        .unwrap();
+    drop(first_reader);
+    drop(first_writer);
+
+    // Two-step barrier, as elsewhere in this file: `client_count` drops at the top of the
+    // `Disconnected` arm, and the fan-out below is handled by a later iteration of the same
+    // single-threaded loop — so receiving it proves the whole arm already ran.
+    wait_for_client_count(&client_count, 1).await;
+    response_tx
+        .send(r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-shared","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"SURVIVOR_FANOUT"}}}}"#.into())
+        .unwrap();
+    assert!(
+        next_acp_payload_matching(&mut second_reader, "SURVIVOR_FANOUT")
+            .await
+            .is_some(),
+        "the remaining TUI must still be subscribed"
+    );
+
+    assert!(
+        next_evicted_sessions(&mut acp_rx).await.is_none(),
+        "a session another TUI is still watching must never be detached"
+    );
+
+    cancel.cancel();
 }

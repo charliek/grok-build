@@ -1917,6 +1917,36 @@ pub async fn run_leader_server(
                             session_subscribers.remove(&sid);
                             session_driver.remove(&sid);
                             detached_sessions.push(sid);
+                            continue;
+                        }
+                        // gx: the remote lane subscribes as an OBSERVER, so "the subscriber set is
+                        // empty" is the wrong detach test (issue #14): a session a phone had once
+                        // opened would stay resident for the life of the leader and never fire its
+                        // `SessionEnd` hooks. Detach on the last registered NON-observer instead.
+                        // Stricter than `is_registered_non_observer`, which counts an *unknown* id
+                        // as a non-observer — the safe answer when picking a driver, the wrong one
+                        // here, where an id the leader can no longer vouch for must not pin a
+                        // session resident forever.
+                        let has_non_observer = session_subscribers.get(&sid).is_some_and(|subs| {
+                            subs.iter().any(|cid| {
+                                clients.get(cid).is_some_and(|c| !c.capabilities.observer)
+                            })
+                        });
+                        if !has_non_observer {
+                            // gx: detach, but deliberately LEAVE the observer subscribed. The agent
+                            // keeps a *busy* session (running turn, pending approval) resident on
+                            // `EvictSessions`, and that session has to keep delivering its
+                            // notifications and reverse-requests to the lane or a phone loses the
+                            // approval it is waiting on. For an idle session the agent unloads it
+                            // and the subscription is merely stale — the lane's next request
+                            // re-attaches, which re-subscribes.
+                            session_driver.remove(&sid);
+                            debug!(
+                                session_id = %sid,
+                                client_id = id.0,
+                                "gx: last non-observer subscriber left; detaching (observer stays subscribed)"
+                            );
+                            detached_sessions.push(sid);
                         } else if session_driver.get(&sid) == Some(&id) {
                             // gx: promote the first remaining NON-observer subscriber; if only observers
                             // are left the session goes driverless (driver-only messages drop) rather than

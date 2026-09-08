@@ -57,6 +57,10 @@ const NOTIFICATION_BUFFER: usize = 1024;
 /// does not take custody of.
 const METHOD_NOT_FOUND: i64 = -32601;
 
+/// JSON-RPC "invalid params" — the code the agent answers a request naming a session it does not
+/// hold with. See [`AcpError::is_unknown_session`].
+const INVALID_PARAMS: i64 = -32602;
+
 /// Extension ACP methods travel with a **leading underscore** on the wire.
 ///
 /// `agent-client-protocol`'s `decode_request` only reaches `ext_method()` via
@@ -91,6 +95,11 @@ pub enum AcpError {
         method: String,
         code: i64,
         message: String,
+        /// The JSON-RPC `data` member, kept rather than dropped because it is the only place the
+        /// agent says *which* invalid parameter — `invalid_params` alone covers every malformed
+        /// request. See [`AcpError::is_unknown_session`]. Not in the `Display` output: it is a
+        /// discriminator this crate matches on, and the prose already names the method.
+        data: Option<Value>,
     },
     /// A JSON-RPC **success** whose [`ExtMethodResult`] envelope carried an `error`. Distinct from
     /// [`AcpError::Rpc`] because the envelope's code is a string (`"not_found"`), not a JSON-RPC
@@ -99,6 +108,30 @@ pub enum AcpError {
     /// [`ExtMethodResult`]: unwrap_ext_envelope
     #[error("leader returned an extension error for {method}: {detail}")]
     Ext { method: String, detail: String },
+}
+
+impl AcpError {
+    /// Did the agent refuse this because it no longer holds the session?
+    ///
+    /// `acp_agent.rs`'s `session_handle_waiting_for_load` answers
+    /// `invalid_params().data("unknown session id")` for a session it has unloaded. That is the
+    /// race the lane has to survive: the roster said `resident`, the agent unloaded the session an
+    /// instant later, and this lane's cached attachment made it skip the `session/load` that would
+    /// have brought it back. Matched on the code **and** the data, because `invalid_params` on its
+    /// own is every malformed request, and retrying one of those would be a loop.
+    pub fn is_unknown_session(&self) -> bool {
+        let Self::Rpc { code, data, .. } = self else {
+            return false;
+        };
+        *code == INVALID_PARAMS
+            && data.as_ref().is_some_and(|data| {
+                let text = data
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| data.to_string());
+                text.to_ascii_lowercase().contains("unknown session")
+            })
+    }
 }
 
 /// Unwrap the gx extension-method response envelope, when the value is one.
@@ -180,7 +213,13 @@ pub struct Notification {
     pub session_id: Option<String>,
 }
 
-type Pending = Arc<Mutex<HashMap<i64, oneshot::Sender<Result<Value, (i64, String)>>>>>;
+/// A JSON-RPC error response, as the link task hands it to the waiting caller: `code`, `message`
+/// and the `data` member. `data` is carried rather than dropped because it is what tells an
+/// "unknown session id" refusal apart from every other `invalid_params` — see
+/// [`AcpError::is_unknown_session`].
+type RpcFailure = (i64, String, Option<Value>);
+
+type Pending = Arc<Mutex<HashMap<i64, oneshot::Sender<Result<Value, RpcFailure>>>>>;
 
 /// Handle to the ACP connection. Cheap to clone; every clone talks to the same task.
 #[derive(Clone)]
@@ -254,10 +293,11 @@ impl AcpClient {
                 method: method.to_string(),
                 detail,
             }),
-            Ok(Ok(Err((code, message)))) => Err(AcpError::Rpc {
+            Ok(Ok(Err((code, message, data)))) => Err(AcpError::Rpc {
                 method: method.to_string(),
                 code,
                 message,
+                data,
             }),
             // The task dropped the sender: the link died while we waited.
             Ok(Err(_)) => Err(AcpError::Closed),
@@ -291,7 +331,7 @@ impl AcpClient {
         tokio::spawn(async move {
             match rx.await {
                 Ok(Ok(_)) => debug!(id, method, "gx-remote-api: detached request completed"),
-                Ok(Err((code, message))) => {
+                Ok(Err((code, message, _data))) => {
                     warn!(
                         id,
                         method, code, message, "gx-remote-api: detached request failed"
@@ -314,7 +354,7 @@ impl AcpClient {
         &self,
         method: &str,
         params: Value,
-    ) -> Result<(i64, oneshot::Receiver<Result<Value, (i64, String)>>), AcpError> {
+    ) -> Result<(i64, oneshot::Receiver<Result<Value, RpcFailure>>), AcpError> {
         // The task has already gone; skip the round trip and the timeout it would burn.
         if self.cancel.is_cancelled() {
             return Err(AcpError::Closed);
@@ -461,6 +501,7 @@ async fn handle_inbound(
                         .and_then(Value::as_str)
                         .unwrap_or("unknown error")
                         .to_string(),
+                    error.get("data").filter(|v| !v.is_null()).cloned(),
                 ))
             } else {
                 Ok(msg.get("result").cloned().unwrap_or(Value::Null))
@@ -754,6 +795,61 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, AcpError::Rpc { code: -32602, .. }), "{err}");
+        assert!(
+            !err.is_unknown_session(),
+            "an `invalid_params` with no data says nothing about residency: {err}"
+        );
+    }
+
+    /// The one refusal the lane recovers from, and everything next to it that it must not.
+    ///
+    /// This is the whole discriminator behind the re-attach retry, so it is pinned against the
+    /// shape the agent really sends — `invalid_params` carrying `data`, which the wire keeps as a
+    /// member of its own next to `code` and `message`.
+    #[tokio::test]
+    async fn only_an_invalid_params_naming_an_unknown_session_asks_for_a_re_attach() {
+        let (client, handle) = spawn_over_fake();
+
+        handle.respond_err_with_data(
+            "x.ai/session/updates",
+            -32602,
+            "Invalid params",
+            json!("unknown session id"),
+        );
+        let err = client
+            .request("x.ai/session/updates", json!({}))
+            .await
+            .unwrap_err();
+        assert!(err.is_unknown_session(), "{err}");
+
+        // Right data, wrong code: whatever this is, it is not the agent having unloaded a session.
+        handle.respond_err_with_data(
+            "x.ai/session/updates",
+            -32603,
+            "Internal error",
+            json!("unknown session id"),
+        );
+        let err = client
+            .request("x.ai/session/updates", json!({}))
+            .await
+            .unwrap_err();
+        assert!(!err.is_unknown_session(), "{err}");
+
+        // Right code, different cause. Reloading the session cannot make this request valid.
+        handle.respond_err_with_data(
+            "x.ai/session/updates",
+            -32602,
+            "Invalid params",
+            json!("offset must be an integer"),
+        );
+        let err = client
+            .request("x.ai/session/updates", json!({}))
+            .await
+            .unwrap_err();
+        assert!(!err.is_unknown_session(), "{err}");
+
+        // And nothing that never reached the agent asks to be retried.
+        assert!(!AcpError::Closed.is_unknown_session());
     }
 
     /// The reply the lane put on the link for reverse-request `id`, if it has sent one.

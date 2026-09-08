@@ -2070,3 +2070,154 @@ async fn another_sessions_approval_is_not_this_streams_business() {
         "tc-1"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Re-attach: surviving a session being unloaded underneath the lane
+// ---------------------------------------------------------------------------
+//
+// The lane stays subscribed to a session after the leader detaches it (the leader detaches on the
+// last non-observer, and the agent then unloads an idle one), so its cached attachment can outlive
+// the agent's copy of the session. Two things repair that: the roster's `resident` bit, checked
+// before every content request, and — for the window the roster cannot see — the agent's own
+// `invalid_params` / `unknown session id` refusal, which buys exactly one retry.
+
+/// The same row as [`roster_row`], but for a session the agent no longer holds.
+fn unloaded_roster_row(session_id: &str) -> Value {
+    let mut row = roster_row(session_id, "dormant");
+    row["resident"] = json!(false);
+    row
+}
+
+/// How many times the lane has sent `method`, by its wire name.
+fn count_outbound(handle: &FakeLinkHandle, wire_method: &str) -> usize {
+    handle
+        .outbound_methods()
+        .into_iter()
+        .filter(|m| m == wire_method)
+        .count()
+}
+
+/// Answer `method` with the agent's unknown-session refusal for the first `failures` calls, then
+/// with `json!({})`. The counter is the point: "retried once" and "retried forever" are the same
+/// test until you can see how many attempts there were.
+fn fail_unknown_session_times(handle: &FakeLinkHandle, method: &str, failures: usize) {
+    let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    handle.respond_with(method, move |_| {
+        if seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < failures {
+            // `acp_agent.rs`: `acp::Error::invalid_params().data("unknown session id")`.
+            Err(json!({
+                "code": -32602,
+                "message": "Invalid params",
+                "data": "unknown session id",
+            }))
+        } else {
+            Ok(json!({ "updates": [], "totalCount": 0, "hasMore": false }))
+        }
+    });
+}
+
+#[tokio::test]
+async fn a_session_the_roster_says_is_not_resident_is_loaded_again() {
+    let (app, handle) = test_app();
+    handle.respond_ext_ok(
+        "x.ai/sessions/list",
+        json!({ "sessions": [unloaded_roster_row("sess-1")] }),
+    );
+    handle.respond_ok("session/load", json!({}));
+    handle.respond_ok(
+        "x.ai/session/updates",
+        json!({ "updates": [], "totalCount": 0, "hasMore": false }),
+    );
+
+    for _ in 0..2 {
+        let (status, _) = call(&app, authed_get("/v1/sessions/sess-1/history")).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    assert_eq!(
+        count_outbound(&handle, "session/load"),
+        2,
+        "a cached attachment to a session the agent has unloaded is a lie; each touch must reload"
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_session_refusal_reattaches_and_retries_the_request_once() {
+    let (app, handle) = test_app();
+    // The roster still says resident: this is the window `ensure_attached` cannot see.
+    handle.respond_ext_ok(
+        "x.ai/sessions/list",
+        json!({ "sessions": [roster_row("sess-1", "idle")] }),
+    );
+    handle.respond_ok("session/load", json!({}));
+    fail_unknown_session_times(&handle, "x.ai/session/updates", 1);
+
+    let (status, body) = call(&app, authed_get("/v1/sessions/sess-1/history")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    assert_eq!(
+        handle.outbound_methods(),
+        vec![
+            "_x.ai/sessions/list",
+            "session/load",
+            "_x.ai/session/updates",
+            // The refusal drops the cached attachment, so this load really goes out again…
+            "session/load",
+            // …and only then is the read replayed.
+            "_x.ai/session/updates",
+        ],
+        "re-attach, then retry — retrying without the reload would just be refused again"
+    );
+}
+
+#[tokio::test]
+async fn a_second_unknown_session_refusal_is_a_503_and_is_not_retried_again() {
+    let (app, handle) = test_app();
+    handle.respond_ext_ok(
+        "x.ai/sessions/list",
+        json!({ "sessions": [roster_row("sess-1", "idle")] }),
+    );
+    handle.respond_ok("session/load", json!({}));
+    // `acp_agent.rs`: `acp::Error::invalid_params().data("unknown session id")`, every time.
+    handle.respond_err_with_data(
+        "x.ai/session/updates",
+        -32602,
+        "Invalid params",
+        json!("unknown session id"),
+    );
+
+    let (status, body) = call(&app, authed_get("/v1/sessions/sess-1/history")).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["error"], "leader_unavailable");
+
+    assert_eq!(
+        count_outbound(&handle, "_x.ai/session/updates"),
+        2,
+        "exactly one retry: a session that is genuinely gone must not become a retry loop"
+    );
+    assert_eq!(count_outbound(&handle, "session/load"), 2);
+}
+
+#[tokio::test]
+async fn an_ordinary_invalid_params_is_not_retried() {
+    let (app, handle) = test_app();
+    handle.respond_ext_ok(
+        "x.ai/sessions/list",
+        json!({ "sessions": [roster_row("sess-1", "idle")] }),
+    );
+    handle.respond_ok("session/load", json!({}));
+    // Same code, different cause. `invalid_params` on its own says nothing about residency, and
+    // reloading the session would not make a malformed request valid.
+    handle.respond_err("x.ai/session/updates", -32602, "Invalid params");
+
+    let (status, body) = call(&app, authed_get("/v1/sessions/sess-1/history")).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["error"], "leader_unavailable");
+
+    assert_eq!(count_outbound(&handle, "_x.ai/session/updates"), 1);
+    assert_eq!(
+        count_outbound(&handle, "session/load"),
+        1,
+        "nothing about a malformed request says the session moved"
+    );
+}

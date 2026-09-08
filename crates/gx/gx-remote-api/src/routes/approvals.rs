@@ -151,7 +151,7 @@ pub async fn post_approval(
 /// already open.
 async fn attach(state: &Arc<AppState>, session_id: &str) -> Result<(), ApiError> {
     let session = resolve_session(state, session_id).await?;
-    ensure_attached(state, session_id, &session.cwd).await
+    ensure_attached(state, &session).await
 }
 
 /// What a client sent instead of an object, for the error message.

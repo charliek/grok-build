@@ -97,19 +97,82 @@ pub async fn resolve_session(state: &Arc<AppState>, id: &str) -> Result<SessionS
     Err(ApiError::UnknownSession(id.to_string()))
 }
 
-/// Attach to `session_id` if this lane has not already, and block until the leader confirms.
+/// Attach to `session` if this lane has not already, and block until the leader confirms.
+///
+/// Takes the **resolved** row rather than a bare id because residency is half the decision. The
+/// lane stays subscribed to a session across an unload — the leader detaches a session when its
+/// last non-observer subscriber disconnects but keeps the observer's subscription (see
+/// `leader/server.rs`'s disconnect handler), and the agent then unloads it if it is idle. The
+/// cached attachment survives that, so a roster row saying the session is **not resident** is the
+/// lane's cue that its cache describes a session the agent no longer holds: drop it first, so the
+/// `session/load` is actually re-issued. Every caller already resolves the row immediately before
+/// this, so nothing pays for an extra round trip.
 ///
 /// `_meta.noReplay` suppresses the transcript replay: a phone reads history over
 /// `/v1/sessions/{id}/history`, so replaying it down the ACP link would be a large duplicate for
 /// nothing. `mcpServers: []` matches what every other attaching client sends — the servers belong
 /// to the session, not to the attaching client.
 ///
-/// Called only by routes that touch a session's *content*; see the module docs.
+/// Called once per request, only by routes that touch a session's *content*; see the module docs.
 pub async fn ensure_attached(
     state: &Arc<AppState>,
-    session_id: &str,
-    cwd: &str,
+    session: &SessionSummary,
 ) -> Result<(), ApiError> {
+    if !session.resident {
+        state.attachments.detach(&session.session_id);
+    }
+    attach(state, &session.session_id, &session.cwd).await
+}
+
+/// Drop the cached attachment and `session/load` again, whatever the cache said.
+///
+/// The recovery half of [`session_scoped_request`]: the roster's `resident` bit can be a moment
+/// stale, and the only other evidence that the agent unloaded a session is its refusal of the
+/// request itself.
+async fn reattach(state: &Arc<AppState>, session: &SessionSummary) -> Result<(), ApiError> {
+    state.attachments.detach(&session.session_id);
+    attach(state, &session.session_id, &session.cwd).await
+}
+
+/// Run one session-scoped ACP request, recovering **once** from the agent having unloaded the
+/// session underneath the lane.
+///
+/// [`ensure_attached`] closes the window the roster can see; this closes the one it cannot. Between
+/// the roster read that said `resident` and this request, the session's last TUI can disconnect and
+/// the agent can unload an idle session — and because the lane's attachment is cached, no
+/// `session/load` went out to bring it back. The agent answers with `invalid_params` /
+/// `unknown session id` (`agent/mvp_agent/acp_agent.rs`), which is specific enough to act on: drop
+/// the cache, re-issue the load, replay the request.
+///
+/// Exactly once. A second failure is a real one — a dead session actor, a session genuinely gone —
+/// and surfaces as the `503 leader_unavailable` it always did, rather than a retry loop.
+///
+/// The caller must have attached already: this is the *request*, not the attach.
+pub async fn session_scoped_request(
+    state: &Arc<AppState>,
+    session: &SessionSummary,
+    method: &str,
+    params: Value,
+) -> Result<Value, ApiError> {
+    match state.acp.request(method, params.clone()).await {
+        Err(err) if err.is_unknown_session() => {
+            warn!(
+                session_id = %session.session_id,
+                method,
+                "gx-remote-api: the agent no longer holds this session; re-attaching and retrying once"
+            );
+            reattach(state, session).await?;
+            Ok(state.acp.request(method, params).await?)
+        }
+        other => Ok(other?),
+    }
+}
+
+/// The `session/load` itself, behind the per-session [`OnceCell`] that makes two concurrent
+/// first-touches send exactly one.
+///
+/// [`OnceCell`]: tokio::sync::OnceCell
+async fn attach(state: &Arc<AppState>, session_id: &str, cwd: &str) -> Result<(), ApiError> {
     let slot = state.attachments.slot(session_id);
     slot.get_or_try_init(|| async {
         state

@@ -321,6 +321,31 @@ error codes and the accepted risks: [`docs/gx/REMOTE_API.md`](REMOTE_API.md).**
 
 To turn it off, see "Coexistence" below.
 
+## Hook environment and roost tabs
+
+One leader serves every TUI on the machine, and it runs every session's hooks — so a hook
+cannot simply read the leader's own environment to work out who it is reporting to. It
+would report to whichever terminal happened to start the leader first, which for
+[roost](https://github.com/charliek/roost) means every session's events landing in one
+arbitrary tab.
+
+So the identity travels **per client**. A TUI launched inside a roost tab carries
+`ROOST_TAB_ID`, `ROOST_SOCKET` and `ROOST_AGENT_HOOK` in its environment; gx registers
+those three with the leader, and the leader stamps them into the hook environment of the
+sessions **that client** creates or attaches to. All three or none: a partial set is
+dropped, because a hook with a socket and no tab id has nothing useful to say.
+
+Sessions that carry no identity — the ones the remote lane creates for a phone, headless
+runs, and any TUI started outside a roost tab — get every `ROOST_*` name the leader
+inherited set to the **empty string** in their hooks' environment, rather than left to
+whatever the leader happened to inherit. That is deliberate: an empty `ROOST_AGENT_HOOK`
+makes roost's hook take its no-op branch, so such a session is simply invisible to roost
+instead of reporting into whichever tab started the leader.
+
+The values are taken from the client's registration and never from a request body, and
+attaching from the phone never changes a session's identity — only a TUI can, and only for
+its own sessions.
+
 ## Coexistence with stock grok
 
 Both binaries default to `$GROK_HOME=~/.grok` and share `config.toml`, auth, and
@@ -456,6 +481,14 @@ Being upfront about the rough edges:
   SSH's job. A stale discovery record can also name a recycled port, so a client must
   check `/v1/healthz`'s `instanceId` before sending the token — see
   [`docs/gx/REMOTE_API.md`](REMOTE_API.md).
-- **Sessions the remote lane has touched stay resident** in the leader for as long as it
-  lives (there is no explicit or idle detach yet), so its memory grows with the set of
-  sessions a phone has opened.
+- **A session stays resident while a TUI is attached to it, and after the remote lane
+  loads it — but the lane alone does not keep it that way.** When a session's last TUI
+  exits, an *idle* session is unloaded even if the lane is still subscribed; the lane
+  reloads it transparently on the phone's next request, so nothing is lost but that one
+  extra round trip. A *busy* session — a turn running, or an approval waiting for an
+  answer — stays resident and keeps delivering to the lane, which is what makes answering
+  a prompt from your phone after closing the laptop work at all. Known limitation: that
+  decision is taken once, at the moment of the disconnect, and nothing re-checks it when
+  the turn ends — so a session whose TUI leaves **mid-turn** stays resident (and its
+  `SessionEnd` hooks unfired) until some later disconnect names it again, or until the
+  leader exits.

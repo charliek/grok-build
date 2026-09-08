@@ -27,9 +27,15 @@ leader's routing:
 - **identity-only** meta injection on `session/load`, so touching a session from the phone does not
   switch off the TUI's status line or its fs/terminal routing.
 
-It *is* a full subscriber, so it receives session fan-out and keeps a session **resident** — which
-is the handoff the whole thing exists for: a session the phone has touched survives its TUI
-exiting.
+It *is* a full subscriber, so it receives session fan-out for every session it has attached, and it
+stays subscribed even after the leader detaches one. What it does **not** do is pin a session
+resident: the leader detaches a session when its last *non-observer* subscriber disconnects, so a
+TUI exiting still unloads an idle session even with a phone watching. That is deliberate — an
+observer that kept every session it had ever opened loaded would leak them for the leader's whole
+life and never let a session's `SessionEnd` hooks fire. The handoff still works, in two halves: a
+**busy** session (a running turn, or an approval waiting for an answer) is kept resident across the
+detach and keeps delivering to the lane, and an **idle** one is unloaded and transparently reloaded
+by the lane on the phone's next request. See [Attach policy](#attach-policy).
 
 ```text
   phone ──http──> 127.0.0.1:2421 ─┐
@@ -267,9 +273,23 @@ to the leader, not that the turn has stopped. The turn's actual end arrives on t
 
 The first request that touches a session's *content* (`/history`, `/events`, `/messages`,
 `/cancel`, `/approvals`) performs a `session/load` with `_meta.noReplay: true`, **awaits it**, and
-only then proceeds (`503 leader_unavailable` on failure). Attached sessions stay attached; there is
-no explicit or idle detach in this cut, so a session the phone touched stays resident in the leader
-until the leader exits.
+only then proceeds (`503 leader_unavailable` on failure). The attachment is then cached, so a
+second touch does not send a second load — a redundant load makes the agent flush and replay.
+
+The cache is not permanent, because the session it describes is not. The leader detaches a session
+when its last non-observer subscriber disconnects, and the agent unloads it if it is idle, while
+this lane stays subscribed. Two things repair the resulting stale cache, and between them a phone
+never has to know it happened:
+
+1. every content request resolves the session's roster row first, and a row reporting
+   `"resident": false` drops the cached attachment, so the `session/load` really is re-sent;
+2. for the window the roster cannot see — resident when it was read, unloaded a moment later — the
+   agent answers with `invalid_params` and an `unknown session id`, and the lane reloads and
+   replays that one request **once**. A second failure is reported as `503 leader_unavailable`
+   rather than retried again.
+
+The visible cost of a reload is one extra round trip on the first request after a TUI exits. There
+is still no *explicit* detach endpoint, and no idle timer of the lane's own.
 
 Pending approvals raised before the first touch are recovered by the leader's replay-on-attach —
 which happens *after* the load response, asynchronously, so a client whose very first call is
@@ -485,8 +505,11 @@ Deliberate, and written down so nobody has to rediscover them:
   lane never logs a full URI.
 - **A stale discovery record can name a port a different local process now owns.** Hence the client
   contract above: `GET /v1/healthz`, match `instanceId`, *then* send the token.
-- **Touched sessions stay resident** in the leader while it lives; memory grows with the set of
-  sessions the phone has touched. Explicit and idle detach are future work.
+- **A session kept resident because it was busy is never re-checked.** The detach is decided at the
+  moment a client disconnects, so a session whose last TUI left mid-turn stays loaded after that
+  turn ends, until some later disconnect names it again or the leader exits. Idle sessions are the
+  common case and are unloaded immediately, so memory does not grow with everything the phone has
+  ever opened — but it can still grow. An idle sweep is future work.
 - **API-created sessions have no driver** until a TUI attaches; scheduled prompt injections are
   dropped meanwhile.
 - **Non-persisted events (approvals, roster) are not exactly resumable.** Reconcile with a GET
@@ -494,13 +517,16 @@ Deliberate, and written down so nobody has to rediscover them:
 - **Exit-on-disconnect is evaluated only on a disconnect.** If the last non-observer client
   disconnects in the microsecond between the lane's `accept` and its `Register`, a manual leader
   that would have exited stays alive until the next disconnect. Accepted: the race can only keep a
-  leader alive, never kill one early.
+  leader alive, never kill one early. (The observer is still ignored by that predicate, and now by
+  the per-session detach one too — the two decisions are independent and both live in the leader's
+  disconnect handler.)
 - **A detached leader with a loopback listener by default is a UX change** for every gx user.
   Mitigated by `gx doctor` and the disable knobs above.
 
-Not in this cut, explicitly: TLS, non-loopback bind, config-file knobs, explicit/idle detach,
-driver handoff for API-created sessions, an API-owned event journal, an OpenAPI document, and a
-standalone `gx remote serve` daemon for leader-less hosts.
+Not in this cut, explicitly: TLS, non-loopback bind, config-file knobs, an explicit detach endpoint
+and an idle sweep for sessions the leader kept resident, driver handoff for API-created sessions, an
+API-owned event journal, an OpenAPI document, and a standalone `gx remote serve` daemon for
+leader-less hosts.
 
 ---
 
