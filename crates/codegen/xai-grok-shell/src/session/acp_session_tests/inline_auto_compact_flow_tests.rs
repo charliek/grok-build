@@ -103,6 +103,8 @@ async fn create_test_actor(
         turn_prompt_mode: Arc::new(parking_lot::Mutex::new(PromptMode::Agent)),
         telemetry_enabled: false,
         supports_backend_search: std::cell::Cell::new(false),
+        // gx: see `SessionActor::supports_vision`.
+        supports_vision: std::cell::Cell::new(true),
         tool_overrides: std::cell::RefCell::new(None),
         resolved_tool_overrides: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
         compactions_remaining: std::cell::Cell::new(None),
@@ -249,6 +251,7 @@ async fn create_test_actor(
         last_api_request_at: std::sync::atomic::AtomicI64::new(0),
         hook_registry: std::cell::RefCell::new(None),
         hook_disabled: Default::default(),
+        gx_hook_env: Default::default(), // gx: roost hook identity (issue #14)
         turn_report: Default::default(),
         turn_abort: Default::default(),
         turn_end_tx: Default::default(),
@@ -279,6 +282,8 @@ async fn create_test_actor(
         turn_stream_drained: parking_lot::Mutex::new(std::collections::HashMap::new()),
         pending_image_strip: parking_lot::Mutex::new(std::collections::HashMap::new()),
         image_strip_rewrite_barrier: ImageStripRewriteBarrier::new(),
+        // gx: see `SessionActor::told_model_text_only_image_notice`.
+        told_model_text_only_image_notice: std::sync::atomic::AtomicBool::new(false),
         sampler_handle: xai_grok_sampler::SamplerHandle::noop(),
         sampling_gate: None,
         image_description_model: crate::test_support::TEST_MODEL.to_owned(),
@@ -527,6 +532,8 @@ async fn create_test_actor_with_memory(
         )),
         telemetry_enabled: false,
         supports_backend_search: std::cell::Cell::new(false),
+        // gx: see `SessionActor::supports_vision`.
+        supports_vision: std::cell::Cell::new(true),
         tool_overrides: std::cell::RefCell::new(None),
         resolved_tool_overrides: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
         compactions_remaining: std::cell::Cell::new(None),
@@ -688,6 +695,7 @@ async fn create_test_actor_with_memory(
         last_api_request_at: std::sync::atomic::AtomicI64::new(0),
         hook_registry: std::cell::RefCell::new(None),
         hook_disabled: Default::default(),
+        gx_hook_env: Default::default(), // gx: roost hook identity (issue #14)
         turn_report: Default::default(),
         turn_abort: Default::default(),
         turn_end_tx: Default::default(),
@@ -718,6 +726,8 @@ async fn create_test_actor_with_memory(
         turn_stream_drained: parking_lot::Mutex::new(std::collections::HashMap::new()),
         pending_image_strip: parking_lot::Mutex::new(std::collections::HashMap::new()),
         image_strip_rewrite_barrier: ImageStripRewriteBarrier::new(),
+        // gx: see `SessionActor::told_model_text_only_image_notice`.
+        told_model_text_only_image_notice: std::sync::atomic::AtomicBool::new(false),
         sampler_handle: xai_grok_sampler::SamplerHandle::noop(),
         sampling_gate: None,
         image_description_model: crate::test_support::TEST_MODEL.to_owned(),

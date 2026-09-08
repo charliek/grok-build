@@ -243,6 +243,36 @@ explicit `context_window` gx sets itself, since grok's model catalog has no entr
 third-party id. Run `gx providers status` to see exactly what's configured and where
 each value came from (`providers.toml` vs `config.toml` vs environment).
 
+### `tool_result_images`
+
+When a tool returns an image (`read_file` on a screenshot, say), grok puts the image
+*inside* the `tool` message. That is an xAI extension — the OpenAI Chat Completions spec
+allows only text there — and Meta's Muse gateway rejects it with
+`messages[N].content did not match any supported type`. So on any **non-xAI Chat
+Completions** provider gx hoists those images into a short `user` message emitted right
+after the tool message(s) that produced them; xAI and the Responses/Messages backends keep
+the inline shape. Set `tool_result_images = "inline"` or `"hoist"` on a `[model."<id>"]`
+table in `config.toml` (or `providers.toml`) to override that per-provider default if your
+endpoint disagrees with the guess.
+
+A loopback base URL is treated as xAI's cli-chat-proxy, so a local OpenAI-compatible server
+(Ollama, LM Studio) keeps the inline shape by default. That is the behaviour it already had;
+set `tool_result_images = "hoist"` on it if its server rejects images in a tool message.
+
+### `supports_vision`
+
+Some third-party endpoints reject an image outright, in any role, regardless of how its
+tool-result images are shaped. Set `supports_vision = false` on a `[model."<id>"]` table to
+say so; gx then strips every image from the request before the first attempt instead of
+paying a guaranteed failed request to find out. `glm-5.3` ships with this set, since Z.AI's
+coding-plan endpoint 400s on an image anywhere in the request
+(`messages.content.type is invalid, allowed values: ['text']`, verified live);
+`glm-5.3-flash` is vision-capable and does not carry it. The image itself is never deleted —
+it stays in the conversation transcript, and only the outgoing request drops it, so it comes
+back if you later switch to a vision-capable model. The key is absent by default (meaning
+`true`); stock grok does not understand it and logs a harmless unknown-field warning since
+the GLM preset lives in the shared `config.toml`.
+
 ## Remote lane
 
 A gx build starts a **leader** by default (stock grok does not), and that leader hosts a
@@ -291,6 +321,31 @@ error codes and the accepted risks: [`docs/gx/REMOTE_API.md`](REMOTE_API.md).**
 
 To turn it off, see "Coexistence" below.
 
+## Hook environment and roost tabs
+
+One leader serves every TUI on the machine, and it runs every session's hooks — so a hook
+cannot simply read the leader's own environment to work out who it is reporting to. It
+would report to whichever terminal happened to start the leader first, which for
+[roost](https://github.com/charliek/roost) means every session's events landing in one
+arbitrary tab.
+
+So the identity travels **per client**. A TUI launched inside a roost tab carries
+`ROOST_TAB_ID`, `ROOST_SOCKET` and `ROOST_AGENT_HOOK` in its environment; gx registers
+those three with the leader, and the leader stamps them into the hook environment of the
+sessions **that client** creates or attaches to. All three or none: a partial set is
+dropped, because a hook with a socket and no tab id has nothing useful to say.
+
+Sessions that carry no identity — the ones the remote lane creates for a phone, headless
+runs, and any TUI started outside a roost tab — get every `ROOST_*` name the leader
+inherited set to the **empty string** in their hooks' environment, rather than left to
+whatever the leader happened to inherit. That is deliberate: an empty `ROOST_AGENT_HOOK`
+makes roost's hook take its no-op branch, so such a session is simply invisible to roost
+instead of reporting into whichever tab started the leader.
+
+The values are taken from the client's registration and never from a request body, and
+attaching from the phone never changes a session's identity — only a TUI can, and only for
+its own sessions.
+
 ## Coexistence with stock grok
 
 Both binaries default to `$GROK_HOME=~/.grok` and share `config.toml`, auth, and
@@ -315,7 +370,7 @@ session state. gx neutralizes the two places that would otherwise collide:
   | `[cli] use_leader = false` in `config.toml` | no leader by default — note this is the **shared** config, so it turns leader mode off for stock grok too |
   | `GX_REMOTE_DISABLE=1` | leader as usual, **no lane** |
   | `GX_REMOTE_PORT=<n>` | a different loopback port (busy ports fall back to an ephemeral one; an unparseable value warns and falls back to the default port) |
-  | `gx leader kill` | stop the running leaders, and their lanes, now |
+  | `gx leader kill` | stop the running leaders, and their lanes, now — gracefully: each leader flushes its sessions (running their `SessionEnd` hooks) before exiting, and the command waits up to 15s per leader and exits non-zero if one is still running |
 
   `gx doctor` prints which of these is in force, plus the socket, the lock's pid, and
   whether the token file exists with mode `0600`.
@@ -426,6 +481,14 @@ Being upfront about the rough edges:
   SSH's job. A stale discovery record can also name a recycled port, so a client must
   check `/v1/healthz`'s `instanceId` before sending the token — see
   [`docs/gx/REMOTE_API.md`](REMOTE_API.md).
-- **Sessions the remote lane has touched stay resident** in the leader for as long as it
-  lives (there is no explicit or idle detach yet), so its memory grows with the set of
-  sessions a phone has opened.
+- **A session stays resident while a TUI is attached to it, and after the remote lane
+  loads it — but the lane alone does not keep it that way.** When a session's last TUI
+  exits, an *idle* session is unloaded even if the lane is still subscribed; the lane
+  reloads it transparently on the phone's next request, so nothing is lost but that one
+  extra round trip. A *busy* session — a turn running, or an approval waiting for an
+  answer — stays resident and keeps delivering to the lane, which is what makes answering
+  a prompt from your phone after closing the laptop work at all. Known limitation: that
+  decision is taken once, at the moment of the disconnect, and nothing re-checks it when
+  the turn ends — so a session whose TUI leaves **mid-turn** stays resident (and its
+  `SessionEnd` hooks unfired) until some later disconnect names it again, or until the
+  leader exits.

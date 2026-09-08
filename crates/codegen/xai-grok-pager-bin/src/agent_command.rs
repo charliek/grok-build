@@ -17,13 +17,15 @@ pub(crate) struct AgentSignals {
     _listener: AbortOnDropHandle<()>,
 }
 
-pub(crate) fn spawn_signal_flush() -> AgentSignals {
+pub(crate) fn spawn_signal_flush(is_leader: bool) -> AgentSignals {
     let defer_exit = Arc::new(AtomicBool::new(false));
     let defer_exit_for_listener = Arc::clone(&defer_exit);
     let (sender, received) = oneshot::channel();
     // Signal observation must remain independent of synchronous agent startup
     let listener = AbortOnDropHandle::new(tokio::spawn(async move {
         let code = next_signal_code().await;
+        // gx: end the leader's sessions before `shutdown_and_flush_telemetry` exits the process.
+        crate::gx_flush_leader_sessions_on_signal(is_leader).await;
         if !defer_exit_for_listener.load(Ordering::Acquire) || sender.send(code).is_err() {
             shutdown_and_flush_telemetry(code);
         }
@@ -32,6 +34,7 @@ pub(crate) fn spawn_signal_flush() -> AgentSignals {
             () = tokio::time::sleep(STDIO_SHUTDOWN_TIMEOUT) => code,
             again = next_signal_code() => again,
         };
+        crate::gx_flush_leader_sessions_on_signal(is_leader).await;
         shutdown_and_flush_telemetry(code);
     }));
     AgentSignals {
