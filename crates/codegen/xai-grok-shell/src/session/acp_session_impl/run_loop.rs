@@ -265,6 +265,15 @@ pub(super) async fn run_session(
     index_root: std::path::PathBuf,
     fs_watch_caps: fs_watch::FsWatchCapabilities,
 ) {
+    // gx: capture this session's freshly built hook registry as its pristine copy and derive the
+    // effective one once, before any hook can fire. Every other call site is conditional -- a
+    // `SetHookEnv` (which an observer-loaded or headless session never gets, because the leader
+    // stamps no identity for those) or a hook reload -- so without this a session with no identity
+    // of its own would keep the pristine registry and its hooks would inherit the LEADER's
+    // environment, which is the misattribution issue #14 is about. Deriving here neutralizes every
+    // `ROOST_*` name the leader inherited, so such a session is invisible to roost instead of
+    // reporting to whichever tab happened to start the leader.
+    session.gx_hook_registry_rebuilt();
     let (completion_tx, mut completion_rx) =
         mpsc::unbounded_channel::<super::turn_task::TurnCompletionMsg>();
     let mut turn_end_queue = super::turn_end_hooks::TurnEndQueue::spawn(session.clone());
