@@ -27,6 +27,12 @@ pub enum StripReason {
     /// Non-deterministic covers a proxy-wrapped 500, a legacy phrase match, or a mid-stream error.
     /// The failure may be transient and blames no particular image.
     PayloadHeuristic,
+    /// gx: a pre-flight strip: `[model.<id>].supports_vision = false` says this
+    /// endpoint never accepts images, so `run_request_task` strips them
+    /// before the first attempt rather than paying a guaranteed 400. Never a
+    /// server verdict on any particular image and never deferred — chat
+    /// history keeps the images; only this request drops them.
+    ModelTextOnly,
 }
 
 impl StripReason {
@@ -35,6 +41,8 @@ impl StripReason {
         match self {
             StripReason::ServerRejected => "server_rejected",
             StripReason::PayloadHeuristic => "payload_heuristic",
+            // gx: see `StripReason::ModelTextOnly`.
+            StripReason::ModelTextOnly => "model_text_only",
         }
     }
 }

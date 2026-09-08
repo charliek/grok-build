@@ -1032,8 +1032,28 @@ impl MvpAgent {
                 "load_session: reconnecting to existing session, updating MCP servers"
             );
             let attach_hints = explicit_startup_hints(request_meta.as_ref());
+            // gx: (issue #14) a warm reattach of an already-resident session. The cold path stamps
+            // the identity in `spawn_and_register_session`; this is the branch where the session
+            // is already running and a DIFFERENT tab's client may be taking it over. An ABSENT key
+            // means the requester is an observer (the remote lane) or predates the stamp: the
+            // session keeps whatever identity it has, so opening it from the phone cannot unhook
+            // the TUI's session from its tab. Present-but-empty is a real client with no roost
+            // identity, and clears.
+            let gx_hook_env = crate::agent::gx_hook_env::from_meta_json(
+                request_meta
+                    .as_ref()
+                    .and_then(|m| m.get(crate::agent::gx_hook_env::META_KEY)),
+            );
             self.with_resident_mut(&session_id, |handle| {
                 handle.initial_client_mcp_servers = initial_client_mcp_servers;
+                // gx: beside `UpdateAttachPolicy`, on the same reconnect rail. The actor re-fires
+                // SessionStart itself when this moves the session to a different live tab.
+                if let Some(env) = gx_hook_env.clone() {
+                    handle.gx_hook_env = env.clone();
+                    let _ = handle
+                        .cmd_tx
+                        .send(crate::session::SessionCommand::SetHookEnv { env });
+                }
                 if let Some(hints) = attach_hints {
                     let _ =
                         handle

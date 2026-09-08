@@ -258,6 +258,7 @@ fn wedged_child_handle() -> (
         session_default_agent_profile: None,
         allowed_subagent_types: None,
         hook_registry: None,
+        gx_hook_env: Default::default(), // gx: roost hook identity (issue #14)
         workspace_ops: xai_grok_workspace::WorkspaceOps::for_test(),
         terminal_backend: None,
         tools_notification_handle: None,
@@ -2350,6 +2351,10 @@ fn test_model_entry(model_id: &str) -> crate::agent::config::ModelEntry {
             show_model_fingerprint: false,
             stream_tool_calls: None,
             codex_compat: None,
+            // gx: see `ModelEntryConfig::tool_result_images`.
+            tool_result_images: None,
+            // gx: see `ModelEntryConfig::supports_vision`.
+            supports_vision: None,
             laziness_detector: crate::agent::config::LazinessDetectorPerModelConfig::default(),
             variants: Vec::new(),
         },
@@ -2577,6 +2582,8 @@ fn test_sampling_config(model_slug: &str) -> xai_grok_sampling_types::SamplingCo
         reasoning_effort: None,
         stream_tool_calls: None,
         codex_compat: None,
+        // gx: see `SamplingConfig::hoist_tool_images`.
+        hoist_tool_images: None,
     }
 }
 fn spawn_test_parent_chat_state(model_slug: &str) -> xai_chat_state::ChatStateHandle {

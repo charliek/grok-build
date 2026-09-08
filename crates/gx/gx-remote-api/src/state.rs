@@ -164,6 +164,24 @@ impl Attachments {
         let slots = self.slots.lock().unwrap();
         slots.get(session_id).is_some_and(|slot| slot.initialized())
     }
+
+    /// Forget `session_id`'s attachment, so the next touch sends a fresh `session/load`.
+    ///
+    /// The lane's subscription outlives the agent's copy of a session: the leader detaches a
+    /// session when its last non-observer subscriber disconnects, and the agent then unloads it if
+    /// it is idle — while this lane stays subscribed. The cached `OnceCell` is what would stop the
+    /// next request re-issuing the `session/load` that brings it back, so it has to be droppable.
+    ///
+    /// The slot is **replaced**, not cleared in place: a caller that is *concurrently* inside
+    /// `get_or_try_init` holds an `Arc` to the old cell and will finish initializing it after this
+    /// returns. Because the map now points at a fresh cell, that late success lands on a generation
+    /// nobody reads and is simply discarded — the next request sees an uninitialized slot and loads
+    /// again. Clearing in place is not even expressible (`OnceCell` has no reset behind a shared
+    /// reference) and would resurrect the stale attachment if it were.
+    pub fn detach(&self, session_id: &str) {
+        let mut slots = self.slots.lock().unwrap();
+        slots.insert(session_id.to_string(), Arc::new(OnceCell::new()));
+    }
 }
 
 #[cfg(test)]
@@ -221,6 +239,52 @@ mod tests {
             loads.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "a second session/load would make the agent flush and replay"
+        );
+    }
+
+    #[tokio::test]
+    async fn detach_forces_the_next_touch_to_load_again() {
+        let attachments = Attachments::default();
+        attachments.mark_attached("s1");
+        assert!(attachments.is_attached("s1"));
+
+        attachments.detach("s1");
+        assert!(
+            !attachments.is_attached("s1"),
+            "a detached session must look unattached, or the next request skips the reload"
+        );
+
+        // And the slot really is loadable again.
+        attachments
+            .slot("s1")
+            .get_or_try_init(|| async { Ok::<(), &str>(()) })
+            .await
+            .unwrap();
+        assert!(attachments.is_attached("s1"));
+    }
+
+    #[tokio::test]
+    async fn a_load_that_was_already_in_flight_cannot_resurrect_a_detached_attachment() {
+        // The race the generation-style replacement exists for: a request takes the slot, the
+        // session is detached underneath it, and only *then* does its `session/load` succeed. That
+        // success describes a session the lane has since been told to forget, so it must not put
+        // the attachment back.
+        let attachments = Attachments::default();
+        let in_flight = attachments.slot("s1");
+
+        attachments.detach("s1");
+
+        in_flight
+            .get_or_try_init(|| async { Ok::<(), &str>(()) })
+            .await
+            .unwrap();
+        assert!(
+            in_flight.initialized(),
+            "sanity: the concurrent initializer really did complete"
+        );
+        assert!(
+            !attachments.is_attached("s1"),
+            "a load that completed after the detach must land on a generation nobody reads"
         );
     }
 }

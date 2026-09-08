@@ -478,6 +478,24 @@ pub(crate) async fn generate_session_compact(
     }
     let chat_history = prepared_history.items;
     let num_messages = chat_history.len();
+    // gx: every arm below builds its own `ConversationRequest` and calls the
+    // client directly, so none of them goes through the sampler's own
+    // pre-flight strip (`run_request_task`) -- a `supports_vision = false`
+    // model has to be stripped here too, once, or the compaction call 400s
+    // on the same image the sampler would have dropped.
+    let chat_history = if sampling_config.supports_vision {
+        chat_history
+    } else {
+        let mut request = ConversationRequest::from_items(chat_history);
+        let stripped = request.strip_images();
+        if !stripped.is_empty() {
+            tracing::info!(
+                stripped = stripped.len(),
+                "compaction: stripped image(s) before summarizing: model is configured text-only (supports_vision = false)"
+            );
+        }
+        request.items
+    };
     let wire_tool_choice = match tool_choice {
         crate::util::config::CompactionToolChoice::Auto => ToolChoice::auto(),
         crate::util::config::CompactionToolChoice::None => ToolChoice::none(),
@@ -490,8 +508,12 @@ pub(crate) async fn generate_session_compact(
     let output = match sampling_config.api_backend {
         ApiBackend::ChatCompletions => {
             // Fold `Reasoning` siblings into the following assistant via `conversation_to_chat_messages`.
+            // gx: this branch builds the request itself instead of going
+            // through the sampler's `apply_conversation_defaults`, so the
+            // tool-image hoist has to be passed in explicitly or a compaction
+            // request would 400 on the provider the flag exists for.
             let chat_messages: Vec<ChatRequestMessage> =
-                conversation_to_chat_messages(chat_history);
+                conversation_to_chat_messages(chat_history, sampling_config.hoist_tool_images);
             let mut message =
                 ChatCompletionRequest::new(sampling_config.model.to_owned(), chat_messages)
                     .with_temperature(1.0);

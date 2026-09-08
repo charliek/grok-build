@@ -440,6 +440,7 @@ fn field_parse_error(field: &str, value: &toml::Value) -> Option<toml::de::Error
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::gx_tool_images::ToolResultImages;
     use crate::sampling::ApiBackend;
     use xai_grok_sampling_types::{
         CompactionAtTokens, CompactionsRemaining, ReasoningEffort, ReasoningEffortOption,
@@ -712,7 +713,95 @@ mod tests {
             show_model_fingerprint: Some(true),
             stream_tool_calls: Some(false),
             codex_compat: None,
+            // gx: set, not `None`, so the lossless-round-trip guard covers the
+            // `"hoist"` spelling too.
+            tool_result_images: Some(ToolResultImages::Hoist),
+            // gx: set, not `None`, so the lossless-round-trip guard covers
+            // `supports_vision` too.
+            supports_vision: Some(false),
         }
+    }
+
+    /// gx: `tool_result_images` is a gx-only per-model key; the enum is the
+    /// only thing standing between a typo and silently getting the wire shape
+    /// the provider rejects.
+    #[test]
+    fn tool_result_images_parses_both_spellings() {
+        for (spelling, expected) in [
+            ("hoist", ToolResultImages::Hoist),
+            ("inline", ToolResultImages::Inline),
+        ] {
+            let cfg = parse_cfg(&format!(
+                r#"
+                [model."muse"]
+                model = "muse"
+                tool_result_images = "{spelling}"
+                "#
+            ));
+            let model = cfg
+                .config_models
+                .get("muse")
+                .expect("muse must remain in catalog");
+            assert_eq!(model.tool_result_images, Some(expected));
+            assert!(cfg.config_warnings.is_empty(), "{spelling}");
+        }
+    }
+
+    /// gx: `[model.<id>] supports_vision = false` must round-trip and leave
+    /// the field unset (meaning "true") when absent -- `glm-5.3`'s preset
+    /// (and any future text-only model) depends on a missing key never being
+    /// silently coerced to `false`.
+    #[test]
+    fn supports_vision_round_trips_and_defaults_to_unset() {
+        for expected in [false, true] {
+            let cfg = parse_cfg(&format!(
+                r#"
+                [model."muse"]
+                model = "muse"
+                supports_vision = {expected}
+                "#
+            ));
+            let model = cfg
+                .config_models
+                .get("muse")
+                .expect("muse must remain in catalog");
+            assert_eq!(model.supports_vision, Some(expected));
+            assert!(cfg.config_warnings.is_empty());
+        }
+
+        let cfg = parse_cfg(
+            r#"
+            [model."muse"]
+            model = "muse"
+            "#,
+        );
+        let model = cfg.config_models.get("muse").expect("muse in catalog");
+        assert_eq!(
+            model.supports_vision, None,
+            "an absent key must not default to false"
+        );
+    }
+
+    /// gx: an unparseable value is pruned like every other bad field -- the
+    /// model stays and falls back to the per-provider default.
+    #[test]
+    fn invalid_tool_result_images_skips_field_keeps_model() {
+        let cfg = parse_cfg(
+            r#"
+            [model."muse"]
+            model = "muse"
+            tool_result_images = "sideways"
+            "#,
+        );
+        let model = cfg
+            .config_models
+            .get("muse")
+            .expect("muse must remain in catalog");
+        assert_eq!(model.model.as_deref(), Some("muse"));
+        assert!(model.tool_result_images.is_none());
+        assert!(cfg.config_warnings.iter().any(|w| {
+            w.kind == ConfigWarningKind::InvalidValue && w.field() == Some("tool_result_images")
+        }));
     }
 
     fn parse_single_entry(

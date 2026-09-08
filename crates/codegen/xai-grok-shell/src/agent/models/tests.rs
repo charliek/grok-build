@@ -2103,6 +2103,10 @@ fn make_entry_config_with_id(
         show_model_fingerprint: false,
         stream_tool_calls: None,
         codex_compat: None,
+        // gx: see `ModelEntryConfig::tool_result_images`.
+        tool_result_images: None,
+        // gx: see `ModelEntryConfig::supports_vision`.
+        supports_vision: None,
         laziness_detector: config::LazinessDetectorPerModelConfig::default(),
         variants: Vec::new(),
     }

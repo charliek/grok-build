@@ -151,7 +151,7 @@ pub async fn get_events(
     // never reaches the notification fan-out, and a POST that answers one happens on an HTTP task.
     let approvals = state.approvals.subscribe();
 
-    ensure_attached(&state, &id, &session.cwd).await?;
+    ensure_attached(&state, &session).await?;
 
     let cursor = headers
         .get("last-event-id")
@@ -390,7 +390,7 @@ async fn plan_replay(
     let bounds = state.ring.bounds(session_id);
     let newest = match bounds {
         Some((_, newest)) => Some(newest),
-        None => newest_persisted(state, session_id, &session.cwd).await?,
+        None => newest_persisted(state, session).await?,
     };
     match newest {
         Some(newest) if cursor > newest => {
@@ -410,7 +410,7 @@ async fn plan_replay(
     }
 
     // (4) Older than the ring: disk first, then whatever the ring holds beyond it.
-    let page = fetch_updates(state, session_id, &session.cwd, None, DISK_REPLAY_LIMIT).await?;
+    let page = fetch_updates(state, session, None, DISK_REPLAY_LIMIT).await?;
     let mut frames: Vec<Arc<NormalizedEnvelope>> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     let mut last = cursor;
@@ -442,13 +442,12 @@ async fn plan_replay(
     Ok((None, frames))
 }
 
-/// The newest persisted event counter for `session_id`, or `None` when the tail carries no id.
+/// The newest persisted event counter for `session`, or `None` when the tail carries no id.
 async fn newest_persisted(
     state: &Arc<AppState>,
-    session_id: &str,
-    cwd: &str,
+    session: &SessionSummary,
 ) -> Result<Option<u64>, ApiError> {
-    let page = fetch_updates(state, session_id, cwd, Some(NEWEST_PROBE_TAIL), None).await?;
+    let page = fetch_updates(state, session, Some(NEWEST_PROBE_TAIL), None).await?;
     Ok(page
         .last_event_id
         .as_deref()

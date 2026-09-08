@@ -1427,6 +1427,13 @@ pub(crate) async fn run_shell_child(
             return child_run_output(result, completion_data, None);
         }
     };
+    // gx: (issue #14) give the child its parent's roost identity, on the same rail the parent's
+    // hook registry travels. Queued here, before the first turn is driven below, so it lands ahead
+    // of the child's first hook — the actor drains commands in order. An empty map (a parent with
+    // no identity) is a no-op that stamps nothing.
+    let _ = child_handle.cmd_tx.send(SessionCommand::SetHookEnv {
+        env: std::mem::take(&mut ctx.gx_hook_env),
+    });
     let ready_to_first_turn_span = phase_region(SubagentSpawnPhase::ReadyToFirstTurn);
     let (receipt_sink, receipt_stream) = mpsc::channel(ACTIVE_MESSAGE_RECEIPT_CAPACITY);
     let receipt_drain = PromptTurnReceiptDrain::start(

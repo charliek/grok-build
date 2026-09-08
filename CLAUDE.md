@@ -136,9 +136,10 @@ cargo test -p xai-grok-update --locked -- \
   --skip install_scripts_allow_custom_https_proxy_url \
   --skip install_scripts_refuse_bad_proxy_url_for_deployment_key
 cargo test -p xai-grok-version --locked
-cargo test -p xai-grok-shell --lib --locked -- leader:: agent::model_providers::tests:: agent::reasoning_family session_compact auth::auth_provider::tests::resolve_auth_program auth::gx_openai_codex auth::auth_provider::tests::shipped_gx_helper
+cargo test -p xai-grok-shell --lib --locked -- gx_hook_env gx_leader_shutdown gx_tool_images tool_result_images leader:: agent::model_providers::tests:: agent::reasoning_family session_compact auth::auth_provider::tests::resolve_auth_program auth::gx_openai_codex auth::auth_provider::tests::shipped_gx_helper
 cargo test -p xai-grok-shell --locked --bin chat-history-downgrade
 cargo test -p gx-remote-api --locked
+cargo test -p xai-chat-state --locked
 cargo test -p xai-message-delivery-core --locked
 ```
 

@@ -33,6 +33,8 @@ impl SessionActor {
             .set(auto_compact_threshold_percent);
         self.supports_backend_search
             .set(sampling_config.supports_backend_search);
+        // gx: see `SessionActor::supports_vision`.
+        self.supports_vision.set(sampling_config.supports_vision);
         self.compactions_remaining
             .set(sampling_config.compactions_remaining);
         self.compaction_at_tokens
@@ -61,6 +63,8 @@ impl SessionActor {
                 reasoning_effort: sampling_config.reasoning_effort,
                 stream_tool_calls: Some(sampling_config.stream_tool_calls),
                 codex_compat: Some(sampling_config.codex_compat),
+                // gx: see `SamplingConfig::hoist_tool_images`.
+                hoist_tool_images: Some(sampling_config.hoist_tool_images),
             });
         let existing = self.chat_state_handle.get_credentials().await;
         let session_key = self

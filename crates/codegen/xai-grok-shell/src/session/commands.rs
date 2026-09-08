@@ -757,6 +757,17 @@ pub enum SessionCommand {
     },
     /// Re-discover skills from disk, update the SkillManager baseline, and re-advertise slash commands to the client.
     ReloadSkills,
+    /// gx: set the roost identity every hook of this session exports (issue #14).
+    /// Sent by `MvpAgent` from `_meta["gx/hookEnv"]`, which the leader stamped from the attaching
+    /// client's registration — and sent ONLY when that key is present. An EMPTY map is meaningful:
+    /// it clears a previous tab's identity, so a session handed to a client with no identity stops
+    /// reporting the old tab. An absent key sends nothing at all, which is how an observer (the
+    /// remote lane) attaches without disturbing the identity of a session a TUI owns.
+    /// Applied by `SessionActor::gx_apply_hook_env`, which re-derives the live hook registry from
+    /// the pristine one so re-application never erases a user hook's own `env`.
+    SetHookEnv {
+        env: std::collections::BTreeMap<String, String>,
+    },
     /// Dispatch session_start hook using the actor's loaded HookRegistry.
     DispatchSessionStartHook {
         /// "new" for brand new sessions, "load" for sessions loaded from disk.

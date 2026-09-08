@@ -41,6 +41,10 @@ pub(crate) fn ctx_with_toggle(toggle: HashMap<String, bool>) -> SubagentSpawnCon
             max_retries: None,
             stream_tool_calls: false,
             codex_compat: false,
+            // gx: see `SamplerConfig::hoist_tool_images`.
+            hoist_tool_images: false,
+            // gx: see `SamplerConfig::supports_vision`.
+            supports_vision: true,
             idle_timeout_secs: None,
             client_identifier: None,
             reasoning_effort: None,
@@ -108,6 +112,7 @@ pub(crate) fn ctx_with_toggle(toggle: HashMap<String, bool>) -> SubagentSpawnCon
         gcs_bucket_url: None,
         gcs_upload_method: None,
         hook_registry: None,
+        gx_hook_env: Default::default(), // gx: roost hook identity (issue #14)
         parent_depth: 0,
         subagents_max_depth: xai_grok_tools::implementations::grok_build::task::MAX_SUBAGENT_DEPTH,
         workflow_max_concurrent_agents:

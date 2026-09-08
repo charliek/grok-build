@@ -171,6 +171,16 @@ pub struct ClientCapabilities {
     /// older clients (which never send the key) deserializing as `observer: false`.
     #[serde(default)]
     pub observer: bool,
+
+    /// gx: the client's own roost identity (`ROOST_TAB_ID` / `ROOST_SOCKET` / `ROOST_AGENT_HOOK`),
+    /// carried per client because the leader's own environment is whichever TUI spawned it — see
+    /// [`crate::agent::gx_hook_env`] and issue #14. The leader validates it at registration and
+    /// stamps it into that client's session requests as `_meta["gx/hookEnv"]`; the session actor
+    /// merges it into every hook spec's `extra_env`. Empty (the default, and every non-TUI client)
+    /// means "stamp nothing", which is the pre-gx behaviour.
+    /// `#[serde(default)]` like every other field here, so the wire stays compatible both ways.
+    #[serde(default)]
+    pub hook_env: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -226,6 +236,18 @@ pub enum ControlCommand {
     RelaunchForUpdate {
         to_version: String,
     },
+
+    /// gx: ask the leader to flush every live session — which runs their `SessionEnd` hooks — and
+    /// then exit with [`ShutdownReason::Manual`].
+    ///
+    /// It exists because a bare SIGTERM cannot: the pager's signal task exits the process directly,
+    /// so no session actor is ever asked to shut down and no `SessionEnd` hook runs. roost releases
+    /// a tab's ownership only on `SessionEnd`, so a killed leader left its tabs owned forever
+    /// (issue #14). `gx leader kill` sends this instead of signalling.
+    ///
+    /// Idempotent: a second request while a shutdown is already in progress is acked but starts no
+    /// second flush.
+    Shutdown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -287,6 +309,15 @@ pub enum ControlPayload {
     /// Response to [`ControlCommand::RelaunchForUpdate`] when the leader will not relaunch.
     /// E.g. it is already running `to_version` or newer, or a relaunch is already in progress.
     RelaunchDeclined { reason: String },
+
+    /// gx: ack for [`ControlCommand::Shutdown`], sent before the leader starts flushing.
+    /// `grace_ms` is the bounded budget the session flush may spend running `SessionEnd` hooks.
+    /// `already_shutting_down` is true when a shutdown was already in progress: the request changed
+    /// nothing (no second flush was started) and the leader is still on its way out.
+    ShuttingDown {
+        grace_ms: u64,
+        already_shutting_down: bool,
+    },
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

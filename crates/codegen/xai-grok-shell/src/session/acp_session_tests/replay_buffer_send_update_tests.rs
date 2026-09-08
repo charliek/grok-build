@@ -115,6 +115,8 @@ pub(super) async fn make_replay_send_update_fixture() -> ReplaySendUpdateFixture
         )),
         telemetry_enabled: false,
         supports_backend_search: std::cell::Cell::new(false),
+        // gx: see `SessionActor::supports_vision`.
+        supports_vision: std::cell::Cell::new(true),
         tool_overrides: std::cell::RefCell::new(None),
         resolved_tool_overrides: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
         compactions_remaining: std::cell::Cell::new(None),
@@ -247,6 +249,7 @@ pub(super) async fn make_replay_send_update_fixture() -> ReplaySendUpdateFixture
         last_search_prompt_index: std::sync::atomic::AtomicI64::new(-1),
         last_api_request_at: std::sync::atomic::AtomicI64::new(0),
         hook_registry: std::cell::RefCell::new(None),
+        gx_hook_env: Default::default(), // gx: roost hook identity (issue #14)
         turn_report: Default::default(),
         turn_abort: Default::default(),
         turn_end_tx: Default::default(),
@@ -274,6 +277,8 @@ pub(super) async fn make_replay_send_update_fixture() -> ReplaySendUpdateFixture
         turn_stream_drained: parking_lot::Mutex::new(std::collections::HashMap::new()),
         pending_image_strip: parking_lot::Mutex::new(HashMap::new()),
         image_strip_rewrite_barrier: ImageStripRewriteBarrier::new(),
+        // gx: see `SessionActor::told_model_text_only_image_notice`.
+        told_model_text_only_image_notice: std::sync::atomic::AtomicBool::new(false),
         sampler_handle: xai_grok_sampler::SamplerHandle::noop(),
         sampling_gate: None,
         rebuild_spec: crate::session::agent_rebuild::test_rebuild_spec_default(),

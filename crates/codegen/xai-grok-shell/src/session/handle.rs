@@ -148,6 +148,12 @@ pub struct SessionHandle {
     pub allowed_subagent_types: Option<Vec<String>>,
     /// Hook registry for this session (snapshot from spawn time).
     pub hook_registry: Option<std::sync::Arc<xai_grok_hooks::discovery::HookRegistry>>,
+    /// gx: the roost identity currently applied to this session's hooks (issue #14).
+    /// Kept here — not read back off the actor — because it is what
+    /// `MvpAgent::build_subagent_spawn_context` copies into a child, so a subagent reports its
+    /// PARENT's tab rather than whichever tab happened to start the leader. Written by the same
+    /// two sites that send `SessionCommand::SetHookEnv`.
+    pub gx_hook_env: std::collections::BTreeMap<String, String>,
     /// Typed workspace operations handle (agent sessions use local ops).
     pub workspace_ops: xai_grok_workspace::WorkspaceOps,
     /// Subagents inherit the parent's backend so background tasks and monitors survive the subagent's exit.

@@ -235,8 +235,17 @@ fn install_mirrors_the_live_glm_openrouter_and_fireworks_shapes() {
             .collect::<Vec<_>>(),
         vec!["low", "high", "max"]
     );
+    // gx: `glm-5.3`'s coding-plan endpoint 400s on an image in any role
+    // (verified live); the sampler must never even send one.
+    assert_eq!(glm["supports_vision"].as_bool(), Some(false));
 
     let glm_flash_zai = &parsed["model"]["glm-5.3-flash"];
+    // gx: `glm-5.3-flash` is vision-capable (verified live) and must not
+    // inherit its sibling's text-only flag.
+    assert!(
+        glm_flash_zai.get("supports_vision").is_none(),
+        "{glm_flash_zai:?}"
+    );
     assert_eq!(glm_flash_zai["model"].as_str(), Some("glm-5.3-flash"));
     assert_eq!(
         glm_flash_zai["model_provider"].as_str(),
@@ -434,6 +443,86 @@ fn install_mirrors_the_live_glm_openrouter_and_fireworks_shapes() {
         fireworks_doc["model"]["fireworks/kimi-k3"]["context_window"].as_integer(),
         Some(1_048_576)
     );
+}
+
+/// gx: `supports_vision` shipped after `glm-5.3` was already a common
+/// install; `apply_fields`' missing-key rule must backfill it on an existing
+/// entry the same way it backfilled the effort fields for pre-probe
+/// Fireworks entries above.
+#[test]
+fn install_adds_supports_vision_to_a_pre_existing_glm_53_entry() {
+    let dir = home();
+    let path = config_toml(dir.path());
+    fs::write(
+        &path,
+        r#"[model_providers.zai-coding-plan]
+base_url = "https://api.z.ai/api/coding/paas/v4"
+api_backend = "chat_completions"
+env_key = ["ZHIPU_API_KEY", "ZAI_API_KEY"]
+
+[model."glm-5.3"]
+model = "glm-5.3"
+name = "GLM 5.3 (Z.AI)"
+description = "Z.AI flagship coding model. Thinking is always on."
+model_provider = "zai-coding-plan"
+context_window = 1000000
+max_completion_tokens = 131072
+supports_reasoning_effort = true
+reasoning_effort = "max"
+reasoning_efforts = ["low", "high", "max"]
+system_prompt_label = "GLM 5.3"
+
+[model."glm-5.3-flash"]
+model = "glm-5.3-flash"
+name = "GLM 5.3 Flash (Z.AI)"
+description = "Fast Z.AI coding-plan model, verified on the coding plan (2026-08-27)."
+model_provider = "zai-coding-plan"
+context_window = 1000000
+max_completion_tokens = 131072
+supports_reasoning_effort = true
+reasoning_effort = "high"
+reasoning_efforts = ["low", "high", "max"]
+"#,
+    )
+    .unwrap();
+    let before = fs::read_to_string(&path).unwrap();
+
+    let report = install_at(dir.path(), PRESETS, false, &ctx()).expect("install");
+    let parsed = parse_config(dir.path());
+
+    assert!(
+        report
+            .added_fields
+            .contains(&"model.\"glm-5.3\".supports_vision".to_owned()),
+        "expected model.\"glm-5.3\".supports_vision in added_fields: {:?}",
+        report.added_fields
+    );
+    assert!(
+        !report
+            .added_fields
+            .iter()
+            .any(|f| f.starts_with("model.\"glm-5.3-flash\"")),
+        "glm-5.3-flash must not gain a supports_vision key: {:?}",
+        report.added_fields
+    );
+    assert_eq!(
+        parsed["model"]["glm-5.3"]["supports_vision"].as_bool(),
+        Some(false)
+    );
+    assert!(
+        parsed["model"]["glm-5.3-flash"]
+            .get("supports_vision")
+            .is_none()
+    );
+
+    // Nothing pre-existing moved: every original line is still present
+    // verbatim, and the new field is strictly additive.
+    for line in before.lines() {
+        assert!(
+            fs::read_to_string(&path).unwrap().contains(line),
+            "pre-existing line dropped: {line}"
+        );
+    }
 }
 
 #[test]

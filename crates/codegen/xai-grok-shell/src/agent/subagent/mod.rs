@@ -248,6 +248,10 @@ pub(crate) struct SubagentSpawnContext {
     /// GCS upload method (direct or proxy).
     pub gcs_upload_method: Option<crate::session::repo_changes::UploadMethod>,
     pub hook_registry: Option<std::sync::Arc<xai_grok_hooks::discovery::HookRegistry>>,
+    /// gx: the parent session's roost identity, applied to the child before its first hook fires
+    /// (issue #14). Without it a subagent would report whichever tab started the leader — or, once
+    /// the leader scrubs its environment, no tab at all.
+    pub gx_hook_env: std::collections::BTreeMap<String, String>,
     pub permission_handle: Option<xai_grok_workspace::permission::PermissionHandle>,
     pub worktree_type: crate::util::config::WorktreeType,
     pub api_key_provider: Option<xai_grok_tools::types::SharedApiKeyProvider>,
@@ -688,6 +692,11 @@ async fn read_parent_sampling_config(
             let supports_backend_search = ctx
                 .models_manager
                 .model_supports_backend_search(catalog_model_id.0.as_ref());
+            // gx: this stored `cfg` predates `supports_vision`, so look the
+            // catalog entry up directly rather than trusting an absent field.
+            let supports_vision = ctx
+                .models_manager
+                .model_supports_vision(catalog_model_id.0.as_ref());
             let extra_response_includes = crate::agent::config::response_include_extensions(
                 supports_backend_search,
                 &cfg.api_backend,
@@ -715,6 +724,9 @@ async fn read_parent_sampling_config(
                 // gx: a subagent inherits the parent model's provider, so it
                 // must inherit its body shaping too.
                 codex_compat: cfg.codex_compat.unwrap_or(false),
+                hoist_tool_images: cfg.hoist_tool_images.unwrap_or(false),
+                // gx: see `ModelEntryConfig::supports_vision`.
+                supports_vision,
                 idle_timeout_secs: None,
                 client_identifier: ctx.sampling_config.client_identifier.clone(),
                 deployment_id: ctx.sampling_config.deployment_id.clone(),

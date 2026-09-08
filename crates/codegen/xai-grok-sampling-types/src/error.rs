@@ -208,6 +208,18 @@ pub const INVALID_IMAGE_ERROR_CODE: &str = "invalid_image";
 /// Fragile to the provider renaming the wire path.
 const IMAGE_CONTENT_PATH_MARKER: &str = ".image.source.";
 
+// gx: Third-party ChatCompletions providers reject image-bearing tool messages
+// with a 400 whose message the markers above don't match, so the sampler's
+// strip-and-retry never engages. Live-verified phrasings, 400-only (unlike the
+// `400 | 500` gate above, since these are provider-specific and not observed
+// at 500): Z.AI (glm-5.3, error code 1210) and Meta (Muse, invalid_request_error).
+const GX_ZAI_TEXT_ONLY_CONTENT_MESSAGE: &str = "allowed values: ['text']";
+const GX_META_UNSUPPORTED_CONTENT_MESSAGE: &str = "did not match any supported type";
+// gx: both phrasings are generic schema-validation wording; requiring the `content`
+// path word alongside them keeps an unrelated 400 (e.g. a bad `role`) from stripping
+// every image in the request and spending a retry.
+const GX_CONTENT_PATH_WORD: &str = "content";
+
 /// True when a wire `code` slot means the request exceeded a size limit: the 413 status as a numeric string, or a provider size slug.
 /// Structured counterpart of [`is_context_length_error`] for backends that stamp a code but an opaque message.
 ///
@@ -408,6 +420,24 @@ impl SamplingError {
     /// Recovery destroys request images, so unexpected statuses (422, 415, ...) fail closed.
     pub fn is_image_processing_error(&self) -> bool {
         match self {
+            // gx: third-party ChatCompletions providers (Z.AI, Meta) reject
+            // image-bearing tool messages with a 400 whose message the
+            // markers below don't match. Must be tried before the arm below:
+            // that arm's guard matches on status alone (400 | 500), so for
+            // any 400 it would otherwise consume the match first and return
+            // false without ever inspecting these phrasings. 400-only:
+            // unlike the generic markers, these are provider-specific and
+            // not observed at 500.
+            SamplingError::Api {
+                status: StatusCode::BAD_REQUEST,
+                message,
+                ..
+            } if message.contains(GX_CONTENT_PATH_WORD)
+                && (message.contains(GX_ZAI_TEXT_ONLY_CONTENT_MESSAGE)
+                    || message.contains(GX_META_UNSUPPORTED_CONTENT_MESSAGE)) =>
+            {
+                true
+            }
             SamplingError::Api {
                 status,
                 message,
@@ -1567,6 +1597,84 @@ mod tests {
         };
         assert!(err.is_image_processing_error());
         assert!(!err.is_encrypted_content_error());
+    }
+
+    // gx: third-party ChatCompletions providers (Z.AI, Meta) reject
+    // image-bearing tool messages with a 400 the classifier above didn't
+    // recognize, so the sampler's strip-and-retry never engaged.
+    #[test]
+    fn gx_zai_text_only_400_is_image_processing_error() {
+        let err = SamplingError::Api {
+            status: StatusCode::BAD_REQUEST,
+            message: "messages.content.type is invalid, allowed values: ['text']".into(),
+            model_metadata: None,
+            retry_after_secs: None,
+            should_retry: None,
+            error_code: None,
+        };
+        assert!(err.is_image_processing_error());
+    }
+
+    #[test]
+    fn gx_meta_unsupported_content_400_is_image_processing_error() {
+        let err = SamplingError::Api {
+            status: StatusCode::BAD_REQUEST,
+            message: "`messages[5].content` did not match any supported type".into(),
+            model_metadata: None,
+            retry_after_secs: None,
+            should_retry: None,
+            error_code: None,
+        };
+        assert!(err.is_image_processing_error());
+    }
+
+    #[test]
+    fn gx_provider_image_rejections_ignore_500() {
+        let zai = SamplingError::Api {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: "messages.content.type is invalid, allowed values: ['text']".into(),
+            model_metadata: None,
+            retry_after_secs: None,
+            should_retry: None,
+            error_code: None,
+        };
+        assert!(!zai.is_image_processing_error());
+
+        let meta = SamplingError::Api {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: "`messages[5].content` did not match any supported type".into(),
+            model_metadata: None,
+            retry_after_secs: None,
+            should_retry: None,
+            error_code: None,
+        };
+        assert!(!meta.is_image_processing_error());
+    }
+
+    #[test]
+    fn gx_generic_phrase_without_content_path_is_not_image_processing_error() {
+        let err = SamplingError::Api {
+            status: StatusCode::BAD_REQUEST,
+            message: "`messages[3].role` did not match any supported type".into(),
+            model_metadata: None,
+            retry_after_secs: None,
+            should_retry: None,
+            error_code: None,
+        };
+        assert!(!err.is_image_processing_error());
+    }
+
+    #[test]
+    fn gx_unrelated_400_still_not_image_processing_error() {
+        let err = SamplingError::Api {
+            status: StatusCode::BAD_REQUEST,
+            message: "messages[3].role is invalid".into(),
+            model_metadata: None,
+            retry_after_secs: None,
+            should_retry: None,
+            error_code: None,
+        };
+        assert!(!err.is_image_processing_error());
     }
 
     #[test]

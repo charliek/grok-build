@@ -57,6 +57,10 @@ async fn persist_ack_waits_for_disk_flush_before_success() {
                 max_retries: None,
                 stream_tool_calls: false,
                 codex_compat: false,
+                // gx: see `SamplingConfig::hoist_tool_images`.
+                hoist_tool_images: false,
+                // gx: see `SamplerConfig::supports_vision`.
+                supports_vision: true,
                 idle_timeout_secs: None,
                 client_identifier: None,
                 reasoning_effort: None,
@@ -104,6 +108,8 @@ async fn persist_ack_waits_for_disk_flush_before_success() {
                     reasoning_effort: None,
                     stream_tool_calls: None,
                     codex_compat: None,
+                    // gx: see `SamplingConfig::hoist_tool_images`.
+                    hoist_tool_images: None,
                 },
                 Box::new(
                     crate::session::chat_persistence::ChannelChatPersistence::new(
@@ -164,6 +170,8 @@ async fn persist_ack_waits_for_disk_flush_before_success() {
                 turn_prompt_mode: Arc::new(parking_lot::Mutex::new(PromptMode::Agent)),
                 telemetry_enabled: false,
                 supports_backend_search: std::cell::Cell::new(false),
+                // gx: see `SessionActor::supports_vision`.
+                supports_vision: std::cell::Cell::new(true),
                 tool_overrides: std::cell::RefCell::new(None),
                 resolved_tool_overrides: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
                 compactions_remaining: std::cell::Cell::new(None),
@@ -295,6 +303,7 @@ async fn persist_ack_waits_for_disk_flush_before_success() {
                 last_search_prompt_index: std::sync::atomic::AtomicI64::new(-1),
                 last_api_request_at: std::sync::atomic::AtomicI64::new(0),
                 hook_registry: std::cell::RefCell::new(None),
+                gx_hook_env: Default::default(), // gx: roost hook identity (issue #14)
                 turn_report: Default::default(),
                 turn_abort: Default::default(),
                 turn_end_tx: Default::default(),
@@ -322,6 +331,8 @@ async fn persist_ack_waits_for_disk_flush_before_success() {
                 turn_stream_drained: parking_lot::Mutex::new(std::collections::HashMap::new()),
                 pending_image_strip: parking_lot::Mutex::new(std::collections::HashMap::new()),
                 image_strip_rewrite_barrier: ImageStripRewriteBarrier::new(),
+                // gx: see `SessionActor::told_model_text_only_image_notice`.
+                told_model_text_only_image_notice: std::sync::atomic::AtomicBool::new(false),
                 sampler_handle: xai_grok_sampler::SamplerHandle::noop(),
                 sampling_gate: None,
                 rebuild_spec: crate::session::agent_rebuild::test_rebuild_spec_default(),
@@ -480,6 +491,10 @@ async fn first_turn_memory_injection_persists_to_chat_history() {
                     max_retries: None,
                     stream_tool_calls: false,
                     codex_compat: false,
+                    // gx: see `SamplingConfig::hoist_tool_images`.
+                    hoist_tool_images: false,
+                    // gx: see `SamplerConfig::supports_vision`.
+                    supports_vision: true,
                     idle_timeout_secs: None,
                     client_identifier: None,
                     reasoning_effort: None,
@@ -530,6 +545,8 @@ async fn first_turn_memory_injection_persists_to_chat_history() {
                     reasoning_effort: None,
                     stream_tool_calls: None,
                     codex_compat: None,
+                    // gx: see `SamplingConfig::hoist_tool_images`.
+                    hoist_tool_images: None,
                 },
                 Box::new(
                     crate::session::chat_persistence::ChannelChatPersistence::new(
@@ -617,6 +634,10 @@ async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history()
                 max_retries: None,
                 stream_tool_calls: false,
                 codex_compat: false,
+                // gx: see `SamplingConfig::hoist_tool_images`.
+                hoist_tool_images: false,
+                // gx: see `SamplerConfig::supports_vision`.
+                supports_vision: true,
                 idle_timeout_secs: None,
                 client_identifier: None,
                 reasoning_effort: None,
@@ -669,6 +690,8 @@ async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history()
                     reasoning_effort: None,
                     stream_tool_calls: None,
                     codex_compat: None,
+                    // gx: see `SamplingConfig::hoist_tool_images`.
+                    hoist_tool_images: None,
                 },
                 Box::new(
                     crate::session::chat_persistence::ChannelChatPersistence::new(
@@ -746,6 +769,8 @@ async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history()
                 turn_prompt_mode: Arc::new(parking_lot::Mutex::new(PromptMode::Agent)),
                 telemetry_enabled: false,
                 supports_backend_search: std::cell::Cell::new(false),
+                // gx: see `SessionActor::supports_vision`.
+                supports_vision: std::cell::Cell::new(true),
                 tool_overrides: std::cell::RefCell::new(None),
                 resolved_tool_overrides: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
                 compactions_remaining: std::cell::Cell::new(None),
@@ -880,6 +905,7 @@ async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history()
                 last_search_prompt_index: std::sync::atomic::AtomicI64::new(-1),
                 last_api_request_at: std::sync::atomic::AtomicI64::new(0),
                 hook_registry: std::cell::RefCell::new(None),
+                gx_hook_env: Default::default(), // gx: roost hook identity (issue #14)
                 turn_report: Default::default(),
                 turn_abort: Default::default(),
                 turn_end_tx: Default::default(),
@@ -907,6 +933,8 @@ async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history()
                 turn_stream_drained: parking_lot::Mutex::new(std::collections::HashMap::new()),
                 pending_image_strip: parking_lot::Mutex::new(std::collections::HashMap::new()),
                 image_strip_rewrite_barrier: ImageStripRewriteBarrier::new(),
+                // gx: see `SessionActor::told_model_text_only_image_notice`.
+                told_model_text_only_image_notice: std::sync::atomic::AtomicBool::new(false),
                 sampler_handle: xai_grok_sampler::SamplerHandle::noop(),
                 sampling_gate: None,
                 rebuild_spec: crate::session::agent_rebuild::test_rebuild_spec_default(),
@@ -1063,6 +1091,8 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
                 turn_prompt_mode: Arc::new(parking_lot::Mutex::new(PromptMode::Agent)),
                 telemetry_enabled: false,
                 supports_backend_search: std::cell::Cell::new(false),
+                // gx: see `SessionActor::supports_vision`.
+                supports_vision: std::cell::Cell::new(true),
                 tool_overrides: std::cell::RefCell::new(None),
                 resolved_tool_overrides: std::sync::Arc::new(
                     arc_swap::ArcSwapOption::empty(),
@@ -1213,6 +1243,7 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
                 last_search_prompt_index: std::sync::atomic::AtomicI64::new(-1),
                 last_api_request_at: std::sync::atomic::AtomicI64::new(0),
                 hook_registry: std::cell::RefCell::new(None),
+                gx_hook_env: Default::default(), // gx: roost hook identity (issue #14)
                 turn_report: Default::default(),
                 turn_abort: Default::default(),
                 turn_end_tx: Default::default(),
@@ -1250,6 +1281,8 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
                     std::collections::HashMap::new(),
                 ),
                 image_strip_rewrite_barrier: ImageStripRewriteBarrier::new(),
+                // gx: see `SessionActor::told_model_text_only_image_notice`.
+                told_model_text_only_image_notice: std::sync::atomic::AtomicBool::new(false),
                 sampler_handle: xai_grok_sampler::SamplerHandle::noop(),
                 sampling_gate: None,
                 rebuild_spec: crate::session::agent_rebuild::test_rebuild_spec_default(),
@@ -2535,6 +2568,10 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
                 max_retries: Some(0),
                 stream_tool_calls: false,
                 codex_compat: false,
+                // gx: see `SamplingConfig::hoist_tool_images`.
+                hoist_tool_images: false,
+                // gx: see `SamplerConfig::supports_vision`.
+                supports_vision: true,
                 idle_timeout_secs: Some(60),
                 client_identifier: None,
                 reasoning_effort: None,
@@ -2656,6 +2693,8 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
                 turn_prompt_mode: Arc::new(parking_lot::Mutex::new(PromptMode::Agent)),
                 telemetry_enabled: false,
                 supports_backend_search: std::cell::Cell::new(false),
+                // gx: see `SessionActor::supports_vision`.
+                supports_vision: std::cell::Cell::new(true),
                 tool_overrides: std::cell::RefCell::new(None),
                 resolved_tool_overrides: std::sync::Arc::new(
                     arc_swap::ArcSwapOption::empty(),
@@ -2806,6 +2845,7 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
                 last_search_prompt_index: std::sync::atomic::AtomicI64::new(-1),
                 last_api_request_at: std::sync::atomic::AtomicI64::new(0),
                 hook_registry: std::cell::RefCell::new(None),
+                gx_hook_env: Default::default(), // gx: roost hook identity (issue #14)
                 turn_report: Default::default(),
                 turn_abort: Default::default(),
                 turn_end_tx: Default::default(),
@@ -2843,6 +2883,8 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
                     std::collections::HashMap::new(),
                 ),
                 image_strip_rewrite_barrier: ImageStripRewriteBarrier::new(),
+                // gx: see `SessionActor::told_model_text_only_image_notice`.
+                told_model_text_only_image_notice: std::sync::atomic::AtomicBool::new(false),
                 sampler_handle: sampler_handle.clone(),
                 sampling_gate: None,
                 rebuild_spec: crate::session::agent_rebuild::test_rebuild_spec_default(),

@@ -851,6 +851,19 @@ pub(crate) fn parse_remote_model_value(
             .get("codexCompat")
             .or_else(|| obj.get("codex_compat"))
             .and_then(|v| v.as_bool()),
+        // gx: a remote catalog can also say where tool-result images go, same
+        // as a local `[model.<id>]` entry. An unrecognised spelling falls back
+        // to the per-provider default rather than failing the whole model.
+        tool_result_images: obj
+            .get("toolResultImages")
+            .or_else(|| obj.get("tool_result_images"))
+            .and_then(|v| serde_json::from_value(v.clone()).ok()),
+        // gx: a remote catalog can also say a model is text-only, same as a
+        // local `[model.<id>]` entry.
+        supports_vision: obj
+            .get("supportsVision")
+            .or_else(|| obj.get("supports_vision"))
+            .and_then(|v| v.as_bool()),
         laziness_detector: get_object(obj, "lazinessDetector")
             .or_else(|| get_object(obj, "laziness_detector"))
             .or_else(|| meta.and_then(|m| get_object(m, "lazinessDetector")))

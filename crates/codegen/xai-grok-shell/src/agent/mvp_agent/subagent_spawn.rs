@@ -163,6 +163,11 @@ impl MvpAgent {
             per_model.or(remote).unwrap_or(600).max(10)
         };
         let parent_hook_registry = parent_handle.as_ref().and_then(|h| h.hook_registry.clone());
+        // gx: a subagent must report its PARENT's roost tab, never another tab's (issue #14).
+        let parent_gx_hook_env = parent_handle
+            .as_ref()
+            .map(|h| h.gx_hook_env.clone())
+            .unwrap_or_default();
         let parent_max_turns = parent_handle.as_ref().and_then(|h| h.max_turns);
         let parent_model_agent_type =
             config::find_model_by_id(&available_models, parent_model_id.0.as_ref())
@@ -302,6 +307,7 @@ impl MvpAgent {
             agent_config: Some(self.cfg.borrow().clone()),
             gcs_upload_method,
             hook_registry: parent_hook_registry,
+            gx_hook_env: parent_gx_hook_env, // gx: issue #14
             permission_handle: parent_handle.as_ref().map(|h| h.permission_handle.clone()),
             worktree_type: self.worktree_type,
             api_key_provider: Some(Arc::new(crate::auth::manager::SharedAuthKeyProvider(

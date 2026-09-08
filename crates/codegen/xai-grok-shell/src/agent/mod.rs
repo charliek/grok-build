@@ -8,6 +8,12 @@ mod ext_parsers;
 pub mod external_otel_pin;
 pub mod feedback_client;
 pub mod folder_trust;
+// gx: per-client roost hook identity (issue #14); see the module docs for why it is per client.
+pub mod gx_hook_env;
+// gx: lets a signal handler flush a leader's sessions (SessionEnd hooks) before the process exits.
+pub mod gx_leader_shutdown;
+// gx: where a tool result's images go on the Chat Completions wire.
+pub mod gx_tool_images;
 pub(crate) mod handlers;
 pub mod init;
 pub mod model_providers;
