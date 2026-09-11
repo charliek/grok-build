@@ -148,6 +148,7 @@ echo "  review the diff before committing." >&2
 step "11/13 Gate: targeted tests (CI parity, all --locked)"
 cargo check -p xai-grok-pager-bin --locked
 cargo test -p xai-grok-sampling-types --locked
+cargo test -p xai-grok-sampler --lib --locked
 cargo test -p xai-grok-config --locked
 # Skip the two host-environment-sensitive upstream diagnostics tests
 # (same skips as .github/workflows/ci.yml -- keep the two lists in sync):
@@ -164,10 +165,26 @@ cargo test -p xai-grok-update --locked -- \
   --skip install_scripts_allow_custom_https_proxy_url \
   --skip install_scripts_refuse_bad_proxy_url_for_deployment_key
 cargo test -p xai-grok-version --locked
-cargo test -p xai-grok-shell --lib --locked -- leader:: agent::model_providers::tests:: agent::reasoning_family session_compact auth::auth_provider::tests::resolve_auth_program
+# Auth lives in xai-grok-login since upstream 1.0.24 extracted it from the shell.
+cargo test -p xai-grok-shell --lib --locked -- \
+  gx_hook_env \
+  gx_leader_shutdown \
+  gx_tool_images \
+  tool_result_images \
+  leader:: \
+  agent::model_providers::tests:: \
+  agent::reasoning_family \
+  session_compact
+cargo test -p xai-grok-login --lib --locked -- \
+  auth_provider::tests::resolve_auth_program \
+  gx_openai_codex \
+  auth_provider::tests::shipped_gx_helper
 # NOTE: upstream 1.0.16 deleted the test_sampling_client integration target;
 # its gx wire-compat coverage lives in xai-grok-sampling-types unit tests.
 cargo test -p xai-grok-shell --locked --bin chat-history-downgrade
+cargo test -p gx-remote-api --locked
+cargo test -p xai-chat-state --locked
+cargo test -p xai-message-delivery-core --locked
 echo "  gate passed"
 
 step "12/13 Range-diff sanity check"

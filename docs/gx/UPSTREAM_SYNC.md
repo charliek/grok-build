@@ -109,8 +109,12 @@ real pressure.
    | file | what gx has there |
    |---|---|
    | `Cargo.toml` | one `# gx:`-marked line in the auto-generated, sorted `members` list (`"crates/gx/gx-remote-api",`). Upstream regenerates this list, so expect a conflict whenever a crate is added or removed near it. Re-insert in sorted position; never touch `[workspace.dependencies]`. |
-   | `crates/codegen/xai-grok-shell/src/leader/server.rs` | **five** `observer` hunks — never last-active, never driver on load/new, skipped in driver reassignment, excluded from the exit-on-disconnect count, identity-only injection in `inject_session_request_context` — plus the `#[path = "server_gx_tests.rs"]` mod line. Upstream edits this file often; re-read both sides rather than taking either wholesale. |
-   | `crates/codegen/xai-grok-shell/src/leader/protocol.rs` | `ClientCapabilities.observer` (`#[serde(default)]`) and `LeaderCapabilities::observer_v1`. |
+   | `crates/codegen/xai-grok-shell/src/leader/server.rs` | **five** `observer` hunks — never last-active, never driver on load/new, skipped in driver reassignment, excluded from the exit-on-disconnect count, identity-only injection in `inject_session_request_context` — plus `hook_env` / roost identity injection and the `#[path = "server_gx_tests.rs"]` mod line. Upstream edits this file often; re-read both sides rather than taking either wholesale. |
+   | `crates/codegen/xai-grok-shell/src/leader/protocol.rs` | `ClientCapabilities.observer` and `hook_env` (`#[serde(default)]`) and `LeaderCapabilities::observer_v1`. Keep both when upstream adds a new capability field (e.g. `user_message_echo`). |
+   | `crates/codegen/xai-grok-login/src/auth_provider.rs` | gx in-process openai-codex mint (`is_shipped_gx_token_helper`). Auth moved here from `xai-grok-shell/src/auth/` in upstream 1.0.24; `AuthProviderConfig` lives in `xai-grok-config-types`. |
+   | `crates/codegen/xai-grok-pager/src/acp/mod.rs` | `ClientCapabilities.observer: false` next to upstream's `user_message_echo`. |
+   | `crates/codegen/xai-grok-pager/src/views/welcome/logo.rs` | `LogoTier::art()` routes through `logo_full()` / `logo_small()` (owl vs Grok `g`). Keep upstream's `LogoTier` API. |
+   | `crates/codegen/xai-chat-state/src/commands.rs` | `SamplingConfig` literals need gx's trailing `codex_compat` / `hoist_tool_images` fields when upstream adds a new field. |
    | `crates/codegen/xai-grok-hooks/src/event.rs` | the `gxRemote` insert at the end of `to_hook_json()`. Small and self-contained; conflicts only if upstream reworks the alias loop. |
    | `crates/codegen/xai-grok-pager-bin/src/main.rs` | four hunks: `Command::Remote(_)` in **both** early-exit match lists, the `Command::Remote(…)` dispatch arm, and the `gx_remote_lane::spawn` line in `AgentCmd::Leader`. The two match lists are exhaustive over `Command`, so an upstream variant addition conflicts here by construction. |
    | `crates/codegen/xai-grok-pager/src/app/cli.rs` | the `Command::Providers` and `Command::Remote` variants. |
@@ -133,15 +137,18 @@ real pressure.
     ```
     cargo check -p xai-grok-pager-bin --locked
     cargo test -p xai-grok-sampling-types --locked
+    cargo test -p xai-grok-sampler --lib --locked
     cargo test -p xai-grok-config --locked
     cargo test -p xai-grok-pager --lib --locked
     cargo test -p xai-grok-update --locked -- \
       --skip install_scripts_allow_custom_https_proxy_url \
       --skip install_scripts_refuse_bad_proxy_url_for_deployment_key
     cargo test -p xai-grok-version --locked
-    cargo test -p xai-grok-shell --lib --locked -- leader:: agent::model_providers::tests:: agent::reasoning_family session_compact auth::auth_provider::tests::resolve_auth_program
+    cargo test -p xai-grok-shell --lib --locked -- gx_hook_env gx_leader_shutdown gx_tool_images tool_result_images leader:: agent::model_providers::tests:: agent::reasoning_family session_compact
+    cargo test -p xai-grok-login --lib --locked -- auth_provider::tests::resolve_auth_program gx_openai_codex auth_provider::tests::shipped_gx_helper
     cargo test -p xai-grok-shell --locked --bin chat-history-downgrade
     cargo test -p gx-remote-api --locked
+    cargo test -p xai-chat-state --locked
     cargo test -p xai-message-delivery-core --locked
     ```
 

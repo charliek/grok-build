@@ -175,8 +175,13 @@ impl SessionActor {
             &ctx,
         )
         .await;
-        self.send_hook_execution("session_start", None, None, &results)
-            .await;
+        // gx: upstream 1.0.24 changed send_hook_execution to take a HookBatch
+        // (shared identity for HookRunStarted / HookExecution).
+        self.send_hook_execution(
+            &super::hook_dispatch::HookBatch::from_envelope(&envelope),
+            &results,
+        )
+        .await;
     }
 }
 
