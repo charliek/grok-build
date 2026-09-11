@@ -13927,6 +13927,7 @@ dependencies = [
  "urlencoding",
  "uuid",
  "webbrowser",
+ "xai-dirs",
  "xai-file-utils",
  "xai-grok-auth",
  "xai-grok-config",
