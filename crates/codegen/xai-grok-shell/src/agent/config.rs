@@ -3864,6 +3864,10 @@ impl Default for ModelEntryConfig {
             reasoning_summary: None,
             // gx: see `ModelEntryConfig::codex_compat`.
             codex_compat: None,
+            // gx: see `ModelEntryConfig::tool_result_images`.
+            tool_result_images: None,
+            // gx: see `ModelEntryConfig::supports_vision`.
+            supports_vision: None,
             laziness_detector: LazinessDetectorPerModelConfig::default(),
         }
     }
