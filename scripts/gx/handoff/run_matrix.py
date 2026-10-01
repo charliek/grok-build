@@ -32,7 +32,7 @@ Optional env:
         (crates/.../leader/lock.rs), so this is a supported override, not a
         hack -- GROK_HOME itself (config/auth/providers/sessions) is
         untouched and stays at the mandated scratch path.
-    GX_MODEL    -- model id to request (default: gpt-5.6-luna). Falls back to
+    GX_MODEL    -- model id to request (default: gpt-6-luna). Falls back to
         GX_FALLBACK_MODEL (default: glm-5.3-flash) if the primary model fails.
 """
 from __future__ import annotations
@@ -102,7 +102,7 @@ def load_env(args: argparse.Namespace) -> Env:
     if not os.path.isfile(gx_bin):
         sys.exit(f"GX_BIN does not exist: {gx_bin}")
     leader_socket = os.environ.get("GX_LEADER_SOCKET") or f"/tmp/gx-handoff-{os.getpid()}.sock"
-    model = os.environ.get("GX_MODEL", "gpt-5.6-luna")
+    model = os.environ.get("GX_MODEL", "gpt-6-luna")
     fallback_model = os.environ.get("GX_FALLBACK_MODEL", "glm-5.3-flash")
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
