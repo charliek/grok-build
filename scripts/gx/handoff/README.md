@@ -76,7 +76,7 @@ directly) rather than relying on `gx leader kill`.
 | `GROK_HOME` | yes | Scratch `$GROK_HOME`. Never the real one. |
 | `A1_CWD` | yes | Scratch project cwd, trusted in the scratch `GROK_HOME`. |
 | `GX_LEADER_SOCKET` | no | Overrides the leader socket path (see above). |
-| `GX_MODEL` | no | Model id to request (default `gpt-5.6-luna`). |
+| `GX_MODEL` | no | Model id to request (default `gpt-6-luna`). |
 | `GX_FALLBACK_MODEL` | no | Retried once if the primary model fails to answer the bootstrap prompt (default `glm-5.3-flash`). |
 
 ## Running it

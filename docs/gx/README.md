@@ -192,18 +192,18 @@ entry point for both the providers layer and the codex credential.
 |---|---|---|---|
 | Fireworks | `fireworks/kimi-k3` | low / medium / high / xhigh / max | high |
 | Fireworks | `fireworks/qwen3p8-max` | low / medium / high / xhigh / max | high |
-| Fireworks | `fireworks/deepseek-v4-pro` | low / medium / high / xhigh / max | high |
-| Fireworks | `fireworks/kimi-k2p7-code` | low / medium / high / xhigh / max | high |
-| Fireworks | `fireworks/deepseek-v4-flash` | low / medium / high / xhigh / max | high |
+| Fireworks | `fireworks/deepseek-v4p1-flash` | low / medium / high / xhigh / max | high |
 | Z.AI | `glm-5.3` | low / high / max | max |
 | Z.AI | `glm-5.3-flash` | low / high / max | high |
 | OpenRouter | `openrouter/minimax-m3` | none | n/a |
 | OpenRouter | `openrouter/gemini-3.8-flash` | low / medium / high | medium |
+| OpenRouter (metered) | `openrouter/gpt-6-astra` / `openrouter/gpt-6.1-sol` | low / medium / high / xhigh / max | medium |
+| OpenRouter (metered) | `openrouter/gpt-6-luna` | none / low / medium / high / xhigh / max | medium |
 | Meta | `muse-spark-1.3` | minimal / low / medium / high / xhigh | high |
 | Meta | `muse-spark-1.3-contributor` | minimal / low / medium / high / xhigh | high |
 | OpenAI (ChatGPT plan) | `gpt-6-astra` | low / medium / high / xhigh / max | low |
-| OpenAI (ChatGPT plan) | `gpt-5.6-sol` | low / medium / high / xhigh / max | low |
-| OpenAI (ChatGPT plan) | `gpt-5.6-terra` / `gpt-5.6-luna` | low / medium / high / xhigh / max | medium |
+| OpenAI (ChatGPT plan) | `gpt-6.1-sol` | low / medium / high / xhigh / max | low |
+| OpenAI (ChatGPT plan) | `gpt-6-luna` | low / medium / high / xhigh / max | medium |
 
 `muse-spark-1.3` is the Standard tier: prompts are not used for training.
 `muse-spark-1.3-contributor` is the discounted Contributor tier: your content,
@@ -227,16 +227,64 @@ $0.30/$1.20 per M tokens, verified 2026-08-27) and
 1,048,576-token context window, 65,536 maximum output tokens, tool calling, and mandatory
 low / medium / high reasoning (medium by default), verified 2026-09-05.
 
-The metered OpenRouter copies of `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna` were
-removed from the shipped catalog on 2026-09-05; the direct ChatGPT-plan entries remain under
-`openai-codex`, alongside the new `gpt-6-astra`. Existing
-`[model."openrouter/gpt-5.6-..."]` tables remain in `config.toml` because
-`gx providers install` preserves entries that leave the catalog; delete those three tables
-by hand if an earlier gx installed them and you no longer want them in `/model`.
+### October 2026 catalog upgrade
 
-`gpt-6-astra` uses Codex's current 272,000-token active context window and supports
-low / medium / high / xhigh / max reasoning. Its default is low, matching the Codex
-catalog. Availability depends on OpenAI's rollout, your ChatGPT plan, and workspace policy.
+Run `gx providers install` to add `fireworks/deepseek-v4p1-flash`, `gpt-6.1-sol`,
+and `gpt-6-luna`. Re-running is idempotent and preserves custom values without
+`--force`. The ChatGPT-plan set is now Astra, GPT-6.1 Sol and GPT-6 Luna.
+
+The following presets were retired on 2026-10-01 and will no longer be installed:
+
+- `fireworks/deepseek-v4-flash` (wire id `deepseek-v4-flash-0731`)
+- `fireworks/deepseek-v4-pro`
+- `fireworks/kimi-k2p7-code`
+- `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`
+
+**Existing entries are deliberately preserved, even with `--force`.** Installation
+never deletes or renames a retired table, so customized aliases, comments and extra
+fields survive. Back up `$GROK_HOME/providers.toml` (normally `~/.grok/providers.toml`),
+then remove those six `[model."..."]` tables manually if no longer needed. The three
+Fireworks wire ids return 404; leaving an old entry in the file does not restore
+service. Use `fireworks/deepseek-v4p1-flash` instead of either old DeepSeek preset,
+and `fireworks/kimi-k3` instead of Kimi K2.7 Code. Update any explicit default-model
+setting, saved model selection or external harness that names a retired alias, then
+restart gx. GX does not ship a separate Linux-specific Fireworks default in this
+repository; an existing user's default must be changed explicitly.
+
+The metered `openrouter/gpt-5.6-sol`, `openrouter/gpt-5.6-terra`, and
+`openrouter/gpt-5.6-luna` twins were already retired on 2026-09-05. Remove their
+existing tables from `config.toml` (or `providers.toml` on older installs) manually
+as needed; this update does not restore them.
+
+The three ChatGPT-plan models retain Codex's 272,000-token active context window.
+The [bundled Codex catalog rechecked on 2026-10-01](https://github.com/openai/codex/blob/90d7f2715a4434f68b56a8ab80a6c3943f692d89/codex-rs/models-manager/models.json)
+sets Astra/Sol to low and Luna to medium. Astra's low default differs from the
+September 26 account-cache value reported in #21. All expose low through max;
+`ultra` is client-side orchestration and is not sent as a wire effort.
+Availability depends on OpenAI's rollout, your ChatGPT plan, and workspace policy.
+For Forge's high-effort reviewer and plan seats, set these per-model overrides in
+`providers.toml` after installation (normal reinstall preserves them):
+
+```toml
+[model."gpt-6.1-sol"]
+reasoning_effort = "high"
+
+[model."gpt-6-astra"]
+reasoning_effort = "high"
+```
+
+The new OpenRouter twins are separately metered and explicitly labeled that way;
+GX does not automatically substitute them for a ChatGPT-plan model. The
+[OpenRouter catalog](https://openrouter.ai/api/v1/models), checked 2026-10-01, lists
+1,050,000-token context, 128,000 maximum output tokens and medium default effort
+for all three. Only the Luna twin also supports `none`.
+
+[Fireworks' model catalog](https://fireworks.ai/models?featured=true&provider=fireworks-ai)
+lists DeepSeek V4.1 Flash with a 1,048,576-token context window. Its
+[reasoning API documentation](https://docs.fireworks.ai/api-reference/post-chatcompletions#body-reasoning-effort)
+confirms low/medium/high/xhigh/max; this preset keeps high by default and the
+reasoning-enabled menu of its predecessor. The API also supports `none` if configured
+by hand. `stream_tool_calls = false` is retained.
 
 Fireworks, GLM, OpenRouter, and Meta entries carry `stream_tool_calls = false` and an
 explicit `context_window` gx sets itself, since grok's model catalog has no entry for a
