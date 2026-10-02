@@ -885,14 +885,17 @@ const OPENAI_CODEX_COMPAT: PresetField = PresetField::new("codex_compat", &[b(tr
 const OPENAI_CODEX_SUPPORTS_EFFORT: PresetField =
     PresetField::new("supports_reasoning_effort", &[b(true)]);
 
-// Codex bundled catalog rechecked 2026-10-01 at commit
-// 90d7f2715a4434f68b56a8ab80a6c3943f692d89 (codex-rs/models-manager/models.json):
-// Astra/Sol default low, Luna medium; the Sept-26 account cache in #21 differs
-// for Astra. `ultra` is orchestration, not a wire effort or a gx enum value.
+// Codex bundled catalog rechecked 2026-10-02 on openai/codex main
+// (codex-rs/models-manager/models.json): Astra/Sol default low, Luna medium.
+// gx ships medium for all three ChatGPT-plan models. `low` stays in the Astra
+// and Sol upgrade chain so an untouched shipped low is raised on install.
+// Luna never shipped low, so a hand-set low there is left alone. `ultra` is
+// orchestration, not a wire effort or a gx enum value.
 // Retired 2026-10-01: GPT-5.6 Sol/Terra/Luna. Existing tables are preserved;
 // install adds the new ids rather than renaming or deleting user entries.
-const OPENAI_SOL_EFFORT: PresetField = PresetField::new("reasoning_effort", &[s("low")]);
 const OPENAI_MEDIUM_EFFORT: PresetField = PresetField::new("reasoning_effort", &[s("medium")]);
+const OPENAI_MEDIUM_UPGRADING_LOW: PresetField =
+    PresetField::new("reasoning_effort", &[s("medium"), s("low")]);
 const OPENAI_GPT6_EFFORTS: PresetField = PresetField::new(
     "reasoning_efforts",
     &[l(&["low", "medium", "high", "xhigh", "max"])],
@@ -913,7 +916,7 @@ const OPENAI_ASTRA_FIELDS: &[PresetField] = &[
     OPENAI_CODEX_FAMILY,
     OPENAI_CODEX_COMPAT,
     OPENAI_CODEX_SUPPORTS_EFFORT,
-    PresetField::new("reasoning_effort", &[s("low")]),
+    OPENAI_MEDIUM_UPGRADING_LOW,
     PresetField::new(
         "reasoning_efforts",
         &[l(&["low", "medium", "high", "xhigh", "max"])],
@@ -934,7 +937,7 @@ const OPENAI_SOL_FIELDS: &[PresetField] = &[
     OPENAI_CODEX_FAMILY,
     OPENAI_CODEX_COMPAT,
     OPENAI_CODEX_SUPPORTS_EFFORT,
-    OPENAI_SOL_EFFORT,
+    OPENAI_MEDIUM_UPGRADING_LOW,
     OPENAI_GPT6_EFFORTS,
 ];
 

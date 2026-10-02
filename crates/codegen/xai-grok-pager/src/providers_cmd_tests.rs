@@ -953,23 +953,41 @@ model = "hand-picked-wire-id"
 }
 
 #[test]
-fn install_preserves_astra_and_custom_effort_defaults() {
-    for (old, expected) in [("low", "low"), ("medium", "medium"), ("high", "high")] {
-        let dir = home();
-        fs::write(
-            providers_path(dir.path()),
-            format!("[model.\"gpt-6-astra\"]\nreasoning_effort = \"{old}\"\n"),
-        )
-        .unwrap();
-        install_at(dir.path(), PRESETS, false, &ctx()).expect("install");
-        let parsed = parse_providers(dir.path());
-        assert_eq!(
-            parsed["model"]["gpt-6-astra"]["reasoning_effort"].as_str(),
-            Some(expected)
-        );
-        let second = install_at(dir.path(), PRESETS, false, &ctx()).expect("reinstall");
-        assert!(!second.changed, "upgrade must be idempotent");
+fn install_upgrades_shipped_low_effort_and_keeps_custom_effort() {
+    // `low` is the previous shipped Astra/Sol default, so install raises it.
+    // `medium` is current. `high` is a hand edit (Forge) and stays.
+    for id in ["gpt-6-astra", "gpt-6.1-sol"] {
+        for (old, expected) in [("low", "medium"), ("medium", "medium"), ("high", "high")] {
+            let dir = home();
+            fs::write(
+                providers_path(dir.path()),
+                format!("[model.\"{id}\"]\nreasoning_effort = \"{old}\"\n"),
+            )
+            .unwrap();
+            install_at(dir.path(), PRESETS, false, &ctx()).expect("install");
+            let parsed = parse_providers(dir.path());
+            assert_eq!(
+                parsed["model"][id]["reasoning_effort"].as_str(),
+                Some(expected),
+                "{id}"
+            );
+            let second = install_at(dir.path(), PRESETS, false, &ctx()).expect("reinstall");
+            assert!(!second.changed, "upgrade must be idempotent");
+        }
     }
+
+    // Luna never shipped `low`, so a hand-set low stays.
+    let dir = home();
+    fs::write(
+        providers_path(dir.path()),
+        "[model.\"gpt-6-luna\"]\nreasoning_effort = \"low\"\n",
+    )
+    .unwrap();
+    install_at(dir.path(), PRESETS, false, &ctx()).expect("install");
+    assert_eq!(
+        parse_providers(dir.path())["model"]["gpt-6-luna"]["reasoning_effort"].as_str(),
+        Some("low")
+    );
 }
 
 #[test]
@@ -1001,7 +1019,7 @@ fn catalog_refresh_preserves_retired_entries_and_customizations() {
         assert!(providers_body(dir.path()).contains("# Keep my aliases until I migrate them"));
         assert_eq!(
             parsed["model"]["gpt-6.1-sol"]["reasoning_effort"].as_str(),
-            Some(if force { "low" } else { "high" })
+            Some(if force { "medium" } else { "high" })
         );
         assert!(
             parsed["model"]
@@ -2865,7 +2883,7 @@ fn the_openai_codex_preset_matches_the_shape_the_spike_proved() {
     assert_eq!(astra["codex_compat"].as_bool(), Some(true));
     assert_eq!(astra["model_family"].as_str(), Some("openai-codex"));
     assert_eq!(astra["supports_reasoning_effort"].as_bool(), Some(true));
-    assert_eq!(astra["reasoning_effort"].as_str(), Some("low"));
+    assert_eq!(astra["reasoning_effort"].as_str(), Some("medium"));
     assert_eq!(
         astra["reasoning_efforts"]
             .as_array()
@@ -2882,7 +2900,7 @@ fn the_openai_codex_preset_matches_the_shape_the_spike_proved() {
         );
     }
 
-    for (id, default_effort) in [("gpt-6.1-sol", "low"), ("gpt-6-luna", "medium")] {
+    for (id, default_effort) in [("gpt-6.1-sol", "medium"), ("gpt-6-luna", "medium")] {
         let entry = model_entry(&parsed, id);
         assert_eq!(entry["model"].as_str(), Some(id), "wire id == catalog id");
         assert_eq!(entry["model_provider"].as_str(), Some("openai-codex"));

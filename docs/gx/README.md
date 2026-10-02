@@ -201,9 +201,7 @@ entry point for both the providers layer and the codex credential.
 | OpenRouter (metered) | `openrouter/gpt-6-luna` | none / low / medium / high / xhigh / max | medium |
 | Meta | `muse-spark-1.3` | minimal / low / medium / high / xhigh | high |
 | Meta | `muse-spark-1.3-contributor` | minimal / low / medium / high / xhigh | high |
-| OpenAI (ChatGPT plan) | `gpt-6-astra` | low / medium / high / xhigh / max | low |
-| OpenAI (ChatGPT plan) | `gpt-6.1-sol` | low / medium / high / xhigh / max | low |
-| OpenAI (ChatGPT plan) | `gpt-6-luna` | low / medium / high / xhigh / max | medium |
+| OpenAI (ChatGPT plan) | `gpt-6-astra` / `gpt-6.1-sol` / `gpt-6-luna` | low / medium / high / xhigh / max | medium |
 
 `muse-spark-1.3` is the Standard tier: prompts are not used for training.
 `muse-spark-1.3-contributor` is the discounted Contributor tier: your content,
@@ -256,12 +254,15 @@ The metered `openrouter/gpt-5.6-sol`, `openrouter/gpt-5.6-terra`, and
 existing tables from `config.toml` (or `providers.toml` on older installs) manually
 as needed; this update does not restore them.
 
-The three ChatGPT-plan models retain Codex's 272,000-token active context window.
-The [bundled Codex catalog rechecked on 2026-10-01](https://github.com/openai/codex/blob/90d7f2715a4434f68b56a8ab80a6c3943f692d89/codex-rs/models-manager/models.json)
-sets Astra/Sol to low and Luna to medium. Astra's low default differs from the
-September 26 account-cache value reported in #21. All expose low through max;
-`ultra` is client-side orchestration and is not sent as a wire effort.
-Availability depends on OpenAI's rollout, your ChatGPT plan, and workspace policy.
+The three ChatGPT-plan models retain Codex's 272,000-token active context window
+and ship `reasoning_effort = "medium"`. The
+[bundled Codex catalog](https://github.com/openai/codex/blob/main/codex-rs/models-manager/models.json)
+still defaults Astra and Sol to low and Luna to medium (rechecked 2026-10-02);
+gx uses medium for all three. `gx providers install` upgrades an untouched
+`reasoning_effort = "low"` on `gpt-6-astra` or `gpt-6.1-sol` to medium. Any
+other value is kept. All three expose low through max; `ultra` is client-side
+orchestration and is not sent as a wire effort. Availability depends on
+OpenAI's rollout, your ChatGPT plan, and workspace policy.
 For Forge's high-effort reviewer and plan seats, set these per-model overrides in
 `providers.toml` after installation (normal reinstall preserves them):
 
