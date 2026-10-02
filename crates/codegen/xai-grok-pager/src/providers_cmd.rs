@@ -590,8 +590,8 @@ const OPENROUTER_MINIMAX_M3_FIELDS: &[PresetField] = &[
 ];
 
 // The OpenRouter copies of GPT-5.6 Sol/Terra/Luna were retired from PRESETS
-// on 2026-09-05 so GPT models use the direct ChatGPT-plan route only. As with
-// the retired GLM entries above, install leaves an existing user table intact.
+// on 2026-09-05. As with the retired GLM entries above, install leaves an
+// existing user table intact. The current metered GPT twins are separate ids.
 //
 // OpenRouter's public model catalog reports a mandatory reasoning model with
 // low/medium/high effort, medium by default, a 1,048,576-token context window,
@@ -612,6 +612,72 @@ const OPENROUTER_GEMINI_38_FLASH_FIELDS: &[PresetField] = &[
     PresetField::new("supports_reasoning_effort", &[b(true)]),
     PresetField::new("reasoning_effort", &[s("medium")]),
     PresetField::new("reasoning_efforts", &[l(&["low", "medium", "high"])]),
+];
+
+// OpenRouter /api/v1/models verified 2026-10-01: all three GPT routes
+// expose 1,050,000 context and 128,000 maximum output tokens. These are
+// metered API models, never the ChatGPT-plan route or an automatic fallback.
+const OPENROUTER_GPT6_ASTRA_FIELDS: &[PresetField] = &[
+    PresetField::new("model", &[s("openai/gpt-6-astra")]),
+    PresetField::new("name", &[s("GPT-6 Astra (OpenRouter, metered)")]),
+    PresetField::new(
+        "description",
+        &[s(
+            "GPT-6 Astra via OpenRouter; separately metered, not covered by your ChatGPT plan.",
+        )],
+    ),
+    OPENROUTER_MODEL_PROVIDER,
+    PresetField::new("context_window", &[i(1_050_000)]),
+    PresetField::new("max_completion_tokens", &[i(128_000)]),
+    OPENROUTER_NO_STREAM_TOOL_CALLS,
+    PresetField::new("supports_reasoning_effort", &[b(true)]),
+    PresetField::new("reasoning_effort", &[s("medium")]),
+    PresetField::new(
+        "reasoning_efforts",
+        &[l(&["low", "medium", "high", "xhigh", "max"])],
+    ),
+];
+
+const OPENROUTER_GPT6_SOL_FIELDS: &[PresetField] = &[
+    PresetField::new("model", &[s("openai/gpt-6.1-sol")]),
+    PresetField::new("name", &[s("GPT-6.1 Sol (OpenRouter, metered)")]),
+    PresetField::new(
+        "description",
+        &[s(
+            "GPT-6.1 Sol via OpenRouter; separately metered, not covered by your ChatGPT plan.",
+        )],
+    ),
+    OPENROUTER_MODEL_PROVIDER,
+    PresetField::new("context_window", &[i(1_050_000)]),
+    PresetField::new("max_completion_tokens", &[i(128_000)]),
+    OPENROUTER_NO_STREAM_TOOL_CALLS,
+    PresetField::new("supports_reasoning_effort", &[b(true)]),
+    PresetField::new("reasoning_effort", &[s("medium")]),
+    PresetField::new(
+        "reasoning_efforts",
+        &[l(&["low", "medium", "high", "xhigh", "max"])],
+    ),
+];
+
+const OPENROUTER_GPT6_LUNA_FIELDS: &[PresetField] = &[
+    PresetField::new("model", &[s("openai/gpt-6-luna")]),
+    PresetField::new("name", &[s("GPT-6 Luna (OpenRouter, metered)")]),
+    PresetField::new(
+        "description",
+        &[s(
+            "GPT-6 Luna via OpenRouter; separately metered, not covered by your ChatGPT plan.",
+        )],
+    ),
+    OPENROUTER_MODEL_PROVIDER,
+    PresetField::new("context_window", &[i(1_050_000)]),
+    PresetField::new("max_completion_tokens", &[i(128_000)]),
+    OPENROUTER_NO_STREAM_TOOL_CALLS,
+    PresetField::new("supports_reasoning_effort", &[b(true)]),
+    PresetField::new("reasoning_effort", &[s("medium")]),
+    PresetField::new(
+        "reasoning_efforts",
+        &[l(&["none", "low", "medium", "high", "xhigh", "max"])],
+    ),
 ];
 
 // -- Meta (Muse Spark) -------------------------------------------------------
@@ -748,48 +814,22 @@ const FIREWORKS_QWEN_FIELDS: &[PresetField] = &[
     FIREWORKS_REASONING_EFFORTS,
 ];
 
-const FIREWORKS_DEEPSEEK_PRO_FIELDS: &[PresetField] = &[
-    PresetField::new("model", &[s("accounts/fireworks/models/deepseek-v4-pro")]),
-    PresetField::new("name", &[s("DeepSeek V4 Pro (Fireworks)")]),
-    PresetField::new(
-        "description",
-        &[s(
-            "DeepSeek V4 Pro for deep coding and reasoning work, served by Fireworks.",
-        )],
-    ),
-    FIREWORKS_MODEL_PROVIDER,
-    PresetField::new("context_window", &[i(1_048_576)]),
-    FIREWORKS_NO_STREAM_TOOL_CALLS,
-    FIREWORKS_SUPPORTS_REASONING_EFFORT,
-    FIREWORKS_REASONING_EFFORT,
-    FIREWORKS_REASONING_EFFORTS,
-];
-
-const FIREWORKS_KIMI_CODE_FIELDS: &[PresetField] = &[
-    PresetField::new("model", &[s("accounts/fireworks/models/kimi-k2p7-code")]),
-    PresetField::new("name", &[s("Kimi K2.7 Code (Fireworks)")]),
-    PresetField::new(
-        "description",
-        &[s("Moonshot Kimi K2.7 coding model, served by Fireworks.")],
-    ),
-    FIREWORKS_MODEL_PROVIDER,
-    PresetField::new("context_window", &[i(262_144)]),
-    FIREWORKS_NO_STREAM_TOOL_CALLS,
-    FIREWORKS_SUPPORTS_REASONING_EFFORT,
-    FIREWORKS_REASONING_EFFORT,
-    FIREWORKS_REASONING_EFFORTS,
-];
-
-const FIREWORKS_DEEPSEEK_FLASH_FIELDS: &[PresetField] = &[
+// Retired 2026-10-01: Fireworks no longer serves deepseek-v4-flash-0731,
+// deepseek-v4-pro or kimi-k2p7-code (issue #23). Install never deletes an
+// existing table; see docs/gx/README.md for manual migration instructions.
+// Fireworks model catalog and chat-completions API docs rechecked 2026-10-01:
+// 1,048,576 context; low/medium/high/xhigh/max accepted (also none).
+// Keep the existing reasoning-enabled menu and high default.
+const FIREWORKS_DEEPSEEK_V41_FLASH_FIELDS: &[PresetField] = &[
     PresetField::new(
         "model",
-        &[s("accounts/fireworks/models/deepseek-v4-flash-0731")],
+        &[s("accounts/fireworks/models/deepseek-v4p1-flash")],
     ),
-    PresetField::new("name", &[s("DeepSeek V4 Flash (Fireworks)")]),
+    PresetField::new("name", &[s("DeepSeek V4.1 Flash (Fireworks)")]),
     PresetField::new(
         "description",
         &[s(
-            "Fast DeepSeek V4 Flash for high-throughput coding work, served by Fireworks.",
+            "Fast DeepSeek V4.1 Flash for high-throughput coding work, served by Fireworks.",
         )],
     ),
     FIREWORKS_MODEL_PROVIDER,
@@ -834,8 +874,7 @@ const OPENAI_CODEX_PROVIDER_FIELDS: &[PresetField] = &[
 
 /// Shared by every ChatGPT-plan model.
 ///
-/// `context_window`: 272000, codex-rs's current active-window value for both
-/// GPT-5.6 and GPT-6 Astra (`codex-rs/models-manager/models.json`).
+/// `context_window`: 272000, Codex's active window (not its maximum window).
 const OPENAI_CODEX_MODEL_PROVIDER: PresetField =
     PresetField::new("model_provider", &[s("openai-codex")]);
 const OPENAI_CODEX_CONTEXT_WINDOW: PresetField = PresetField::new("context_window", &[i(272_000)]);
@@ -846,25 +885,22 @@ const OPENAI_CODEX_COMPAT: PresetField = PresetField::new("codex_compat", &[b(tr
 const OPENAI_CODEX_SUPPORTS_EFFORT: PresetField =
     PresetField::new("supports_reasoning_effort", &[b(true)]);
 
-// Codex's current GPT-5.6 catalog exposes max for all three direct models.
-// `ultra`, where offered, is orchestration rather than a wire reasoning effort
-// and is not a gx enum value. The older defaults keep untouched installations
-// upgradeable without replacing hand edits.
-const OPENAI_SOL_EFFORT: PresetField =
-    PresetField::new("reasoning_effort", &[s("low"), s("medium")]);
+// Codex bundled catalog rechecked 2026-10-02 on openai/codex main
+// (codex-rs/models-manager/models.json): Astra/Sol default low, Luna medium.
+// gx ships medium for all three ChatGPT-plan models. `low` stays in the Astra
+// and Sol upgrade chain so an untouched shipped low is raised on install.
+// Luna never shipped low, so a hand-set low there is left alone. `ultra` is
+// orchestration, not a wire effort or a gx enum value.
+// Retired 2026-10-01: GPT-5.6 Sol/Terra/Luna. Existing tables are preserved;
+// install adds the new ids rather than renaming or deleting user entries.
 const OPENAI_MEDIUM_EFFORT: PresetField = PresetField::new("reasoning_effort", &[s("medium")]);
-const OPENAI_GPT56_EFFORTS: PresetField = PresetField::new(
+const OPENAI_MEDIUM_UPGRADING_LOW: PresetField =
+    PresetField::new("reasoning_effort", &[s("medium"), s("low")]);
+const OPENAI_GPT6_EFFORTS: PresetField = PresetField::new(
     "reasoning_efforts",
-    &[
-        l(&["low", "medium", "high", "xhigh", "max"]),
-        l(&["low", "medium", "high", "xhigh"]),
-    ],
+    &[l(&["low", "medium", "high", "xhigh", "max"])],
 );
 
-// Codex 0.153.3's bundled and account catalogs both expose Astra through
-// ChatGPT sign-in with low/medium/high/xhigh/max and low by default. `ultra`
-// is orchestration rather than a wire reasoning effort and is not a gx enum
-// value, so it is deliberately omitted.
 const OPENAI_ASTRA_FIELDS: &[PresetField] = &[
     PresetField::new("model", &[s("gpt-6-astra")]),
     PresetField::new("name", &[s("GPT-6 Astra (ChatGPT)")]),
@@ -880,7 +916,7 @@ const OPENAI_ASTRA_FIELDS: &[PresetField] = &[
     OPENAI_CODEX_FAMILY,
     OPENAI_CODEX_COMPAT,
     OPENAI_CODEX_SUPPORTS_EFFORT,
-    PresetField::new("reasoning_effort", &[s("low")]),
+    OPENAI_MEDIUM_UPGRADING_LOW,
     PresetField::new(
         "reasoning_efforts",
         &[l(&["low", "medium", "high", "xhigh", "max"])],
@@ -888,12 +924,12 @@ const OPENAI_ASTRA_FIELDS: &[PresetField] = &[
 ];
 
 const OPENAI_SOL_FIELDS: &[PresetField] = &[
-    PresetField::new("model", &[s("gpt-5.6-sol")]),
-    PresetField::new("name", &[s("GPT-5.6 Sol (ChatGPT)")]),
+    PresetField::new("model", &[s("gpt-6.1-sol")]),
+    PresetField::new("name", &[s("GPT-6.1 Sol (ChatGPT)")]),
     PresetField::new(
         "description",
         &[s(
-            "OpenAI's frontier agentic coding model, via your ChatGPT plan.",
+            "OpenAI's latest workhorse for coding and agentic work, via your ChatGPT plan.",
         )],
     ),
     OPENAI_CODEX_MODEL_PROVIDER,
@@ -901,29 +937,16 @@ const OPENAI_SOL_FIELDS: &[PresetField] = &[
     OPENAI_CODEX_FAMILY,
     OPENAI_CODEX_COMPAT,
     OPENAI_CODEX_SUPPORTS_EFFORT,
-    OPENAI_SOL_EFFORT,
-    OPENAI_GPT56_EFFORTS,
-];
-
-const OPENAI_TERRA_FIELDS: &[PresetField] = &[
-    PresetField::new("model", &[s("gpt-5.6-terra")]),
-    PresetField::new("name", &[s("GPT-5.6 Terra (ChatGPT)")]),
-    PresetField::new("description", &[s("GPT-5.6 Terra via your ChatGPT plan.")]),
-    OPENAI_CODEX_MODEL_PROVIDER,
-    OPENAI_CODEX_CONTEXT_WINDOW,
-    OPENAI_CODEX_FAMILY,
-    OPENAI_CODEX_COMPAT,
-    OPENAI_CODEX_SUPPORTS_EFFORT,
-    OPENAI_MEDIUM_EFFORT,
-    OPENAI_GPT56_EFFORTS,
+    OPENAI_MEDIUM_UPGRADING_LOW,
+    OPENAI_GPT6_EFFORTS,
 ];
 
 const OPENAI_LUNA_FIELDS: &[PresetField] = &[
-    PresetField::new("model", &[s("gpt-5.6-luna")]),
-    PresetField::new("name", &[s("GPT-5.6 Luna (ChatGPT)")]),
+    PresetField::new("model", &[s("gpt-6-luna")]),
+    PresetField::new("name", &[s("GPT-6 Luna (ChatGPT)")]),
     PresetField::new(
         "description",
-        &[s("GPT-5.6 Luna, the faster ChatGPT-plan model.")],
+        &[s("GPT-6 Luna, the faster ChatGPT-plan model.")],
     ),
     OPENAI_CODEX_MODEL_PROVIDER,
     OPENAI_CODEX_CONTEXT_WINDOW,
@@ -931,7 +954,7 @@ const OPENAI_LUNA_FIELDS: &[PresetField] = &[
     OPENAI_CODEX_COMPAT,
     OPENAI_CODEX_SUPPORTS_EFFORT,
     OPENAI_MEDIUM_EFFORT,
-    OPENAI_GPT56_EFFORTS,
+    OPENAI_GPT6_EFFORTS,
 ];
 
 // -- OpenAI (plain API key) --------------------------------------------------
@@ -993,6 +1016,18 @@ pub(crate) const PRESETS: &[ProviderPreset] = &[
                 id: "openrouter/gemini-3.8-flash",
                 fields: OPENROUTER_GEMINI_38_FLASH_FIELDS,
             },
+            ModelPreset {
+                id: "openrouter/gpt-6-astra",
+                fields: OPENROUTER_GPT6_ASTRA_FIELDS,
+            },
+            ModelPreset {
+                id: "openrouter/gpt-6.1-sol",
+                fields: OPENROUTER_GPT6_SOL_FIELDS,
+            },
+            ModelPreset {
+                id: "openrouter/gpt-6-luna",
+                fields: OPENROUTER_GPT6_LUNA_FIELDS,
+            },
         ],
     },
     ProviderPreset {
@@ -1032,16 +1067,8 @@ pub(crate) const PRESETS: &[ProviderPreset] = &[
                 fields: FIREWORKS_QWEN_FIELDS,
             },
             ModelPreset {
-                id: "fireworks/deepseek-v4-pro",
-                fields: FIREWORKS_DEEPSEEK_PRO_FIELDS,
-            },
-            ModelPreset {
-                id: "fireworks/kimi-k2p7-code",
-                fields: FIREWORKS_KIMI_CODE_FIELDS,
-            },
-            ModelPreset {
-                id: "fireworks/deepseek-v4-flash",
-                fields: FIREWORKS_DEEPSEEK_FLASH_FIELDS,
+                id: "fireworks/deepseek-v4p1-flash",
+                fields: FIREWORKS_DEEPSEEK_V41_FLASH_FIELDS,
             },
         ],
     },
@@ -1059,15 +1086,11 @@ pub(crate) const PRESETS: &[ProviderPreset] = &[
                 fields: OPENAI_ASTRA_FIELDS,
             },
             ModelPreset {
-                id: "gpt-5.6-sol",
+                id: "gpt-6.1-sol",
                 fields: OPENAI_SOL_FIELDS,
             },
             ModelPreset {
-                id: "gpt-5.6-terra",
-                fields: OPENAI_TERRA_FIELDS,
-            },
-            ModelPreset {
-                id: "gpt-5.6-luna",
+                id: "gpt-6-luna",
                 fields: OPENAI_LUNA_FIELDS,
             },
         ],

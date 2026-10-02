@@ -398,7 +398,7 @@ fn install_mirrors_the_live_glm_openrouter_and_fireworks_shapes() {
         assert!(entry.get("api_key").is_none(), "{id}");
     }
 
-    // Five Fireworks models, every one with an explicit context window, a
+    // Three Fireworks models, every one with an explicit context window, a
     // fully-qualified wire id, and streamed tool calls off.
     let fireworks: Vec<(&String, &toml::Value)> = fireworks_doc["model"]
         .as_table()
@@ -406,7 +406,7 @@ fn install_mirrors_the_live_glm_openrouter_and_fireworks_shapes() {
         .iter()
         .filter(|(_, v)| v.get("model_provider").and_then(toml::Value::as_str) == Some("fireworks"))
         .collect();
-    assert_eq!(fireworks.len(), 5, "expected five fireworks models");
+    assert_eq!(fireworks.len(), 3, "expected three fireworks models");
     for (id, entry) in &fireworks {
         let wire = entry["model"].as_str().expect("wire model id");
         assert!(
@@ -415,9 +415,8 @@ fn install_mirrors_the_live_glm_openrouter_and_fireworks_shapes() {
         );
         assert!(entry["context_window"].as_integer().is_some(), "{id} ctx");
         assert_eq!(entry["stream_tool_calls"].as_bool(), Some(false), "{id}");
-        // Live-probed (2026-08-25): Fireworks validates `reasoning_effort`;
-        // `adaptive` is accepted by Fireworks but excluded here because
-        // grok's `ReasoningEffort` enum cannot express it.
+        // Existing models were live-probed 2026-08-25; V4.1 effort values
+        // were rechecked against Fireworks docs on 2026-10-01.
         assert_eq!(
             entry["supports_reasoning_effort"].as_bool(),
             Some(true),
@@ -436,8 +435,16 @@ fn install_mirrors_the_live_glm_openrouter_and_fireworks_shapes() {
         );
     }
     assert_eq!(
-        fireworks_doc["model"]["fireworks/deepseek-v4-flash"]["model"].as_str(),
-        Some("accounts/fireworks/models/deepseek-v4-flash-0731")
+        fireworks_doc["model"]["fireworks/deepseek-v4p1-flash"]["model"].as_str(),
+        Some("accounts/fireworks/models/deepseek-v4p1-flash")
+    );
+    assert_eq!(
+        fireworks_doc["model"]["fireworks/deepseek-v4p1-flash"]["context_window"].as_integer(),
+        Some(1_048_576)
+    );
+    assert_eq!(
+        fireworks_doc["model"]["fireworks/deepseek-v4p1-flash"]["name"].as_str(),
+        Some("DeepSeek V4.1 Flash (Fireworks)")
     );
     assert_eq!(
         fireworks_doc["model"]["fireworks/kimi-k3"]["context_window"].as_integer(),
@@ -938,73 +945,122 @@ model = "hand-picked-wire-id"
     // Missing fields on an existing entry are reported as added fields, not as
     // a new entry.
     assert!(report.added_entries.is_empty());
-    assert!(report
-        .added_fields
-        .contains(&"model_providers.synth.env_key".to_owned()));
+    assert!(
+        report
+            .added_fields
+            .contains(&"model_providers.synth.env_key".to_owned())
+    );
 }
 
 #[test]
-fn install_upgrades_previous_gpt56_effort_defaults() {
+fn install_upgrades_shipped_low_effort_and_keeps_custom_effort() {
+    // `low` is the previous shipped Astra/Sol default, so install raises it.
+    // `medium` is current. `high` is a hand edit (Forge) and stays.
+    for id in ["gpt-6-astra", "gpt-6.1-sol"] {
+        for (old, expected) in [("low", "medium"), ("medium", "medium"), ("high", "high")] {
+            let dir = home();
+            fs::write(
+                providers_path(dir.path()),
+                format!("[model.\"{id}\"]\nreasoning_effort = \"{old}\"\n"),
+            )
+            .unwrap();
+            install_at(dir.path(), PRESETS, false, &ctx()).expect("install");
+            let parsed = parse_providers(dir.path());
+            assert_eq!(
+                parsed["model"][id]["reasoning_effort"].as_str(),
+                Some(expected),
+                "{id}"
+            );
+            let second = install_at(dir.path(), PRESETS, false, &ctx()).expect("reinstall");
+            assert!(!second.changed, "upgrade must be idempotent");
+        }
+    }
+
+    // Luna never shipped `low`, so a hand-set low stays.
     let dir = home();
     fs::write(
         providers_path(dir.path()),
-        r#"[model."gpt-5.6-sol"]
-reasoning_effort = "medium"
-reasoning_efforts = ["low", "medium", "high", "xhigh"]
-
-[model."gpt-5.6-terra"]
-reasoning_effort = "medium"
-reasoning_efforts = ["low", "medium", "high", "xhigh"]
-
-[model."gpt-5.6-luna"]
-reasoning_effort = "medium"
-reasoning_efforts = ["low", "medium", "high", "xhigh"]
-"#,
+        "[model.\"gpt-6-luna\"]\nreasoning_effort = \"low\"\n",
     )
     .unwrap();
+    install_at(dir.path(), PRESETS, false, &ctx()).expect("install");
+    assert_eq!(
+        parse_providers(dir.path())["model"]["gpt-6-luna"]["reasoning_effort"].as_str(),
+        Some("low")
+    );
+}
 
-    let report = install_at(dir.path(), PRESETS, false, &ctx()).expect("install");
-    let parsed = parse_providers(dir.path());
-    let current_efforts = vec!["low", "medium", "high", "xhigh", "max"];
-
-    for (id, expected_default) in [
-        ("gpt-5.6-sol", "low"),
-        ("gpt-5.6-terra", "medium"),
-        ("gpt-5.6-luna", "medium"),
-    ] {
-        let model = &parsed["model"][id];
+#[test]
+fn catalog_refresh_preserves_retired_entries_and_customizations() {
+    let retired = [
+        "fireworks/deepseek-v4-flash",
+        "fireworks/deepseek-v4-pro",
+        "fireworks/kimi-k2p7-code",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+    ];
+    for force in [false, true] {
+        let dir = home();
+        let mut before = String::from("# Keep my aliases until I migrate them\n");
+        for id in retired {
+            before.push_str(&format!(
+                "[model.\"{id}\"]\nmodel = \"custom-wire-id\"\nreasoning_effort = \"high\"\ncustom_option = true\n\n"
+            ));
+        }
+        before.push_str("[model.\"gpt-6.1-sol\"]\nreasoning_effort = \"high\"\n");
+        fs::write(providers_path(dir.path()), &before).unwrap();
+        let previous: toml::Value = toml::from_str(&before).unwrap();
+        install_at(dir.path(), PRESETS, force, &ctx()).expect("install");
+        let parsed = parse_providers(dir.path());
+        for id in retired {
+            assert_eq!(parsed["model"][id], previous["model"][id], "retired {id}");
+        }
+        assert!(providers_body(dir.path()).contains("# Keep my aliases until I migrate them"));
         assert_eq!(
-            model["reasoning_effort"].as_str(),
-            Some(expected_default),
-            "{id}"
+            parsed["model"]["gpt-6.1-sol"]["reasoning_effort"].as_str(),
+            Some(if force { "medium" } else { "high" })
         );
-        assert_eq!(
-            model["reasoning_efforts"]
-                .as_array()
-                .expect("efforts")
-                .iter()
-                .filter_map(toml::Value::as_str)
-                .collect::<Vec<_>>(),
-            current_efforts,
-            "{id}"
+        assert!(
+            parsed["model"]
+                .get("fireworks/deepseek-v4p1-flash")
+                .is_some()
+        );
+        assert!(parsed["model"].get("gpt-6-luna").is_some());
+        assert!(
+            !install_at(dir.path(), PRESETS, force, &ctx())
+                .expect("reinstall")
+                .changed
         );
     }
-    assert_eq!(
-        report.upgraded_fields,
-        vec![
-            r#"model."gpt-5.6-sol".reasoning_effort"#.to_owned(),
-            r#"model."gpt-5.6-sol".reasoning_efforts"#.to_owned(),
-            r#"model."gpt-5.6-terra".reasoning_efforts"#.to_owned(),
-            r#"model."gpt-5.6-luna".reasoning_efforts"#.to_owned(),
-        ]
-    );
+}
+
+#[test]
+fn fresh_install_excludes_retired_fireworks_and_chatgpt_models() {
+    let dir = home();
+    install_at(dir.path(), PRESETS, false, &ctx()).expect("install");
+    let parsed = parse_providers(dir.path());
+    for id in [
+        "fireworks/deepseek-v4-flash",
+        "fireworks/deepseek-v4-pro",
+        "fireworks/kimi-k2p7-code",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+        "gpt-6-sol",
+    ] {
+        assert!(
+            parsed["model"].get(id).is_none(),
+            "retired {id} must not return"
+        );
+    }
 }
 
 /// Upgrade path for the 2026-08-25 Fireworks reasoning-effort probe: a
 /// `providers.toml` written by a build that shipped Fireworks entries
 /// *without* `reasoning_effort` / `supports_reasoning_effort` /
-/// `reasoning_efforts` must gain exactly those three fields per model on the
-/// next `install`, and nothing else in the file should move.
+/// `reasoning_efforts` must gain exactly those three fields per active model
+/// on the next `install`. Retired entries stay untouched.
 #[test]
 fn install_adds_reasoning_effort_fields_to_pre_probe_fireworks_entries() {
     let dir = home();
@@ -1063,17 +1119,20 @@ stream_tool_calls = false
     let report = install_at(dir.path(), PRESETS, false, &ctx()).expect("install");
     let parsed = parse_providers(dir.path());
 
-    // No new Fireworks tables — every Fireworks entry already existed. (The
-    // fixture omits the other presets on purpose, so `install` does add
-    // *those* as fresh entries; that is out of scope for this test.)
+    // The replacement is added; existing retired aliases remain untouched.
     assert!(
         report
             .added_entries
-            .iter()
-            .all(|e| !e.contains("fireworks")),
-        "no fireworks entry should be added: {:?}",
-        report.added_entries
+            .contains(&r#"model."fireworks/deepseek-v4p1-flash""#.to_owned())
     );
+    let before_parsed: toml::Value = toml::from_str(&before).unwrap();
+    for id in [
+        "fireworks/deepseek-v4-pro",
+        "fireworks/kimi-k2p7-code",
+        "fireworks/deepseek-v4-flash",
+    ] {
+        assert_eq!(parsed["model"][id], before_parsed["model"][id]);
+    }
     assert!(report.upgraded_fields.is_empty());
     assert!(report.forced_fields.is_empty());
     assert!(
@@ -1082,13 +1141,7 @@ stream_tool_calls = false
         report.kept_fields
     );
 
-    let fireworks_ids = [
-        "fireworks/kimi-k3",
-        "fireworks/qwen3p8-max",
-        "fireworks/deepseek-v4-pro",
-        "fireworks/kimi-k2p7-code",
-        "fireworks/deepseek-v4-flash",
-    ];
+    let fireworks_ids = ["fireworks/kimi-k3", "fireworks/qwen3p8-max"];
     for id in fireworks_ids {
         for field in [
             "supports_reasoning_effort",
@@ -1814,6 +1867,9 @@ fn status_covers_configured_unconfigured_and_env_key_cases() {
         openrouter.models,
         vec![
             "openrouter/gemini-3.8-flash".to_owned(),
+            "openrouter/gpt-6-astra".to_owned(),
+            "openrouter/gpt-6-luna".to_owned(),
+            "openrouter/gpt-6.1-sol".to_owned(),
             "openrouter/minimax-m3".to_owned(),
         ]
     );
@@ -1829,7 +1885,7 @@ fn status_covers_configured_unconfigured_and_env_key_cases() {
             vars: vec!["FIREWORKS_API_KEY".to_owned()]
         }
     );
-    assert_eq!(fireworks.models.len(), 5);
+    assert_eq!(fireworks.models.len(), 3);
 
     let codex = report
         .providers
@@ -1840,12 +1896,11 @@ fn status_covers_configured_unconfigured_and_env_key_cases() {
     assert_eq!(
         codex.models,
         vec![
-            "gpt-5.6-luna".to_owned(),
-            "gpt-5.6-sol".to_owned(),
-            "gpt-5.6-terra".to_owned(),
             "gpt-6-astra".to_owned(),
+            "gpt-6-luna".to_owned(),
+            "gpt-6.1-sol".to_owned(),
         ],
-        "the four direct ChatGPT-plan models"
+        "the three direct ChatGPT-plan models"
     );
     assert!(
         codex.env_keys.is_empty(),
@@ -2828,7 +2883,7 @@ fn the_openai_codex_preset_matches_the_shape_the_spike_proved() {
     assert_eq!(astra["codex_compat"].as_bool(), Some(true));
     assert_eq!(astra["model_family"].as_str(), Some("openai-codex"));
     assert_eq!(astra["supports_reasoning_effort"].as_bool(), Some(true));
-    assert_eq!(astra["reasoning_effort"].as_str(), Some("low"));
+    assert_eq!(astra["reasoning_effort"].as_str(), Some("medium"));
     assert_eq!(
         astra["reasoning_efforts"]
             .as_array()
@@ -2845,15 +2900,11 @@ fn the_openai_codex_preset_matches_the_shape_the_spike_proved() {
         );
     }
 
-    for (id, default_effort) in [
-        ("gpt-5.6-sol", "low"),
-        ("gpt-5.6-terra", "medium"),
-        ("gpt-5.6-luna", "medium"),
-    ] {
+    for (id, default_effort) in [("gpt-6.1-sol", "medium"), ("gpt-6-luna", "medium")] {
         let entry = model_entry(&parsed, id);
         assert_eq!(entry["model"].as_str(), Some(id), "wire id == catalog id");
         assert_eq!(entry["model_provider"].as_str(), Some("openai-codex"));
-        // codex-rs's own value for the gpt-5.6 family.
+        // Codex's active context window, distinct from its maximum.
         assert_eq!(entry["context_window"].as_integer(), Some(272_000), "{id}");
         assert_eq!(entry["codex_compat"].as_bool(), Some(true), "{id}");
         assert_eq!(entry["model_family"].as_str(), Some("openai-codex"), "{id}");
@@ -3302,4 +3353,45 @@ auth = { command = "/somewhere/else/gx", args = ["providers", "token", "openai"]
         "{:?}",
         report.kept_fields
     );
+}
+
+#[test]
+fn openrouter_gpt_twins_are_explicitly_metered_and_stock_compatible() {
+    let dir = home();
+    install_at(dir.path(), PRESETS, false, &ctx()).expect("install");
+    let config = parse_config(dir.path());
+    let providers = parse_providers(dir.path());
+    for slug in ["gpt-6-astra", "gpt-6.1-sol", "gpt-6-luna"] {
+        let id = format!("openrouter/{slug}");
+        let model = &config["model"][&id];
+        assert_eq!(
+            model["model"].as_str(),
+            Some(format!("openai/{slug}").as_str())
+        );
+        assert_eq!(model["model_provider"].as_str(), Some("openrouter"));
+        assert!(model["name"].as_str().unwrap().contains("metered"));
+        assert_eq!(model["context_window"].as_integer(), Some(1_050_000));
+        assert_eq!(model["max_completion_tokens"].as_integer(), Some(128_000));
+        assert_eq!(model["reasoning_effort"].as_str(), Some("medium"));
+        assert_eq!(model["stream_tool_calls"].as_bool(), Some(false));
+        let mut efforts = vec!["low", "medium", "high", "xhigh", "max"];
+        if slug == "gpt-6-luna" {
+            efforts.insert(0, "none");
+        }
+        assert_eq!(
+            model["reasoning_efforts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(toml::Value::as_str)
+                .collect::<Vec<_>>(),
+            efforts
+        );
+        assert!(model.get("codex_compat").is_none());
+        assert!(providers["model"].get(&id).is_none());
+        assert_eq!(
+            providers["model"][slug]["model_provider"].as_str(),
+            Some("openai-codex")
+        );
+    }
 }
