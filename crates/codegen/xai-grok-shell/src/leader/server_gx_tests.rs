@@ -19,6 +19,10 @@
 use std::time::Duration;
 
 use super::*;
+// gx: upstream 1.0.45 stopped re-exporting the free `read_message` through
+// `server.rs` (the server uses `FrameReader::read_message`). Import it the
+// same way `server_tests.rs` does.
+use crate::leader::protocol::read_message;
 use tempfile::TempDir;
 
 // ---------------------------------------------------------------------------

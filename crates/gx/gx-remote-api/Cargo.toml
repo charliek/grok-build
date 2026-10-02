@@ -23,7 +23,10 @@ tokio-stream = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 xai-dirs = { workspace = true }
-xai-grok-shell = { workspace = true }
+# gx: upstream 1.0.45 dropped `xai-grok-shell` from `[workspace.dependencies]`
+# when it split the shell crate. Keep the path dep here; do not put the shell
+# crate back into the workspace table.
+xai-grok-shell = { path = "../../codegen/xai-grok-shell" }
 xai-grok-version = { workspace = true }
 # Vocabulary for the C5 authorization matrix (`Operation` / `OperationSet`).
 xai-message-delivery-core = { workspace = true }
