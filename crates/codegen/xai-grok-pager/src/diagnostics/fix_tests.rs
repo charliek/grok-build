@@ -76,6 +76,7 @@ fn terminal() -> TerminalContext {
         term_program_version: None,
         term_features: None,
         env_term_version: None,
+        gx_roost_host: false, // gx: field added for Roost KKP negotiation
     }
 }
 
