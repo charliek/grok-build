@@ -45,6 +45,8 @@ pub use term_version::{TermVersion, TermVersionSource};
 
 #[cfg(test)]
 mod test;
+#[cfg(test)]
+mod gx_roost_tests; // gx:
 
 /// Shared by the `test` submodule and `embedded_editor`'s tests.
 #[cfg(test)]
@@ -285,6 +287,10 @@ pub struct TerminalContext {
     /// The brand-corroborated counterpart to `term_program_version` (see [`term_version`]).
     /// It is resolved once in [`build_terminal_context_from_env`], so it does not re-derive if `brand` or `vte_version` change afterwards.
     pub env_term_version: Option<TermVersion>,
+    /// gx: `TERM_PROGRAM=Roost`. Roost's terminal is libghostty-vt, which answers the KKP query
+    /// at once, so probing it never stalls startup; without KKP, gx's macOS build drops Roost's
+    /// legacy `ESC[27;2;13~` Shift+Enter.
+    pub gx_roost_host: bool,
 }
 
 impl TerminalContext {
@@ -381,6 +387,7 @@ impl TerminalContext {
         // Probing an unresponsive terminal blocks startup.
         if self.brand.is_capability_unclassified()
             && self.multiplexer == MultiplexerKind::Undetected
+            && !self.gx_roost_host // gx: Roost answers the probe; see `gx_roost_host`
         {
             return Some("unknown_no_multiplexer");
         }
@@ -451,6 +458,7 @@ impl TerminalContext {
         // Consult env_brand: Windows refines Unknown to WindowsTerminal, but bare ConHost must still advertise Alt+Enter.
         if self.env_brand.is_capability_unclassified()
             && self.multiplexer == MultiplexerKind::Undetected
+            && !self.gx_roost_host // gx: KKP is negotiated in Roost; see `gx_roost_host`
         {
             return true;
         }
@@ -903,6 +911,9 @@ pub fn build_terminal_context_from_env(env: &HashMap<String, String>) -> Termina
         term_program_version,
         term_features,
         env_term_version,
+        // gx: see `TerminalContext::gx_roost_host`.
+        gx_roost_host: env_get(env, "TERM_PROGRAM")
+            .is_some_and(|program| program.trim().eq_ignore_ascii_case("roost")),
     }
 }
 

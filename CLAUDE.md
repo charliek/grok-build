@@ -144,6 +144,7 @@ cargo test -p xai-grok-shell --locked --bin chat-history-downgrade
 cargo test -p gx-remote-api --locked
 cargo test -p xai-chat-state --locked
 cargo test -p xai-message-delivery-core --locked
+cargo test -p xai-grok-pager-render --lib --locked -- terminal::
 ```
 
 This is the gate for every commit that touches gx code, every sync, and every PR into

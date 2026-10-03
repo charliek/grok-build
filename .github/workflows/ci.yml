@@ -135,6 +135,12 @@ jobs:
       - name: Test xai-message-delivery-core
         run: cargo test -p xai-message-delivery-core --locked
 
+      # Upstream crate, but gx adds a Roost host flag to its terminal context
+      # (`gx_roost_tests.rs`); the crate is otherwise outside the gate, so only
+      # the terminal module runs.
+      - name: Test xai-grok-pager-render terminal
+        run: "cargo test -p xai-grok-pager-render --lib --locked -- terminal::"
+
   secret-scan:
     name: secret-scan
     runs-on: ubuntu-latest
